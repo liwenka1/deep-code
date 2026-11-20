@@ -10,9 +10,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    APPROVAL_AUTO_ALLOW_ENV, AUTO_COST_SAVING_ENV, AgentConfig, CHECKPOINT_MAX_SNAPSHOTS_ENV,
-    COMPACTION_THRESHOLD_ENV, COST_CURRENCY_ENV, DEEPSEEK_API_KEY_ENV, LANG_ENV, MODEL_ENV,
-    REASONING_EFFORT_ENV, STREAM_CHUNK_TIMEOUT_ENV, STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV,
+    APPROVAL_AUTO_ALLOW_ENV, AgentConfig, CHECKPOINT_MAX_SNAPSHOTS_ENV, COMPACTION_THRESHOLD_ENV,
+    COST_CURRENCY_ENV, DEEPSEEK_API_KEY_ENV, LANG_ENV, MODEL_ENV, REASONING_EFFORT_ENV,
+    STREAM_CHUNK_TIMEOUT_ENV, STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV,
     STREAM_TOTAL_TIMEOUT_ENV,
 };
 use crate::execution_policy::{NetworkMode, PermissionMode};
@@ -32,9 +32,8 @@ fn render_warning(lang: Lang, (id, args): &PendingWarning) -> String {
     tr_with(lang, *id, &refs)
 }
 
-/// Parse a setting whose value is one of a fixed set of spellings, warning
-/// when the spelling is not one of them instead of silently leaving the field
-/// at whatever the layers below it left there.
+/// Parse a setting, warning when the value is invalid and keeping the value
+/// from the layers below it.
 ///
 /// One helper rather than a warning written out per setting, because "written
 /// out per setting" is exactly how the gap appeared: of the five enum-shaped
@@ -50,8 +49,8 @@ fn render_warning(lang: Lang, (id, args): &PendingWarning) -> String {
 /// function, and `every_enum_setting_warns_on_an_unrecognized_spelling`
 /// enumerates them.
 ///
-/// `field` is the dotted name as the file spells it, so the message names the
-/// line the user has to go fix.
+/// `field` identifies the setting to fix. A rejected value may contain a
+/// credential pasted into the wrong setting, so the warning omits it.
 fn parse_setting<T>(
     raw: Option<&str>,
     field: &'static str,
@@ -73,7 +72,6 @@ fn parse_setting<T>(
             vec![
                 ("layer", layer.label().to_string()),
                 ("field", field.to_string()),
-                ("value", value.to_string()),
             ],
         ));
     }
@@ -364,7 +362,6 @@ struct ProviderSection {
 #[serde(default)]
 struct CostSection {
     currency: Option<String>,
-    auto_cost_saving: Option<bool>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -469,7 +466,21 @@ fn read_config_file(path: &Path) -> FileRead {
     };
     match toml::from_str::<ConfigFile>(&raw) {
         Ok(file) => FileRead::Parsed(Box::new(file)),
-        Err(error) => FileRead::Error(error.to_string()),
+        Err(error) => {
+            // TOML diagnostics can quote source lines or values, including
+            // credentials. Keep only a position and a static description.
+            let detail = match error.span() {
+                Some(span) => {
+                    let prefix = &raw[..raw.floor_char_boundary(span.start)];
+                    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                    let line_prefix = prefix.rsplit_once('\n').map_or(prefix, |(_, tail)| tail);
+                    let column = line_prefix.chars().count() + 1;
+                    format!("invalid TOML or configuration value at line {line}, column {column}")
+                }
+                None => "invalid TOML or configuration value".to_string(),
+            };
+            FileRead::Error(detail)
+        }
     }
 }
 
@@ -506,12 +517,9 @@ fn apply_file_overlay(
         // credentials + full context go. A malicious repo dropping
         // `base_url = "https://evil"` would otherwise exfiltrate the
         // env/global-config API key on the first turn. Self-hosted endpoints
-        // still work — set base_url in the environment or global config.
+        // can be configured globally.
         if project {
-            pending.push((
-                TextId::CfgProjectBaseUrlIgnored,
-                vec![("url", base_url.to_string())],
-            ));
+            pending.push((TextId::CfgProjectBaseUrlIgnored, Vec::new()));
         } else {
             config.base_url = base_url.to_string();
             report.sources.base_url = layer;
@@ -524,7 +532,7 @@ fn apply_file_overlay(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        config.model = model.to_string();
+        config.model = model.to_owned();
         report.sources.model = layer;
     }
 
@@ -562,7 +570,7 @@ fn apply_file_overlay(
     }
     // Runtime-behavior knobs below share one rule with provider.timeout_secs:
     // not project-configurable. A repo's config must not be able to starve
-    // streams, blow up snapshot retention, or flip cost/compaction behavior —
+    // streams, blow up snapshot retention, or flip compaction behavior —
     // set these globally or via environment instead.
     let mut reject_project = |field: &str| {
         pending.push((
@@ -570,14 +578,6 @@ fn apply_file_overlay(
             vec![("field", field.to_string())],
         ));
     };
-    if let Some(value) = file.cost.auto_cost_saving {
-        if project {
-            reject_project("cost.auto_cost_saving");
-        } else {
-            config.auto_cost_saving = value;
-        }
-    }
-
     if let Some(value) = file.context.compaction_threshold {
         if project {
             reject_project("context.compaction_threshold");
@@ -817,23 +817,6 @@ fn apply_file_overlay(
     }
 }
 
-/// Booleans as every other parser in this crate reads them: case-insensitively,
-/// with both directions spelled out and anything else `None`.
-///
-/// `matches!(value.trim(), "1" | "true" | "yes" | "on")` was the old rule, and
-/// it failed in two directions at once. `DEEP_CODE_AUTO_COST_SAVING=TRUE` — the
-/// spelling half of CI writes — silently meant *false*, and so did a typo, so
-/// the only way to learn the setting had not applied was to notice the bill.
-/// Returning `None` for an unrecognized word lets [`parse_setting`] say so and
-/// leaves the value the layers below set, instead of forcing it off.
-fn parse_bool_setting(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
 /// The environment layer, applied last and therefore strongest.
 ///
 /// Every setting whose value has a grammar goes through [`parse_setting`], for
@@ -846,11 +829,7 @@ fn parse_bool_setting(value: &str) -> Option<bool> {
 /// layer; `every_parsed_env_setting_warns_on_an_unrecognized_value` covers this
 /// one, and both are enumerations rather than spot checks.
 ///
-/// The free-form settings stay free-form on purpose: an API key, a model id (a
-/// model newer than this binary must still be settable — see
-/// `ResolutionKind::Passthrough`) and the `auto_allow` tool-name list have no
-/// grammar to check against, so there is nothing an unrecognized value could
-/// mean.
+/// Model resolution checks the final value after all layers have been applied.
 pub(super) fn apply_env_overlay(
     config: &mut AgentConfig,
     sources: &mut ConfigSources,
@@ -889,15 +868,6 @@ pub(super) fn apply_env_overlay(
         },
     ) {
         config.language = language;
-    }
-    if let Some(value) = parse_setting(
-        env(AUTO_COST_SAVING_ENV).as_deref(),
-        AUTO_COST_SAVING_ENV,
-        ConfigLayer::Env,
-        pending,
-        parse_bool_setting,
-    ) {
-        config.auto_cost_saving = value;
     }
     if let Some(currency) = parse_setting(
         env(COST_CURRENCY_ENV).as_deref(),

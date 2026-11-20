@@ -318,7 +318,7 @@ pub(crate) enum ModelPickerFocus {
 }
 
 pub(crate) struct ModelPicker {
-    /// Canonical model ids (with `auto` as the first pseudo-model).
+    /// Canonical model IDs from the catalog.
     pub(crate) models: Vec<String>,
     pub(crate) selected_model: usize,
     /// Serialized reasoning-effort values. Keeping this as strings lets the
@@ -668,14 +668,18 @@ fn remove_char_at(s: &mut String, char_index: usize) -> bool {
 }
 
 impl App {
-    #[must_use]
-    pub fn launch(config: LaunchConfig) -> Self {
+    pub fn launch(config: LaunchConfig) -> deep_code_agent::AgentResult<Self> {
         let workspace = config.workspace.clone().unwrap_or_else(workspace_root);
         let workspace = deep_code_agent::canonicalize(&workspace).unwrap_or(workspace);
-        let workspace_files = deep_code_agent::list_workspace_files(&workspace, 2000);
         let loaded = AgentConfig::load(&workspace);
-        let config_warnings = loaded.report.warnings.clone();
         let agent_config = loaded.config;
+        let launched = launch_runtime(
+            &agent_config,
+            deep_code_agent::WorkspaceRoots::new(workspace.clone(), config.extra_roots),
+            config.resume,
+        )?;
+        let workspace_files = deep_code_agent::list_workspace_files(&workspace, 2000);
+        let config_warnings = loaded.report.warnings;
         let lang = Lang::from_env(&agent_config.language);
         let cost_currency = agent_config.cost_currency;
         let configured_model = agent_config.model.clone();
@@ -695,11 +699,6 @@ impl App {
             })
             .collect();
         let workspace_display = home_relative(&workspace);
-        let launched = launch_runtime(
-            &agent_config,
-            deep_code_agent::WorkspaceRoots::new(workspace.clone(), config.extra_roots.clone()),
-            config.resume.clone(),
-        );
         // Exhaustive destructuring, not field-by-field moves: the previous
         // shape read nine fields and silently ignored `warnings`, and nothing
         // — not the compiler, not review — pointed at the gap. Naming every
@@ -798,7 +797,7 @@ impl App {
             )));
         }
 
-        Self {
+        Ok(Self {
             input_cursor: 0,
             input: String::new(),
             history,
@@ -876,7 +875,7 @@ impl App {
             permission_mode,
             sandbox_off,
             yolo_armed: false,
-        }
+        })
     }
 
     /// Current session permission mode (for the status indicator).
@@ -999,7 +998,8 @@ impl App {
         let mut app = Self::launch(LaunchConfig {
             workspace: Some(workspace),
             ..LaunchConfig::default()
-        });
+        })
+        .unwrap();
         // Tests assert Chinese copy; pin the language so the developer's or
         // CI machine's LANG can never flake them.
         app.lang = Lang::Zh;
@@ -1218,11 +1218,7 @@ impl App {
         // Session id and cost detail live in `/status`, not on the always-on
         // bar.
         //
-        // The model is the *effective* one (auto-routing or a cascade can make
-        // it differ from configured), so a switch to a pricier model is visible
-        // here rather than only under `/status`. The thinking chip follows the
-        // same rule: it shows the effective effort after a turn, and the
-        // configured setting before the first turn produces telemetry.
+        // Show the model and effort reported by the last turn when available.
         let model = self
             .last_telemetry
             .as_ref()

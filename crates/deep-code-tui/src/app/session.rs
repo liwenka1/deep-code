@@ -38,31 +38,32 @@ impl PendingSessionSwitch {
     }
 }
 
-/// Build the effort choices from the embedded model catalog. `auto` is the
-/// product-level control; the catalog contributes the provider's
-/// thinking levels. Keeping this derived from the catalog means a future model
-/// can narrow or expand its levels without a second hard-coded UI list.
-fn picker_efforts(registry: &deep_code_agent::ModelRegistry, model: &str) -> Vec<String> {
-    let mut efforts = vec!["auto".to_string(), "none".to_string()];
-    let mut levels = Vec::new();
-    if model == deep_code_agent::AUTO_MODEL {
-        for info in registry.list() {
-            levels.extend(info.reasoning_efforts.iter().map(String::as_str));
-        }
-    } else if let Some(info) = registry.info_for(model) {
-        levels.extend(info.reasoning_efforts.iter().map(String::as_str));
-    }
-    // Unknown/passthrough models do not have catalog metadata yet. Keep the
-    // current built-in choices usable for them until the provider is queried.
-    if levels.is_empty() {
-        levels.extend(["low", "high", "max"]);
-    }
-    for level in levels {
-        if !efforts.iter().any(|effort| effort == level) {
-            efforts.push(level.to_string());
+/// Offer the model's thinking levels and preselect the current effort when
+/// supported. Otherwise use the catalog default.
+fn picker_efforts(
+    registry: &deep_code_agent::ModelRegistry,
+    model: &str,
+    current_effort: &str,
+) -> (Vec<String>, usize) {
+    let info = registry
+        .info_for(model)
+        .expect("picker models are in the catalog");
+    let mut efforts = vec!["none".to_string()];
+    for level in &info.reasoning_efforts {
+        if !efforts.contains(level) {
+            efforts.push(level.clone());
         }
     }
-    efforts
+    let selected = efforts
+        .iter()
+        .position(|effort| effort == current_effort)
+        .or_else(|| {
+            efforts
+                .iter()
+                .position(|effort| effort == &info.default_reasoning_effort)
+        })
+        .unwrap_or(0);
+    (efforts, selected)
 }
 
 impl PendingSessionScan {
@@ -198,21 +199,21 @@ impl App {
     /// state. The caller must have shut the previous runtime down first.
     fn launch_and_adopt(
         &mut self,
+        agent_config: &AgentConfig,
         resume: Option<SessionRecord>,
     ) -> Result<Option<SessionRecord>, String> {
         deep_code_agent::validate_pinned_workspace(&self.workspace)
             .map_err(|error| error.to_string())?;
-        let agent_config = self.load_layered_config();
         // Preserve unchanged process grants across swaps, but keep their
         // provenance: an old path is not fresh user intent to authorize
         // whatever directory it might now resolve to.
         let launched = deep_code_agent::relaunch_runtime(
-            &agent_config,
+            agent_config,
             deep_code_agent::WorkspaceRoots::new(self.workspace.clone(), self.extra_roots.clone()),
             resume,
         )
         .map_err(|error| error.to_string())?;
-        Ok(self.adopt_configured_runtime(launched, &agent_config))
+        Ok(self.adopt_configured_runtime(launched, agent_config))
     }
 
     fn adopt_configured_runtime(
@@ -386,25 +387,25 @@ impl App {
         }
 
         let registry = deep_code_agent::ModelRegistry::default();
-        let mut models = vec![deep_code_agent::AUTO_MODEL.to_string()];
-        models.extend(registry.list().iter().map(|model| model.id.clone()));
-        let current_model = registry.resolve(Some(&self.configured_model)).resolved_id;
-        // Keep a configured passthrough/provider model visible in the picker.
-        // Opening `/model` to change only reasoning must never silently replace
-        // an unlisted model with Auto when the user confirms the second step.
-        if !models.iter().any(|model| model == &current_model) {
-            models.push(current_model.clone());
-        }
+        let models: Vec<_> = registry
+            .list()
+            .iter()
+            .map(|model| model.id.clone())
+            .collect();
+        let current_model = match registry.resolve(Some(&self.configured_model)) {
+            Ok(model) => model,
+            Err(error) => {
+                self.status = error.user_message(self.lang);
+                return;
+            }
+        };
         let selected_model = models
             .iter()
-            .position(|model| model == &current_model)
+            .position(|model| model == current_model)
             .unwrap_or(0);
 
-        let efforts = picker_efforts(&registry, &current_model);
-        let selected_effort = efforts
-            .iter()
-            .position(|effort| effort == &self.configured_reasoning)
-            .unwrap_or(0);
+        let (efforts, selected_effort) =
+            picker_efforts(&registry, current_model, &self.configured_reasoning);
 
         self.close_completion();
         self.clear_selection();
@@ -437,7 +438,6 @@ impl App {
                     .iter()
                     .map(|model| {
                         let label = match model.as_str() {
-                            deep_code_agent::AUTO_MODEL => "Auto".to_string(),
                             deep_code_agent::DEEPSEEK_V4_PRO => "Pro".to_string(),
                             deep_code_agent::DEEPSEEK_FLASH => "Flash".to_string(),
                             other => other.to_string(),
@@ -453,7 +453,6 @@ impl App {
                     .iter()
                     .map(|effort| {
                         let label = match effort.as_str() {
-                            "auto" => "Auto",
                             "none" => "None",
                             "low" => "Low",
                             "high" => "High",
@@ -519,20 +518,12 @@ impl App {
         let Some(model) = model else {
             return;
         };
-        let previous_effort = previous_effort.unwrap_or_else(|| "high".to_string());
         let registry = deep_code_agent::ModelRegistry::default();
-        let efforts = picker_efforts(&registry, &model);
-        let selected_effort = efforts
-            .iter()
-            .position(|effort| effort == &previous_effort)
-            .or_else(|| {
-                registry.info_for(&model).and_then(|info| {
-                    efforts
-                        .iter()
-                        .position(|effort| effort == &info.default_reasoning_effort)
-                })
-            })
-            .unwrap_or(0);
+        let (efforts, selected_effort) = picker_efforts(
+            &registry,
+            &model,
+            previous_effort.as_deref().unwrap_or("high"),
+        );
         if let Some(picker) = self.model_picker.as_mut() {
             picker.efforts = efforts;
             picker.selected_effort = selected_effort;
@@ -968,9 +959,14 @@ impl App {
             self.status = error.to_string();
             return;
         }
+        let agent_config = self.load_layered_config();
+        if let Err(error) = agent_config.resolved_model() {
+            self.status = error.user_message(self.lang);
+            return;
+        }
         let workspace_display = home_relative(&self.workspace);
         self.shutdown_current_runtime();
-        if let Err(error) = self.launch_and_adopt(None) {
+        if let Err(error) = self.launch_and_adopt(&agent_config, None) {
             self.status = error;
             return;
         }

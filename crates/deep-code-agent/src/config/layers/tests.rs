@@ -257,7 +257,7 @@ fn layered_load_respects_precedence() {
     let project_dir = tempfile::tempdir().unwrap();
     let global = write_config(
         global_dir.path(),
-        "[provider]\nmodel = \"global-model\"\nbase_url = \"https://global.example\"\n[cost]\ncurrency = \"usd\"\n",
+        "[provider]\nmodel = \" global-model \"\nbase_url = \"https://global.example\"\n[cost]\ncurrency = \"usd\"\n",
     );
     let project = write_config(
         project_dir.path(),
@@ -265,9 +265,9 @@ fn layered_load_respects_precedence() {
     );
 
     // global < project for model; env wins over both.
-    let env = |name: &str| (name == MODEL_ENV).then(|| "env-model".to_string());
+    let env = |name: &str| (name == MODEL_ENV).then(|| " flash ".to_string());
     let loaded = AgentConfig::load_with(Some(global.clone()), Some(project.clone()), &env);
-    assert_eq!(loaded.config.model, "env-model");
+    assert_eq!(loaded.config.model, " flash ");
     assert_eq!(loaded.report.sources.model, ConfigLayer::Env);
     assert_eq!(loaded.config.base_url, "https://global.example");
     assert_eq!(loaded.report.sources.base_url, ConfigLayer::Global);
@@ -280,16 +280,20 @@ fn layered_load_respects_precedence() {
 
     // Without project, global wins.
     let loaded = AgentConfig::load_with(Some(global), None, &no_env);
-    assert_eq!(loaded.config.model, "global-model");
+    assert_eq!(loaded.config.model, " global-model ");
     assert_eq!(loaded.report.sources.model, ConfigLayer::Global);
 }
 
 #[test]
 fn project_layer_rejects_api_key_and_base_url() {
     let project_dir = tempfile::tempdir().unwrap();
+    let canary = "url-credential-canary";
+    let host = "project-endpoint.example";
     let project = write_config(
         project_dir.path(),
-        "[provider]\napi_key = \"sk-injected\"\nbase_url = \"https://evil.example\"\ntimeout_secs = 5\n",
+        &format!(
+            "[provider]\napi_key = \"sk-injected\"\nbase_url = \"https://user:{canary}@{host}/{canary}?token={canary}#{canary}\"\ntimeout_secs = 5\n"
+        ),
     );
 
     let loaded = AgentConfig::load_with(None, Some(project), &no_env);
@@ -314,13 +318,19 @@ fn project_layer_rejects_api_key_and_base_url() {
             .iter()
             .any(|warning| warning.contains("api_key"))
     );
-    assert!(
-        loaded
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("base_url"))
-    );
+    for lang in [Lang::En, Lang::Zh] {
+        let warnings = loaded.report.warnings_in(lang);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("provider.base_url"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains(canary) && !warning.contains(host))
+        );
+    }
     assert!(
         loaded
             .report
@@ -335,12 +345,11 @@ fn project_layer_rejects_runtime_behavior_knobs() {
     let project_dir = tempfile::tempdir().unwrap();
     let project = write_config(
         project_dir.path(),
-        "[cost]\nauto_cost_saving = false\n[context]\ncompaction_threshold = 1\n[stream]\nmax_retries = 0\nchunk_timeout_secs = 1\ntotal_timeout_secs = 1\nmax_bytes = 1\n[checkpoints]\nmax_snapshots = 999\n",
+        "[context]\ncompaction_threshold = 1\n[stream]\nmax_retries = 0\nchunk_timeout_secs = 1\ntotal_timeout_secs = 1\nmax_bytes = 1\n[checkpoints]\nmax_snapshots = 999\n",
     );
 
     let loaded = AgentConfig::load_with(None, Some(project), &no_env);
     let builtin = AgentConfig::builtin();
-    assert_eq!(loaded.config.auto_cost_saving, builtin.auto_cost_saving);
     assert_eq!(
         loaded.config.compaction_threshold,
         builtin.compaction_threshold
@@ -360,7 +369,6 @@ fn project_layer_rejects_runtime_behavior_knobs() {
         builtin.checkpoint_max_snapshots
     );
     for field in [
-        "cost.auto_cost_saving",
         "context.compaction_threshold",
         "stream.max_retries",
         "stream.chunk_timeout_secs",
@@ -396,35 +404,67 @@ fn global_layer_applies_api_key_and_stream_tuning() {
 }
 
 #[test]
-fn invalid_toml_layer_is_skipped_with_warning_not_panic() {
+fn invalid_config_layer_reports_location_without_echoing_contents() {
+    let canary = "sk-config-diagnostic-canary";
     let global_dir = tempfile::tempdir().unwrap();
-    let global = write_config(global_dir.path(), "[provider\nmodel = broken");
-
-    let loaded = AgentConfig::load_with(Some(global), None, &no_env);
-    assert_eq!(loaded.config, AgentConfig::builtin());
-    let layer = loaded
-        .report
-        .layers
-        .iter()
-        .find(|layer| layer.name == "global")
-        .expect("global layer status");
-    assert!(layer.present);
-    // layer.error now carries the raw (English) parser error for doctor;
-    // the localized wrapper lives in the rendered warning.
-    assert!(
-        layer
-            .error
-            .as_deref()
-            .is_some_and(|error| !error.is_empty())
-    );
-    // With no env, `auto` resolves to English, so the wrapper renders in en.
-    assert!(
-        loaded
+    for line in [
+        format!("api_key = \"{canary}\" trailing"),
+        format!("timeout_secs = \"{canary}\""),
+    ] {
+        let global = write_config(global_dir.path(), &format!("[provider]\n{line}\n"));
+        let loaded = AgentConfig::load_with(Some(global.clone()), None, &no_env);
+        assert_eq!(loaded.config, AgentConfig::builtin());
+        let layer = loaded
             .report
-            .warnings
+            .layers
             .iter()
-            .any(|warning| warning.contains("skipped"))
+            .find(|layer| layer.name == "global")
+            .expect("global layer status");
+        assert!(layer.present);
+        let detail = layer.error.as_deref().expect("global layer error");
+        assert!(detail.contains("line 2, column "), "{detail}");
+        assert!(!detail.contains(canary));
+
+        let warnings = loaded.report.warnings_in(Lang::En);
+        assert_eq!(warnings.len(), 1);
+        let warning = &warnings[0];
+        assert!(warning.contains(global.to_str().unwrap()), "{warning}");
+        assert!(
+            warning.contains("skipped") && warning.contains(detail),
+            "{warning}"
+        );
+        assert!(!warning.contains(canary));
+    }
+}
+
+#[test]
+fn rejected_settings_omit_misplaced_credentials_from_warnings() {
+    let canary = "sk-misplaced-credential-canary";
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        &format!("[provider]\nreasoning_effort = \"{canary}\"\n"),
     );
+    let env = |name: &str| (name == REASONING_EFFORT_ENV).then(|| canary.to_owned());
+    let loaded = AgentConfig::load_with(Some(path), None, &env);
+    assert_eq!(loaded.config.reasoning_effort, ReasoningEffortSetting::High);
+
+    for lang in [Lang::En, Lang::Zh] {
+        let warnings = loaded.report.warnings_in(lang);
+        assert_eq!(warnings.len(), 2);
+        for (field, layer) in [
+            ("provider.reasoning_effort", ConfigLayer::Global),
+            (REASONING_EFFORT_ENV, ConfigLayer::Env),
+        ] {
+            let layer = layer.label();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains(field) && warning.contains(layer))
+            );
+        }
+        assert!(warnings.iter().all(|warning| !warning.contains(canary)));
+    }
 }
 
 #[test]
@@ -581,8 +621,8 @@ fn every_enum_setting_warns_on_an_unrecognized_spelling() {
                 .report
                 .warnings
                 .iter()
-                .any(|warning| warning.contains(&field) && warning.contains(bad)),
-            "{field}='{bad}' must be reported, got {:?}",
+                .any(|warning| warning.contains(&field) && !warning.contains(bad)),
+            "missing warning naming {field} without its value: {:?}",
             loaded.report.warnings
         );
     }
@@ -598,15 +638,14 @@ fn every_enum_setting_warns_on_an_unrecognized_spelling() {
 #[test]
 fn every_parsed_env_setting_warns_on_an_unrecognized_value() {
     use crate::config::{
-        AUTO_COST_SAVING_ENV, CHECKPOINT_MAX_SNAPSHOTS_ENV, COMPACTION_THRESHOLD_ENV,
-        COST_CURRENCY_ENV, LANG_ENV, REASONING_EFFORT_ENV, STREAM_CHUNK_TIMEOUT_ENV,
-        STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV, STREAM_TOTAL_TIMEOUT_ENV,
+        CHECKPOINT_MAX_SNAPSHOTS_ENV, COMPACTION_THRESHOLD_ENV, COST_CURRENCY_ENV, LANG_ENV,
+        REASONING_EFFORT_ENV, STREAM_CHUNK_TIMEOUT_ENV, STREAM_MAX_BYTES_ENV,
+        STREAM_MAX_RETRIES_ENV, STREAM_TOTAL_TIMEOUT_ENV,
     };
 
-    const SETTINGS: [(&str, &str); 10] = [
+    const SETTINGS: [(&str, &str); 9] = [
         (REASONING_EFFORT_ENV, "maximum"),
         (LANG_ENV, "kling0n"),
-        (AUTO_COST_SAVING_ENV, "affirmative"),
         (COST_CURRENCY_ENV, "eur"),
         (COMPACTION_THRESHOLD_ENV, "lots"),
         (STREAM_MAX_RETRIES_ENV, "many"),
@@ -625,47 +664,11 @@ fn every_parsed_env_setting_warns_on_an_unrecognized_value() {
                 .report
                 .warnings
                 .iter()
-                .any(|warning| warning.contains(name) && warning.contains(bad)),
-            "{name}='{bad}' must be reported, got {:?}",
+                .any(|warning| warning.contains(name) && !warning.contains(bad)),
+            "missing warning naming {name} without its value: {:?}",
             loaded.report.warnings
         );
     }
-}
-
-/// The half of the old boolean rule that failed *toward* the expensive answer:
-/// an uppercase `TRUE` meant false, silently. Both spellings now work, and an
-/// unrecognized word leaves the value alone instead of forcing it off.
-#[test]
-fn an_env_boolean_reads_case_insensitively_and_both_ways() {
-    use crate::config::AUTO_COST_SAVING_ENV;
-
-    let load = |value: &'static str| {
-        AgentConfig::load_with(None, None, &move |asked| {
-            (asked == AUTO_COST_SAVING_ENV).then(|| value.to_string())
-        })
-    };
-
-    for on in ["1", "true", "TRUE", "Yes", "ON"] {
-        assert!(load(on).config.auto_cost_saving, "{on} must read as on");
-    }
-    for off in ["0", "false", "FALSE", "no", "Off"] {
-        assert!(!load(off).config.auto_cost_saving, "{off} must read as off");
-    }
-
-    // Unrecognized: warned about, and the builtin value is left standing
-    // rather than being forced to `false` by the failed parse.
-    let loaded = load("affirmative");
-    assert_eq!(
-        loaded.config.auto_cost_saving,
-        AgentConfig::builtin().auto_cost_saving
-    );
-    assert!(
-        loaded
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("affirmative"))
-    );
 }
 
 /// The regression that motivated the sweep above, spelled out on its own
@@ -691,7 +694,7 @@ fn a_misspelled_network_never_does_not_silently_re_arm_egress() {
             .report
             .warnings
             .iter()
-            .any(|warning| warning.contains("sandbox.network") && warning.contains("nevr")),
+            .any(|warning| warning.contains("sandbox.network")),
         "the one switch that disables egress must not fail silently: {:?}",
         loaded.report.warnings
     );

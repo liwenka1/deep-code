@@ -113,10 +113,8 @@ pub struct InstanceResult {
     pub cost_cny: f64,
     /// Effective model of the turn (e.g. deepseek-flash), if reported.
     pub model: Option<String>,
-    /// What decided the route (heuristic / hard-rule / cascade).
-    pub route_source: Option<String>,
-    /// Whether cascade escalation latched during this instance.
-    pub cascade_triggered: bool,
+    /// Effective reasoning effort of the turn, if reported.
+    pub reasoning_effort: Option<String>,
     /// Error message if failed.
     pub error: Option<String>,
 }
@@ -142,7 +140,7 @@ pub struct BenchReport {
     pub subset: String,
     pub split: String,
     /// `model_name_or_path` for the official predictions — identifies this
-    /// submission by agent version and routing config.
+    /// submission by agent version and configured model.
     pub model_name: String,
     pub started_at: String,
     pub duration_ms: u64,
@@ -212,6 +210,7 @@ where
     F: Fn(EvalConfig, I, CancellationToken) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = InstanceResult> + Send + 'static,
 {
+    let model_name = submission_name(config.agent_config.resolved_model()?);
     anyhow::ensure!(
         !config.resume || config.output_dir.is_some(),
         "resuming an eval requires an output directory"
@@ -267,6 +266,7 @@ where
     let start = Instant::now();
     let report = build_report(
         &config,
+        &model_name,
         &started_at,
         prior_duration,
         selected.len(),
@@ -328,6 +328,7 @@ where
         if let Some(store) = &progress {
             let report = build_report(
                 &config,
+                &model_name,
                 &started_at,
                 prior_duration.saturating_add(elapsed_ms),
                 selected.len(),
@@ -353,6 +354,7 @@ where
     }
     Ok(build_report(
         &config,
+        &model_name,
         &started_at,
         prior_duration
             .saturating_add(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)),
@@ -396,14 +398,14 @@ fn task_error(id: &str, error: String) -> InstanceResult {
         step_limit_hit: false,
         cost_cny: 0.0,
         model: None,
-        route_source: None,
-        cascade_triggered: false,
+        reasoning_effort: None,
         error: Some(error),
     }
 }
 
 fn build_report(
     config: &EvalConfig,
+    model_name: &str,
     started_at: &str,
     duration_ms: u64,
     planned_total: usize,
@@ -421,7 +423,7 @@ fn build_report(
         bench: config.bench.clone(),
         subset: config.subset.clone(),
         split: config.split.clone(),
-        model_name: submission_name(&config.agent_config.model),
+        model_name: model_name.to_owned(),
         started_at: started_at.to_owned(),
         duration_ms,
         total: planned_total,
@@ -434,18 +436,9 @@ fn build_report(
     }
 }
 
-/// `model_name_or_path` for the official predictions: agent version plus the
-/// routing config. A bare "deep-code" would make two runs from different
-/// versions or model pins indistinguishable on a leaderboard. An unset model
-/// reports the routing sentinel (`auto`) rather than inventing a model id —
-/// which models `auto` actually picked is recorded per instance in the report.
-fn submission_name(pinned_model: &str) -> String {
-    let pinned = pinned_model.trim();
-    format!(
-        "deep-code-{}-{}",
-        env!("CARGO_PKG_VERSION"),
-        if pinned.is_empty() { "auto" } else { pinned }
-    )
+/// Identify official predictions by agent version and configured model.
+fn submission_name(model: &str) -> String {
+    format!("deep-code-{}-{model}", env!("CARGO_PKG_VERSION"))
 }
 
 /// Task framing around the raw issue text: without it, many issue reports read
@@ -527,8 +520,7 @@ async fn run_single(
         step_limit_hit: false,
         cost_cny: 0.0,
         model: None,
-        route_source: None,
-        cascade_triggered: false,
+        reasoning_effort: None,
         error: Some(error),
     };
 
@@ -571,7 +563,10 @@ async fn run_single(
     if cancel.is_cancelled() {
         return error_result("rollout cancelled".into(), &start);
     }
-    let launched = launch_runtime(&config.agent_config, workspace.path().to_path_buf(), None);
+    let launched = match launch_runtime(&config.agent_config, workspace.path(), None) {
+        Ok(launched) => launched,
+        Err(error) => return error_result(error.to_string(), &start),
+    };
     for warning in &launched.warnings {
         eprintln!("warning: {warning}");
     }
@@ -622,12 +617,9 @@ async fn run_single(
     // Fully stop the runtime before extracting the diff.
     launched.shutdown().await;
 
-    // Preserve the transcript while the workspace still exists. The report
-    // records THAT an instance struggled (cascade, error, timeout), never what
-    // the agent actually did — and the workspace is a temp dir that takes the
-    // session with it. Without this, diagnosing a low score means re-running
-    // the whole split. Copied before patch extraction so even an extraction
-    // failure keeps its evidence.
+    // Preserve the transcript while the temporary workspace still exists.
+    // Copy before extracting the patch so the session is available for
+    // diagnosing timeouts, errors and patch extraction failures.
     let transcript_error = if let Some(dir) = config.transcripts_dir.as_deref() {
         save_transcript(workspace.path(), dir, &instance_id)
             .await
@@ -659,16 +651,15 @@ async fn run_single(
         (InstanceStatus::PatchProduced, None)
     };
 
-    let (cost_cny, model, route_source, cascade_triggered) = match &turn.telemetry {
+    let (cost_cny, model, reasoning_effort) = match &turn.telemetry {
         Some(t) => (
             t.session_cost.cny,
             Some(t.effective_model.clone()),
-            Some(t.route_source.clone()),
-            t.cascade_triggered,
+            Some(t.reasoning_effort.clone()),
         ),
         // No telemetry (timeout/cancel/error): fall back to the accumulated
         // session spend so a timed-out instance still reports its real cost.
-        None => (session_spend.cost.cny, None, None, false),
+        None => (session_spend.cost.cny, None, None),
     };
     let mut result = InstanceResult {
         instance_id,
@@ -681,8 +672,7 @@ async fn run_single(
         step_limit_hit,
         cost_cny,
         model,
-        route_source,
-        cascade_triggered,
+        reasoning_effort,
         error,
     };
     if let Some(error) = transcript_error {
@@ -1072,15 +1062,11 @@ mod tests {
     }
 
     #[test]
-    fn submission_name_carries_version_and_routing() {
-        let auto = submission_name("auto");
-        assert!(auto.starts_with("deep-code-"), "{auto}");
-        assert!(auto.contains(env!("CARGO_PKG_VERSION")), "{auto}");
-        assert!(auto.ends_with("-auto"), "{auto}");
-        // An unset model reports the sentinel, never a bare agent name.
-        assert_eq!(submission_name("   "), auto);
-        // A pin is carried verbatim so two runs stay distinguishable.
-        assert!(submission_name("deepseek-v4-pro").ends_with("-deepseek-v4-pro"));
+    fn submission_name_carries_version_and_model() {
+        let flash = submission_name(deep_code_agent::DEEPSEEK_FLASH);
+        assert!(flash.starts_with("deep-code-"), "{flash}");
+        assert!(flash.contains(env!("CARGO_PKG_VERSION")), "{flash}");
+        assert!(flash.ends_with("-deepseek-flash"), "{flash}");
     }
 
     #[test]

@@ -14,7 +14,7 @@
 # provider.reasoning_effort, cost.currency and ui.language.
 #
 # Every other behaviour knob (provider.timeout_secs, stream.*, checkpoints.*,
-# context.*, cost.auto_cost_saving, approval.auto_allow) is ignored there, with
+# context.*, approval.auto_allow) is ignored there, with
 # a warning — so a hostile repository cannot starve your streams, blow up
 # snapshot retention, or quietly lift the approval gate. Set those globally or
 # in the environment.
@@ -56,12 +56,11 @@
 # the one that streams reasoning).
 # base_url = "https://api.deepseek.com/beta"
 
-# Model: deepseek-v4-pro, deepseek-flash, or auto (routed per task).
-# model = "auto"
+# Choose pro, flash, or a model ID listed by `deepcode doctor`. The default is deepseek-flash.
+# model = "deepseek-flash"
 
-# Reasoning effort: none, low, high, max, or auto. `none` disables thinking;
-# `auto` lets deep-code choose the effort per task. The model auto setting
-# separately lets deep-code choose Pro or Flash per task.
+# Reasoning effort can be none, low, high, or max. Defaults to high. Choose
+# none to disable thinking.
 # reasoning_effort = "high"
 
 # Request timeout in seconds: connect plus waiting for response headers. It does
@@ -166,9 +165,6 @@
 [cost]
 # Display currency for costs: cny or usd.
 # currency = "cny"
-
-# Prefer cheaper routing (lean towards Flash) in auto mode.
-# auto_cost_saving = false
 
 [lsp]
 # Master switch for post-edit LSP diagnostics. When on, writing a file or
@@ -292,9 +288,9 @@
 # notifications = true
 
 [vision]
-# Provider processing detail for user and tool image observations. Auto mode
-# routes fresh images to a vision-capable model for each request; fixed models
-# retain their selection and unsupported images get explicit omission notes.
+# Provider processing detail for user and tool image observations. With the
+# DeepSeek provider, select Flash for image support. Unsupported images get
+# explicit omission notes.
 # The TUI preserves an attached-image draft when the selected model cannot see it.
 #
 #   low       provider uses a low-resolution representation

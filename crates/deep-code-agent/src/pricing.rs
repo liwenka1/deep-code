@@ -24,7 +24,7 @@ impl CostCurrency {
 
     /// Config/persistence token — the spelling `parse` accepts and `doctor`
     /// reports. On the enum next to its variants like every other setting enum
-    /// (`PermissionMode`, `NetworkMode`, `ReasoningEffort`, `Lang`), so the
+    /// (`PermissionMode`, `NetworkMode`, `ReasoningEffortSetting`, `Lang`), so the
     /// report site matches the real variant instead of lower-casing a Debug
     /// string that a rename would silently change.
     #[must_use]

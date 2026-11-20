@@ -201,23 +201,6 @@ impl Session {
         true
     }
 
-    /// Whether this turn contains visual observations still relevant to its work.
-    pub(crate) fn turn_has_images(&self, turn_id: &TurnId) -> bool {
-        self.entries
-            .iter()
-            .filter(|entry| entry.turn_id.as_ref() == Some(turn_id))
-            .any(|entry| match &entry.kind {
-                EntryKind::User { content } => content.has_images(),
-                EntryKind::Assistant { exchanges, .. } => exchanges.iter().any(|exchange| {
-                    exchange
-                        .result
-                        .as_ref()
-                        .is_some_and(|result| result.content.has_images())
-                }),
-                _ => false,
-            })
-    }
-
     /// Derive the DeepSeek/OpenAI wire messages. Pending exchanges emit the
     /// interrupted placeholder, so the protocol invariant (assistant
     /// `tool_calls` followed by one `role=tool` message per id) holds by
@@ -615,10 +598,6 @@ mod tests {
             matches!(&messages[2].content.blocks[2], ContentBlock::Text {text} if text == "after")
         );
         assert!(!messages[2].content.summary_text().contains("secret"));
-        assert!(session.turn_has_images(&turn));
-        let next = TurnId::new();
-        session.push_user(next.clone(), "plain follow-up");
-        assert!(!session.turn_has_images(&next));
     }
 
     #[test]

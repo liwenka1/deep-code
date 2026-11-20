@@ -85,7 +85,7 @@ sb-cli submit swe-bench_lite dev --predictions_path eval-out/predictions.json --
 4. 自动批准工具调用;超时先 `cancel_turn` 再收 patch
 5. `git add -A`(排除 `.deep-code/` 运行时产物)+ `git diff --cached` 提取
    patch(含新建文件)
-6. 记录 patch 与 telemetry(成本 / 模型 / 路由来源 / 级联触发),逐题保存 checkpoint 和报告
+6. 记录 patch、成本、实际使用的模型和思考强度，逐题保存 checkpoint 和报告。
 
 ## 后续计划
 

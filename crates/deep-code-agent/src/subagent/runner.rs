@@ -241,7 +241,7 @@ mod tests {
             FindingsThenSilence::default(),
             ToolRegistry::with_mock_tools(),
         );
-        let turn_id = runtime.begin_turn("find the race").await;
+        let turn_id = runtime.begin_turn("find the race").await.unwrap();
         let steps_seen = Arc::new(AtomicU32::new(0));
         let outcome = run_subagent(
             runtime,

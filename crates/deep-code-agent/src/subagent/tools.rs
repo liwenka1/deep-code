@@ -229,25 +229,11 @@ impl Tool for AgentTool {
             // parent: same provider endpoint, same key.
             &crate::web_tools::WebBackend::from_config(&self.services.agent_config),
         );
-        // Reconnaissance roles run pinned to the flash tier (a fixed model id
-        // bypasses per-turn auto-routing in the child); other roles inherit
-        // the parent's configured model. See `SubAgentRole::model_override`.
+        // Reconnaissance roles use Flash; other roles inherit the parent's
+        // configured model. See `SubAgentRole::model_override`.
         let mut child_config = self.services.agent_config.clone();
         if let Some(model) = role.model_override() {
-            // Only substitute the built-in flash id when the parent is on a model
-            // this build actually knows (a catalog id, or the `auto` sentinel).
-            // On a custom `base_url` with a passthrough model id, `deepseek-flash`
-            // does not exist upstream and every recon child would 404 — there,
-            // inherit the parent's model instead. Mirrors `classifier_model_for`.
-            let configured = child_config.model.trim();
-            let known = configured.is_empty()
-                || configured.eq_ignore_ascii_case(crate::model_registry::AUTO_MODEL)
-                || crate::model_registry::ModelRegistry::default()
-                    .info_for(configured)
-                    .is_some();
-            if known {
-                child_config.model = model.to_string();
-            }
+            child_config.model = model.to_string();
         }
         let runtime = child_runtime(&self.services, role, network, child_tools, child_config);
 
@@ -298,7 +284,10 @@ impl Tool for AgentTool {
         let run = std::panic::AssertUnwindSafe({
             let steps_seen = Arc::clone(&steps_seen);
             async move {
-                let turn_id = runtime.begin_turn(task).await;
+                let turn_id = runtime
+                    .begin_turn(task)
+                    .await
+                    .map_err(|error| (0, error.user_message(runtime.ui_lang()), None))?;
                 run_subagent(
                     runtime,
                     turn_id,

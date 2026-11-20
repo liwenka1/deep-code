@@ -157,6 +157,10 @@ async fn run_with_diagnostics(
     for warning in loaded.report.warnings_in(deep_code_agent::Lang::En) {
         emit(diagnostics, "config", &warning);
     }
+    if let Err(error) = loaded.config.resolved_model() {
+        emit(diagnostics, "config", &error.to_string());
+        return EXIT_FAILURE;
+    }
 
     let resume = match resolve_resume_record(
         &args.intent,
@@ -203,7 +207,7 @@ async fn run_with_diagnostics(
             // If this caller stays alive, clean up a runtime that finishes
             // after cancellation. The CLI itself exits with 130 immediately.
             tokio::spawn(async move {
-                if let Ok(launched) = initializing.await {
+                if let Ok(Ok(launched)) = initializing.await {
                     launched.shutdown().await;
                 }
             });
@@ -211,7 +215,11 @@ async fn run_with_diagnostics(
             return EXIT_INTERRUPT;
         }
         result = &mut initializing => match result {
-            Ok(launched) => launched,
+            Ok(Ok(launched)) => launched,
+            Ok(Err(error)) => {
+                emit(diagnostics, "config", &error.to_string());
+                return EXIT_FAILURE;
+            }
             Err(error) => {
                 diagnostics.line(format!("runtime initialization failed: {error}"));
                 return EXIT_FAILURE;
@@ -773,7 +781,8 @@ mod tests {
                 &AgentConfig::builtin(),
                 workspace.path().to_path_buf(),
                 None,
-            );
+            )
+            .unwrap();
             assert!(launched.offline);
             let handle = launched.handle.clone();
             let token = CancellationToken::new();

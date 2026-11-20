@@ -376,8 +376,6 @@ text_ids! {
     UsageRestore,
     ApiKeySaved,
     StatusConnected,
-    ModelCurrent,
-    StatusModelInfoShown,
     ModelUnknown,
     ModelSwitched,
     ModelAndReasoningSwitched,
@@ -426,6 +424,7 @@ text_ids! {
     LangSwitchedNotSaved,
     LangUnknown,
     // AgentError 用户可见诊断(agent crate)
+    ErrUnknownModel,
     ErrMissingApiKey,
     ErrHttp,
     ErrApiUnauthorized,
@@ -526,18 +525,7 @@ text_ids! {
     SubagentBudgetWrapUp,
     // 离线 echo 后端提示
     EchoOfflineHint,
-    // 路由遥测原因(auto_mode / streaming),显示在状态栏
-    RouteFixedModel,
-    RouteFixedModelPassthrough,
-    RouteCascade,
-    RouteContextPressure,
-    RouteKeywordDeep,
-    RouteKeywordHeavy,
-    RouteKeywordBorderline,
-    RouteFlashDefault,
-    RouteFallbackProToFlash,
     // 图片理解(图片输入仅在 Flash 上,见 models.toml 的 supports_vision)
-    RouteImagesForceFlash,
     TurnImagesUnsupportedModel,
     ImageChip,
     ImageAttached,

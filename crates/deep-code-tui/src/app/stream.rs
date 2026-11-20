@@ -87,12 +87,7 @@ impl App {
             return;
         }
 
-        // The one place we can refuse an image without costing the user their
-        // draft. Auto mode is routed onto Flash (the only model that takes an
-        // image), so this fires only when `provider.model` pinned a model the
-        // catalog says cannot — and the alternative is a request that 400s
-        // after the turn has started and the images are gone. An id the catalog
-        // does not know is left to the server, matching the runtime's rule.
+        // Keep the draft when the chosen model cannot take images.
         //
         // After the slash branch on purpose: `/image` is how you inspect and fix
         // what is attached, and it has to run whatever model is configured.

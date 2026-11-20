@@ -62,8 +62,7 @@ fn result(id: &str, status: InstanceStatus) -> InstanceResult {
         step_limit_hit: false,
         cost_cny: 0.125,
         model: Some("fixture-model".into()),
-        route_source: Some("fixture".into()),
-        cascade_triggered: false,
+        reasoning_effort: Some("high".into()),
         error,
     }
 }
@@ -159,6 +158,8 @@ async fn interrupted_rollout_keeps_exports_and_resumes_only_unsaved_jobs() {
     let partial = read_json(directory.path().join("report.json"));
     assert_eq!(partial["total"], 2);
     assert_eq!(partial["results"].as_array().unwrap().len(), 1);
+    assert_eq!(partial["results"][0]["model"], "fixture-model");
+    assert_eq!(partial["results"][0]["reasoning_effort"], "high");
 
     invocation.abort();
     assert!(invocation.await.unwrap_err().is_cancelled());
@@ -200,6 +201,7 @@ async fn interrupted_rollout_keeps_exports_and_resumes_only_unsaved_jobs() {
     assert_eq!(report.results.len(), 2);
     assert_eq!(report.patches_produced, 2);
     assert_eq!(report.total_cost_cny, 0.25);
+    assert!(crate::report::to_markdown(&report).contains("| fixture-model | high |"));
     assert_eq!(saved_ids(directory.path()), ["first", "unfinished"]);
 }
 
@@ -314,6 +316,42 @@ async fn all_saved_terminal_statuses_skip_execution_and_rebuild_missing_exports(
             .unwrap()
             .contains("a-different-key-not-persisted")
     );
+}
+
+#[tokio::test]
+async fn unknown_model_fails_before_opening_output_or_starting_jobs() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("eval-out");
+    let bench = benchmark(&["selected"]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let unknown_model = "unsupported-model-test";
+    for resume in [false, true] {
+        let checkpoint = output.join("checkpoint.json");
+        if resume {
+            std::fs::create_dir(&output).unwrap();
+            std::fs::write(&checkpoint, "{incomplete").unwrap();
+        }
+        let mut config = configuration(&output);
+        config.agent_config.model = unknown_model.into();
+        config.resume = resume;
+        let counter = calls.clone();
+        let error = run_bench_with(config, &bench, move |_, instance, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async move { result(instance.0, InstanceStatus::PatchProduced) }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown model"));
+        assert!(!error.to_string().contains(unknown_model));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        if resume {
+            assert_eq!(std::fs::read_to_string(&checkpoint).unwrap(), "{incomplete");
+            assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
+        } else {
+            assert!(!output.exists());
+        }
+    }
 }
 
 #[tokio::test]

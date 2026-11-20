@@ -6,7 +6,7 @@ async fn preparing_a_live_reconfiguration_does_not_write_the_session_file() {
     let workspace = tempfile::tempdir().unwrap();
     let ws = crate::paths::canonicalize(workspace.path()).unwrap();
     let config = AgentConfig::builtin();
-    let original = launch_runtime(&config, ws.clone(), None);
+    let original = launch_runtime(&config, ws.clone(), None).unwrap();
     let id = original.handle.session_id().await.unwrap();
     let path =
         crate::session_store::sessions_dir_for_workspace(&ws).join(format!("{}.json", id.as_str()));
@@ -328,7 +328,8 @@ fn resume_unions_record_grants_with_cli_add_dirs() {
         &config,
         WorkspaceRoots::new(ws, vec![cli_root.clone(), recorded_root.clone()]),
         Some(record),
-    );
+    )
+    .unwrap();
     // Record grants come first, CLI additions after; the repeated
     // `recorded_root` from the CLI must not duplicate.
     assert_eq!(launched.extra_roots, vec![recorded_root, cli_root]);
@@ -347,7 +348,8 @@ fn resume_drops_stale_recorded_grants_instead_of_disabling_tools() {
         &AgentConfig::builtin(),
         record.workspace.clone(),
         Some(record),
-    );
+    )
+    .unwrap();
     // The stale grant is dropped with a warning; it must NOT reach
     // WorkspacePolicy, whose fail-closed constructor would otherwise take
     // every workspace/shell tool down with it on this resumed session —
@@ -383,7 +385,8 @@ fn resume_uses_the_callers_workspace_not_the_records_claim() {
 
     let record = signed(SessionRecord::new(claimed.clone(), "system"));
     let id = record.id.clone();
-    let launched = launch_runtime(&AgentConfig::builtin(), caller_ws.clone(), Some(record));
+    let launched =
+        launch_runtime(&AgentConfig::builtin(), caller_ws.clone(), Some(record)).unwrap();
 
     assert!(
         launched
@@ -436,7 +439,7 @@ fn resume_refuses_a_recorded_grant_a_request_could_never_have_won() {
         SessionRecord::new(ws.clone(), "system")
             .with_extra_roots(vec![home.clone(), PathBuf::from("/")]),
     );
-    let launched = launch_runtime(&AgentConfig::builtin(), ws.clone(), Some(record));
+    let launched = launch_runtime(&AgentConfig::builtin(), ws.clone(), Some(record)).unwrap();
 
     assert!(
         launched.extra_roots.is_empty(),
@@ -506,7 +509,8 @@ fn resume_drops_a_signed_root_that_now_resolves_elsewhere() {
         &AgentConfig::builtin(),
         WorkspaceRoots::new(ws.clone(), Vec::new()),
         Some(record),
-    );
+    )
+    .unwrap();
 
     assert!(
         launched.extra_roots.is_empty(),
@@ -608,7 +612,8 @@ fn a_verbatim_record_copy_does_not_carry_grants_into_another_workspace() {
         &AgentConfig::builtin(),
         WorkspaceRoots::new(other_ws, Vec::new()),
         Some(record),
-    );
+    )
+    .unwrap();
 
     assert!(
         launched.extra_roots.is_empty(),
@@ -639,7 +644,8 @@ fn resume_keeps_a_signed_root_that_still_resolves_to_itself() {
         &AgentConfig::builtin(),
         WorkspaceRoots::new(ws.clone(), Vec::new()),
         Some(record),
-    );
+    )
+    .unwrap();
 
     assert_eq!(
         launched.extra_roots,
@@ -669,7 +675,7 @@ fn resume_drops_recorded_grants_that_carry_no_authorship_tag() {
     record.extra_roots = vec![smuggled_root.clone()];
     assert!(record.extra_roots_mac.is_none());
 
-    let launched = launch_runtime(&AgentConfig::builtin(), ws.clone(), Some(record));
+    let launched = launch_runtime(&AgentConfig::builtin(), ws.clone(), Some(record)).unwrap();
 
     assert!(
         launched.extra_roots.is_empty(),
@@ -692,7 +698,7 @@ fn resume_drops_recorded_grants_that_carry_no_authorship_tag() {
     let tampered = signed(tampered);
     let mut tampered = tampered;
     tampered.extra_roots = vec![smuggled_root];
-    let launched = launch_runtime(&AgentConfig::builtin(), ws, Some(tampered));
+    let launched = launch_runtime(&AgentConfig::builtin(), ws, Some(tampered)).unwrap();
     assert!(
         launched.extra_roots.is_empty(),
         "a tag lifted from another grant list must not verify: {:?}",
@@ -719,7 +725,7 @@ async fn resume_refuses_a_forged_transcript_without_overwriting_its_file() {
         .join(format!("{}.json", original_id.as_str()));
     let original_bytes = serde_json::to_vec_pretty(&record).unwrap();
     std::fs::write(&original_path, &original_bytes).unwrap();
-    let launched = launch_runtime(&AgentConfig::builtin(), ws, Some(record));
+    let launched = launch_runtime(&AgentConfig::builtin(), ws, Some(record)).unwrap();
     assert_ne!(launched.session_id.as_deref(), Some(original_id.as_str()));
     assert!(launched.resume_record.is_none());
     assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
@@ -759,7 +765,8 @@ fn resume_refreshes_system_prompt_and_persists_grants_immediately() {
         &AgentConfig::builtin(),
         WorkspaceRoots::new(ws.clone(), vec![extra_root.clone(), ws.clone()]),
         Some(record),
-    );
+    )
+    .unwrap();
     assert_eq!(launched.extra_roots, vec![extra_root.clone()]);
 
     // The grant must be on disk already — not parked until the first
@@ -792,7 +799,8 @@ fn fresh_launch_drops_extras_equal_to_the_primary() {
         &AgentConfig::builtin(),
         WorkspaceRoots::new(ws.clone(), vec![ws]),
         None,
-    );
+    )
+    .unwrap();
     assert!(launched.extra_roots.is_empty());
 }
 
@@ -907,12 +915,12 @@ fn online_launch_names_the_provider_and_is_not_offline() {
         ..AgentConfig::builtin()
     };
 
-    let fresh = launch_runtime(&config, ws.clone(), None);
+    let fresh = launch_runtime(&config, ws.clone(), None).unwrap();
     assert!(!fresh.offline, "an API key means a working model");
     assert_eq!(fresh.backend_label, format!("DeepSeek {}", config.model));
 
     let record = signed(SessionRecord::new(ws.clone(), "system"));
-    let resumed = launch_runtime(&config, ws.clone(), Some(record));
+    let resumed = launch_runtime(&config, ws.clone(), Some(record)).unwrap();
     assert!(!resumed.offline);
     assert_eq!(
         resumed.backend_label,
@@ -920,15 +928,35 @@ fn online_launch_names_the_provider_and_is_not_offline() {
     );
 
     // And the derivation flips for the placeholder backend on both paths.
-    let echo_fresh = launch_runtime(&AgentConfig::builtin(), ws.clone(), None);
+    let echo_fresh = launch_runtime(&AgentConfig::builtin(), ws.clone(), None).unwrap();
     assert!(echo_fresh.offline);
     let echo_resumed = launch_runtime(
         &AgentConfig::builtin(),
         ws.clone(),
         Some(signed(SessionRecord::new(ws, "system"))),
-    );
+    )
+    .unwrap();
     assert!(echo_resumed.offline);
     assert_eq!(echo_resumed.backend_label, "offline echo (resumed)");
+}
+
+#[test]
+fn launch_rejects_an_unknown_model_without_creating_session_state() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config = AgentConfig {
+        model: "unknown-model".into(),
+        ..AgentConfig::builtin()
+    };
+    let error = launch_runtime(&config, workspace.path(), None)
+        .err()
+        .expect("the runtime accepted an unknown model");
+    assert!(matches!(error, crate::error::AgentError::UnknownModel));
+    assert!(
+        std::fs::read_dir(workspace.path())
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 /// AGENTS.md is read at every launch — which is what startup, `/clear` and a
@@ -943,7 +971,7 @@ async fn agents_md_is_read_at_each_launch_and_on_resume() {
     std::fs::write(&file, "rule one: tests live in tests.rs\n").unwrap();
     let config = AgentConfig::builtin();
 
-    let first = launch_runtime(&config, ws.clone(), None);
+    let first = launch_runtime(&config, ws.clone(), None).unwrap();
     let system = first.handle.session_messages().await[0].content.text();
     assert!(system.starts_with(DEFAULT_SYSTEM_PROMPT), "{system}");
     assert!(
@@ -973,7 +1001,7 @@ async fn agents_md_is_read_at_each_launch_and_on_resume() {
         .unwrap();
 
     std::fs::write(&file, "rule two: never force-push\n").unwrap();
-    let second = launch_runtime(&config, ws.clone(), None);
+    let second = launch_runtime(&config, ws.clone(), None).unwrap();
     let system = second.handle.session_messages().await[0].content.text();
     assert!(
         system.contains("rule two") && !system.contains("rule one"),
@@ -982,7 +1010,7 @@ async fn agents_md_is_read_at_each_launch_and_on_resume() {
     second.shutdown().await;
 
     // The record still carries the first prompt; resuming rebuilds it.
-    let resumed = launch_runtime(&config, ws.clone(), Some(record));
+    let resumed = launch_runtime(&config, ws.clone(), Some(record)).unwrap();
     let system = resumed.handle.session_messages().await[0].content.text();
     assert!(
         system.contains("rule two") && !system.contains("rule one"),
@@ -992,7 +1020,7 @@ async fn agents_md_is_read_at_each_launch_and_on_resume() {
 
     // No file: no block, no source, no warning about it.
     std::fs::remove_file(&file).unwrap();
-    let bare = launch_runtime(&config, ws, None);
+    let bare = launch_runtime(&config, ws, None).unwrap();
     let system = bare.handle.session_messages().await[0].content.text();
     assert!(!system.contains("# Project instructions"), "{system}");
     assert!(
@@ -1016,7 +1044,7 @@ fn an_oversized_agents_md_warns_at_launch() {
         "x".repeat(crate::instructions::MAX_INSTRUCTIONS_CHARS + 1),
     )
     .unwrap();
-    let launched = launch_runtime(&AgentConfig::builtin(), ws, None);
+    let launched = launch_runtime(&AgentConfig::builtin(), ws, None).unwrap();
     assert!(launched.instructions.truncated);
     assert!(
         launched
@@ -1081,7 +1109,7 @@ fn compact_instructions_are_wired_from_agents_md_into_the_launch() {
         "# Rules\nbe terse\n\n## Compact Instructions\n- keep the unpushed commit list\n",
     )
     .unwrap();
-    let launched = launch_runtime(&AgentConfig::builtin(), workspace.path(), None);
+    let launched = launch_runtime(&AgentConfig::builtin(), workspace.path(), None).unwrap();
     assert_eq!(
         launched.instructions.compact_instructions.as_deref(),
         Some("- keep the unpushed commit list")

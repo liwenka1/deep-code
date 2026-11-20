@@ -42,15 +42,15 @@ A DeepSeek-powered terminal coding agent, written in Rust. One small binary: str
 - For multi-step work the model keeps a task list with `todo_write`; each update shows in the transcript as a checklist (done struck through, the current step bold), so a long turn reads as "step 3 of 7" rather than a stream of tool calls.
 - Bilingual UI (English / 中文), hot-switchable with `/lang`. Graceful shutdown end to end: SIGTERM/SIGINT drain properly, and process groups are killed as a tree — no orphaned dev servers squatting on ports.
 
-**Model routing**
+**Model and reasoning effort**
 
-- `auto` picks between `deepseek-v4-pro` and `deepseek-flash` (and the reasoning effort) per task, and falls back with retry on rate limits or upstream failures. Pin with `/model` or `provider.model`.
+- DeepCode defaults to `deepseek-flash` with `high` reasoning effort. Use `/model` or set `provider.model` and `provider.reasoning_effort` to choose the model and effort.
 
 **Image understanding**
 
 - **Attach an image by pasting it, dropping a file in, typing `@` in the file menu, or `/image <path>`.** `Ctrl+V` reads the system clipboard and attaches whatever image it carries — a screenshot, a file copied in Finder, a picture copied out of another application — storing it under `<workspace>/.deep-code/images/`, content-addressed so pasting the same shot twice is one file. The terminal's **own** paste key can attach an image too, by two separate routes, and which one applies depends on whether the clipboard carries any text at all: for a file copied in Finder it does (the file's *name*), so a paste that is exactly an image name we cannot open sends us to the clipboard for the file itself; for a screenshot or a picture copied from an application the clipboard is pixels alone, leaving the terminal nothing to send — and a terminal that forwards the empty paste anyway is telling us a paste was requested, which is the second route. A terminal that stays silent in that case leaves `Ctrl+V` as the only key that works, so that is the one to reach for when you want certainty. Dragging a file in works as it always did, because a terminal hands a dropped file over as its path. The composer shows a `[图片 #N PNG]` chip where the image sits, and `/image` with no argument lists what is attached and where it lives.
 - **Images become immutable observations when a turn starts or `read_file` reads them.** The transcript stores a content-addressed asset reference, so editing or deleting the source file does not change a past observation. Text and images stay in order, including native tool results with their original call IDs. Compaction preserves image source metadata without resending archived pixels.
-- **Image preparation happens for each request.** Auto mode selects a vision-capable model for fresh user or tool images; historical images do not lock later text-only turns to that model. Fixed models keep their selection. Unsupported images, missing or damaged assets, and request limits produce explicit omission notes and recorded preparation reports. `[vision] detail` is sent to the provider (`low`, `original`, or `auto`); uploaded bytes are not resized locally. Assets under `<workspace>/.deep-code/images/` are not cleaned up automatically.
+- **Image preparation happens for each request.** Select `flash` in `/model` to use DeepSeek's model with image support. Unsupported images, missing or damaged assets, and request limits produce explicit omission notes and recorded preparation reports. `[vision] detail` is sent to the provider (`low`, `original`, or `auto`). Uploaded bytes keep their original resolution. Assets under `<workspace>/.deep-code/images/` are not cleaned up automatically.
 **Tool workflow**
 
 - **Tool output has a bounded continuation path.** `read_file` returns text pages with `next_start_byte`, even for large files and long UTF-8 lines, and returns image files as visual observations. Oversized generic tool text is saved under `.deep-code/spill/tool-results/`; execution results report independent stdout/stderr windows and spill completeness. If spilling fails, `job action=tail stream=stdout|stderr start_byte=…` pages through the retained memory buffer with an explicit continuation cursor.
@@ -112,7 +112,7 @@ deepcode --add-dir ../host-app
 - **Grants follow the run**: within one `deepcode` run they stay with you — a new conversation started by `/clear` inherits the current grants (the startup banner and transcript always name the effective set).
 - **Human decision only**: there is deliberately no config key for this — a grant is the launch flag, the `/add-dir` command typed at the keyboard, or your explicit approval of the model's `request_write_root` request. A malicious repo cannot self-grant through project config, and the request path has no automatic yes: no permission mode approves it (`yolo` included), config auto-allow and session memory are ignored for it, and its prompt deliberately offers no "approve for session".
 - **Checkpoints cover the primary workspace only**: `/restore` rolls back just the workspace and says so when extra roots are granted (they are usually git repos themselves — roll back there with git).
-- **Denials don't burn tokens**: a write refused by the boundary is a failure no retry can fix, so it is handled as its own class — the first denial tells the model exactly that (teaching `request_write_root`), three in one turn stop the turn with the same guidance for you, and none of them trigger the Pro escalation that ordinary repeated tool failures do.
+- **Repeated write-boundary denials stop the turn.** The first denial tells the model it needs `request_write_root` to expand its write access. Three in one turn stop it and show you the same guidance.
 
 ### Headless one-shot (`-p`)
 
@@ -201,7 +201,7 @@ Trigger prefix, who may trigger it, language, model and permission tier are all 
 Config file: `~/.deep-code/config.toml` (see `config.example.toml` in the repo root).
 Load order: built-in defaults → global → project `.deep-code/config.toml` → environment variables → CLI flags.
 
-Common keys: `provider.model` (`pro`/`flash`/`auto`), `provider.reasoning_effort` (`none`/`low`/`high`/`max`/`auto`), `cost.currency`, `approval.auto_allow` (pre-approved tool names, matched exactly — never prefixes), `ui.notifications` (ring the terminal — BEL plus an OSC 9 desktop notification where supported — when a turn or a `/compact` that ran for a while ends — an error included — or an approval is waiting; on by default). `none` disables thinking; `auto` chooses an effort per task. `provider.model = "auto"` independently chooses Pro or Flash per task.
+Common keys include `provider.model` (`pro`, `flash`, or a model ID listed by `deepcode doctor`), `provider.reasoning_effort` (`none`, `low`, `high`, or `max`), `cost.currency`, `approval.auto_allow` (exact tool names to pre-approve), and `ui.notifications`. Notifications are on by default and use BEL and OSC 9 desktop notifications where supported. They fire when a long turn or `/compact` finishes, including errors, or when approval is pending. `none` disables thinking.
 
 > Keep the API key in an environment variable or the global config; `api_key` in project-level config is ignored, so it can't leak with the repo.
 
@@ -245,7 +245,7 @@ deepcode eval --split test --parallel 4 --timeout 900 --out eval-test  # full te
 deepcode eval --sample 2 --out eval-smoke --resume    # resume the same 2-task run
 ```
 
-Artifacts land in `eval-out/` (change with `--out`): `checkpoint.json` plus `predictions.json` (official format) and `report.json` (per-task time, cost, model and routing source), saved after each completed task. Use the same options and `--out` with `--resume` to skip every saved result, including empty patches, timeouts and errors; only unsaved tasks run again. Resume validates the selected tasks and effective configuration; the API key is not stored and may change, as may concurrency and report format. A fresh run refuses to overwrite an existing checkpoint or report. See the [eval guide](./crates/deep-code-eval/README.md) for recovery details.
+After each completed task, eval saves `checkpoint.json`, `predictions.json` (official format), and `report.json` in `eval-out/` or the directory specified by `--out`. The report includes each task’s time, cost, effective model, and reasoning effort. Use the same options and `--out` with `--resume` to skip every saved result, including empty patches, timeouts, and errors. Resume validates the selected tasks and effective configuration. You can change the API key, which stays out of the checkpoint, as well as concurrency and report format. A fresh run refuses to overwrite an existing checkpoint or report. See the [eval guide](./crates/deep-code-eval/README.md) for recovery details.
 
 Official scoring:
 

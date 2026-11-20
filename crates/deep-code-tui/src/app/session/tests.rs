@@ -9,7 +9,8 @@ fn test_app() -> (tempfile::TempDir, App) {
     let mut app = App::launch(LaunchConfig {
         workspace: Some(workspace.path().to_path_buf()),
         ..Default::default()
-    });
+    })
+    .unwrap();
     app.lang = Lang::Zh;
     app.prompt_history_path = None;
     (workspace, app)
@@ -19,11 +20,14 @@ fn test_app() -> (tempfile::TempDir, App) {
 async fn reconfiguration_keeps_live_history_after_a_failed_save() {
     let (workspace, mut app) = test_app();
     app.shutdown_current_runtime();
-    app.adopt_runtime(deep_code_agent::launch_runtime(
-        &deep_code_agent::AgentConfig::builtin(),
-        workspace.path().to_path_buf(),
-        None,
-    ));
+    app.adopt_runtime(
+        deep_code_agent::launch_runtime(
+            &deep_code_agent::AgentConfig::builtin(),
+            workspace.path().to_path_buf(),
+            None,
+        )
+        .unwrap(),
+    );
     app.global_config_path = Some(workspace.path().join("unused-global-config.toml"));
     let id = app.session_id.clone();
     // The large escaped record needs chunk storage. Make that storage
@@ -62,13 +66,17 @@ async fn reconfiguration_keeps_unpersisted_conversation_and_can_add_a_root() {
     let mut app = App::launch(LaunchConfig {
         workspace: Some(workspace.path().to_path_buf()),
         ..Default::default()
-    });
+    })
+    .unwrap();
     app.shutdown_current_runtime();
-    app.adopt_runtime(deep_code_agent::launch_runtime(
-        &deep_code_agent::AgentConfig::builtin(),
-        workspace.path().to_path_buf(),
-        None,
-    ));
+    app.adopt_runtime(
+        deep_code_agent::launch_runtime(
+            &deep_code_agent::AgentConfig::builtin(),
+            workspace.path().to_path_buf(),
+            None,
+        )
+        .unwrap(),
+    );
     app.global_config_path = Some(workspace.path().join("unused-global-config.toml"));
     let mut events = app
         .runtime
@@ -99,7 +107,10 @@ async fn failed_reconfiguration_retains_the_live_runtime() {
     let old_runtime = Arc::clone(&app.runtime);
     let id = app.session_id.clone();
     // Protect against a turn starting before the UI has consumed TurnStarted.
-    app.runtime.begin_turn("not yet visible in UI").await;
+    app.runtime
+        .begin_turn("not yet visible in UI")
+        .await
+        .unwrap();
     assert!(app.relaunch_runtime().is_err());
     assert!(Arc::ptr_eq(&old_runtime, &app.runtime));
     assert_eq!(app.session_id, id);

@@ -233,6 +233,7 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
         eprintln!("config warning: {}", neutralize_display_text(&warning));
     }
     let config = loaded.config;
+    config.resolved_model()?;
     let resume = load_resume_record(&options)?;
     let launched = launch_runtime(
         &config,
@@ -241,7 +242,7 @@ pub async fn run_http_server(options: RuntimeServerOptions) -> Result<()> {
             options.extra_roots.clone(),
         ),
         resume,
-    );
+    )?;
     // Model-controlled: these interpolate paths out of the session record.
     for warning in &launched.warnings {
         eprintln!("warning: {}", neutralize_display_text(warning));

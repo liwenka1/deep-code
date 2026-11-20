@@ -12,7 +12,8 @@ use crate::echo_client::EchoClient;
 use crate::event::AgentEvent;
 use crate::message::Message;
 use crate::model::ChatRequest;
-use crate::reasoning::ReasoningEffort;
+use crate::model_registry::DEEPSEEK_FLASH;
+use crate::reasoning::ReasoningEffortSetting;
 use crate::runtime::event::{RuntimeEvent, TurnId, emit};
 use crate::runtime::{AgentRuntime, CompactNowOutcome, CompactionReport};
 use crate::session_entry::SessionEntry;
@@ -154,6 +155,9 @@ impl AgentRuntime {
         focus: Option<&str>,
         cancel: &CancellationToken,
     ) -> CompactNowOutcome {
+        if let Err(error) = self.config.resolved_model() {
+            return CompactNowOutcome::Failed(error.user_message(self.ui_lang()));
+        }
         // Measured around the fold, and only here: the automatic path fires on
         // a threshold (so "did it buy anything" is not in question) and its
         // event carries no numbers to report them with.
@@ -371,9 +375,8 @@ impl AgentRuntime {
         focus: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<Handover, HandoverError> {
-        let model = super::approval_flow::classifier_model_for(&self.config, &self.registry);
         let mut request = ChatRequest::streaming(
-            model.clone(),
+            DEEPSEEK_FLASH,
             vec![
                 Message::system(HANDOVER_SYSTEM_PROMPT),
                 Message::user(handover_request(
@@ -385,13 +388,11 @@ impl AgentRuntime {
             ],
         );
         request.max_tokens = Some(HANDOVER_MAX_TOKENS);
-        if let Some(effort) = ReasoningEffort::Low.as_api_value() {
-            request = request.with_reasoning_effort(effort);
-        }
+        request = request.with_reasoning_effort(ReasoningEffortSetting::Low.as_setting());
         tokio::select! {
             biased;
             () = cancel.cancelled() => Err(HandoverError::Cancelled),
-            outcome = tokio::time::timeout(HANDOVER_DEADLINE, self.collect_handover(&model, request)) => {
+            outcome = tokio::time::timeout(HANDOVER_DEADLINE, self.collect_handover(DEEPSEEK_FLASH, request)) => {
                 outcome
                     .unwrap_or_else(|_| {
                         Err(format!("no reply within {}s", HANDOVER_DEADLINE.as_secs()))
@@ -404,7 +405,7 @@ impl AgentRuntime {
     /// Run the summarizer request to completion and return its text, trimmed
     /// and capped at [`MAX_HANDOVER_SUMMARY_CHARS`]; billed to the session like
     /// any other request on the key. Opened with the turn requests' retry and
-    /// guards (`open_side_stream`), so a transient 429 or 503 is retried rather
+    /// guards (`open_stream`), so a transient 429 or 503 is retried rather
     /// than costing the fold.
     async fn collect_handover(
         &self,
@@ -412,7 +413,7 @@ impl AgentRuntime {
         request: ChatRequest,
     ) -> Result<Handover, String> {
         let mut stream = self
-            .open_side_stream(request)
+            .open_stream(request)
             .await
             .map_err(|error| error.to_string())?;
         let mut text = String::new();

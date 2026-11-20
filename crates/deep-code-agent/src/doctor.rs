@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::config::{AgentConfig, ConfigLoadReport, DEEPSEEK_API_KEY_ENV};
 use crate::error::api_key_setup_hint;
-use crate::model_registry::ModelRegistry;
+use crate::model_registry::builtin_registry;
 use crate::paths::home_dir;
 use crate::sandbox::{Enforcement, detect_capabilities};
 use crate::skills::{discover_in_workspace, global_skills_dir, workspace_skills_dir};
@@ -158,7 +158,6 @@ pub struct ModelDoctorEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeepSeekDoctorReport {
-    pub auto_model: bool,
     pub reasoning_effort: String,
     pub cost_currency: String,
     /// `[vision] detail`: how an attached image is offered to the model. Here
@@ -193,7 +192,10 @@ pub struct DoctorReport {
     pub workspace: String,
     pub api_key: ApiKeyReport,
     pub base_url: String,
-    pub default_model: String,
+    /// Canonical ID of the configured model when it is in the catalog.
+    pub default_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_error: Option<String>,
     pub deepseek: DeepSeekDoctorReport,
     pub sandbox: SandboxReport,
     pub skills: SkillsDoctorReport,
@@ -232,6 +234,10 @@ impl DoctorReport {
         let sandbox = detect_capabilities();
         let skills = collect_skills(workspace);
         let deepseek = collect_deepseek(config);
+        let (default_model, model_error) = match config.resolved_model() {
+            Ok(model) => (Some(model.to_owned()), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         let web = WebDoctorReport {
             enabled: crate::runtime_launch::web_enabled(),
             backend: crate::web_tools::WebBackend::from_config(config)
@@ -273,7 +279,8 @@ impl DoctorReport {
             workspace: workspace.display().to_string(),
             api_key: api_key_report(config),
             base_url: config.base_url.clone(),
-            default_model: config.model.clone(),
+            default_model,
+            model_error,
             deepseek,
             sandbox: SandboxReport {
                 available: sandbox.available && !mode_off,
@@ -313,8 +320,7 @@ impl DoctorReport {
 }
 
 fn collect_deepseek(config: &AgentConfig) -> DeepSeekDoctorReport {
-    let registry = ModelRegistry::default();
-    let models = registry
+    let models = builtin_registry()
         .list()
         .iter()
         .map(|model| ModelDoctorEntry {
@@ -337,7 +343,6 @@ fn collect_deepseek(config: &AgentConfig) -> DeepSeekDoctorReport {
         .collect();
 
     DeepSeekDoctorReport {
-        auto_model: config.auto_model_enabled(),
         reasoning_effort: config.reasoning_effort.as_setting().to_string(),
         cost_currency: config.cost_currency.as_setting().to_string(),
         vision_detail: config.vision_detail.as_str().to_string(),
@@ -432,12 +437,37 @@ mod tests {
     #[test]
     fn doctor_report_serializes_to_json() {
         let workspace = TempDir::new().unwrap();
-        let config = AgentConfig::builtin();
+        let config = AgentConfig {
+            model: "flash".to_string(),
+            ..AgentConfig::builtin()
+        };
         let report = DoctorReport::collect(workspace.path(), &config);
         let json = report.to_json_pretty().unwrap();
         assert!(json.contains("\"version\""));
         assert!(json.contains("\"sandbox\""));
         assert!(json.contains("\"skills\""));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["default_model"],
+            crate::model_registry::DEEPSEEK_FLASH
+        );
+        assert_eq!(value["deepseek"]["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn doctor_reports_no_effective_model_when_the_configured_model_is_unknown() {
+        let workspace = TempDir::new().unwrap();
+        let config = AgentConfig {
+            model: "unknown-model".into(),
+            ..AgentConfig::builtin()
+        };
+        let report = DoctorReport::collect(workspace.path(), &config);
+        let json: serde_json::Value =
+            serde_json::from_str(&report.to_json_pretty().unwrap()).unwrap();
+        assert_eq!(json.get("default_model"), Some(&serde_json::Value::Null));
+        let message = json["model_error"].as_str().unwrap();
+        assert!(message.contains("unknown model"));
+        assert!(!message.contains(&config.model));
     }
 
     /// `doctor --json` is the documented contract for local supervisors, so

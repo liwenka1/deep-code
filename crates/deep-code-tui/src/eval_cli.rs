@@ -4,7 +4,7 @@
 //! local report. Scoring stays with the official SWE-bench harness — submit
 //! the predictions via sb-cli to get the real resolved rate.
 
-use deep_code_agent::AgentConfig;
+use deep_code_agent::{AgentConfig, Lang, neutralize_display_text};
 use deep_code_eval::{EvalConfig, load_bench, run_bench};
 
 use crate::cli::{EvalArgs, workspace_root};
@@ -25,7 +25,11 @@ pub async fn run_eval(args: EvalArgs) -> anyhow::Result<()> {
 
     // Load agent config from workspace (respects env vars, global config, etc.).
     let loaded = AgentConfig::load(&workspace);
+    for warning in loaded.report.warnings_in(Lang::En) {
+        eprintln!("config: {}", neutralize_display_text(&warning));
+    }
     let agent_config = loaded.config;
+    agent_config.resolved_model()?;
 
     // A benchmark run against the offline echo backend is meaningless (and
     // wastes hours producing all-empty patches) — refuse instead of warning.

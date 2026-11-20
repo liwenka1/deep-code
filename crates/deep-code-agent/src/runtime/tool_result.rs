@@ -9,7 +9,7 @@ use crate::model::{ToolCallFunctionPayload, ToolCallPayload};
 use crate::runtime::AgentRuntime;
 use crate::runtime::approval_flow::RootGrantPrompt;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
-use crate::runtime::failure_class::record_failure_signals;
+use crate::runtime::failure_class::record_boundary_denial;
 use crate::runtime::state::PendingToolBatch;
 use crate::session_entry::Ask;
 use crate::tool::details::{PreparedPreview, storage_size as details_storage_size};
@@ -536,7 +536,7 @@ impl AgentRuntime {
                 );
             }
             if state.current_turn_id.as_ref() == Some(&turn_id) {
-                record_failure_signals(&mut state, call, &result);
+                record_boundary_denial(&mut state, call, &result);
             }
         }
         // Persistence and SessionUpdated are flushed once per batch boundary
@@ -1127,7 +1127,7 @@ mod tests {
             &crate::AgentConfig::builtin(),
         )
         .unwrap();
-        let turn = runtime.begin_turn("capture output").await;
+        let turn = runtime.begin_turn("capture output").await.unwrap();
         let call = ToolCall::new(
             "capture",
             "mock_echo",

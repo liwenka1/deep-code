@@ -238,8 +238,7 @@ mod tests {
             step_limit_hit: false,
             cost_cny: 0.01,
             model: Some("mock".to_string()),
-            route_source: None,
-            cascade_triggered: false,
+            reasoning_effort: None,
             error: None,
         }
     }

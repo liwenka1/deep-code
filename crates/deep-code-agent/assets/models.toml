@@ -64,11 +64,6 @@
 
 [[model]]
 id = "deepseek-v4-pro"
-# `pro` is the short name the README and the CI bot advertise
-# (`provider.model = pro`, `model: pro`). Without an alias it went through as a
-# `Passthrough` id the API does not know, so EVERY request 400'd and the auto
-# judge fell back to asking: the TUI's `/model pro` mapped it by hand, config,
-# env and the bot did not.
 aliases = ["pro"]
 version = "DeepSeek-V4-Pro-0813"
 
@@ -103,7 +98,6 @@ output_cny = 27.0
 
 [[model]]
 id = "deepseek-flash"
-# `flash` is the advertised short name (see the `pro` note above).
 aliases = ["flash"]
 version = "DeepSeek-V4.1-Flash-1017"
 

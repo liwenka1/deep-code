@@ -45,10 +45,10 @@ use tokio_util::sync::CancellationToken;
 use crate::checkpoint::CheckpointStore;
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
+use crate::error::{AgentError, AgentResult};
 use crate::execution_policy::SharedPermissionMode;
 use crate::lsp::LspManager;
 use crate::message::Message;
-use crate::model_registry::ModelRegistry;
 use crate::session::Session;
 use crate::session_store::{TurnRecord, now_ms};
 use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolRegistry};
@@ -123,7 +123,6 @@ const LIVE_TURN_CANCEL_POLL: std::time::Duration = std::time::Duration::from_mil
 pub struct AgentRuntime {
     client: Arc<dyn LlmClient>,
     config: AgentConfig,
-    registry: ModelRegistry,
     is_subagent: bool,
     tools: Arc<ToolRegistry>,
     state: Arc<Mutex<RuntimeState>>,
@@ -212,7 +211,6 @@ impl AgentRuntime {
         Self {
             client: Arc::new(client),
             config: config.clone(),
-            registry: ModelRegistry::default(),
             is_subagent: false,
             tools: Arc::new(tools),
             state: Arc::new(Mutex::new(RuntimeState::default())),
@@ -256,7 +254,6 @@ impl AgentRuntime {
         Self {
             client,
             config: config.clone(),
-            registry: ModelRegistry::default(),
             is_subagent,
             tools: Arc::new(tools),
             state: Arc::new(Mutex::new(RuntimeState {
@@ -429,12 +426,27 @@ impl AgentRuntime {
     /// [`RuntimeEvent`]s until either the turn finishes or an approval is
     /// required. After approval, call [`Self::submit_approval`] to resume.
     pub async fn submit_user(&self, prompt: impl Into<UserTurn>) -> RuntimeEventReceiver {
-        self.begin_turn(prompt).await;
-        self.drive_turn().await
+        match self.begin_turn(prompt).await {
+            Ok(_) => self.drive_turn().await,
+            Err(error) => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                emit(&tx, self.turn_start_error(None, error));
+                rx
+            }
+        }
+    }
+
+    fn turn_start_error(&self, turn_id: Option<TurnId>, error: AgentError) -> RuntimeEvent {
+        RuntimeEvent::Error {
+            kind: RuntimeFailureKind::Execution,
+            turn_id,
+            message: error.user_message(self.ui_lang()),
+        }
     }
 
     /// Record a user prompt and start turn bookkeeping without spawning the loop.
-    pub async fn begin_turn(&self, prompt: impl Into<UserTurn>) -> TurnId {
+    pub async fn begin_turn(&self, prompt: impl Into<UserTurn>) -> AgentResult<TurnId> {
+        self.config.resolved_model()?;
         // A previous turn may still be live (e.g. the HTTP client disconnected
         // mid-turn and a new prompt arrived): cancel its loop so it stops
         // streaming. The turn-id guard in `finish_turn` keeps that loop's late
@@ -471,11 +483,6 @@ impl AgentRuntime {
             // turn (see `TurnBudget`), so only a new turn starts from zero.
             state.turn_budget = Some(TurnBudget::new(turn_id.clone()));
             state.cancel = CancellationToken::new();
-            // Per-turn struggle counter and the "triggered this turn" flag
-            // reset; the `cascade_escalated` latch intentionally persists for
-            // the rest of the session.
-            state.turn_tool_errors = 0;
-            state.cascade_triggered_this_turn = false;
             state.turn_boundary_denials = 0;
             state.last_boundary_denial_path = None;
             state.turn_cost = Default::default();
@@ -488,7 +495,7 @@ impl AgentRuntime {
             state.steering.clear();
         }
         self.persist().await;
-        turn_id
+        Ok(turn_id)
     }
 
     /// Low-level step driver used by the runtime's focused tests. Application

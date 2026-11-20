@@ -597,50 +597,17 @@ impl App {
 
     fn set_model(&mut self, arg: &str) {
         let registry = deep_code_agent::ModelRegistry::default();
-        let available = || {
-            let mut ids: Vec<String> = registry
+        let Some(info) = registry.info_for(arg) else {
+            let available = registry
                 .list()
                 .iter()
-                .map(|model| model.id.clone())
-                .collect();
-            ids.push(deep_code_agent::AUTO_MODEL.to_string());
-            ids.join(", ")
-        };
-        if arg.is_empty() {
-            self.history.push(HistoryCell::system(self.tr_with(
-                TextId::ModelCurrent,
-                &[
-                    ("model", &self.configured_model),
-                    ("available", &available()),
-                ],
-            )));
-            self.status = self.tr(TextId::StatusModelInfoShown).to_string();
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.status = self.tr_with(TextId::ModelUnknown, &[("available", &available)]);
             return;
-        }
-        // `auto` is the one name here that is NOT a model: it is a sentinel the
-        // turn router answers, so the catalog has no entry for it. Every real
-        // name — canonical id or alias, including the `pro` / `flash` short
-        // names the README advertises — is looked up in the catalog, so `/model`
-        // and `provider.model` cannot disagree about which spellings exist.
-        //
-        // This used to carry its own `pro` / `flash` arms, which is precisely
-        // how the two came to disagree: the arms shadowed the alias table, so
-        // removing an alias there left `/model` still accepting a name that
-        // config, env and the bot had stopped resolving.
-        let resolved = if arg.eq_ignore_ascii_case(deep_code_agent::AUTO_MODEL) {
-            deep_code_agent::AUTO_MODEL.to_string()
-        } else {
-            match registry.info_for(arg) {
-                Some(info) => info.id.clone(),
-                None => {
-                    self.status = self.tr_with(
-                        TextId::ModelUnknown,
-                        &[("name", arg), ("available", &available())],
-                    );
-                    return;
-                }
-            }
         };
+        let resolved = info.id.clone();
         // Before the write, for the reason `set_api_key` gives.
         if self.runtime_busy() {
             self.status = self.busy_status(TextId::BusyRelaunchConfig);
@@ -747,11 +714,6 @@ impl App {
         };
         let telemetry = match self.last_telemetry.as_ref() {
             Some(telemetry) => {
-                let fallback = telemetry
-                    .fallback_reason
-                    .as_deref()
-                    .map(|reason| format!("\nfallback_reason={reason}"))
-                    .unwrap_or_default();
                 let turn_cache = cache_hit_percent(
                     telemetry.cache_hit_tokens.unwrap_or(0),
                     telemetry.cache_miss_tokens.unwrap_or(0),
@@ -770,22 +732,17 @@ impl App {
                     telemetry.session_cache_savings,
                 );
                 format!(
-                    "\neffective_model={}\nroute={}\nroute_source={}\nprefix={}\ncascade_triggered={}\nreasoning={}\nauto_reason={}\nturn_cost={}\nsession_cost={}\n{cache_line}\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}{}",
+                    "\neffective_model={}\nreasoning={}\nprefix={}\nturn_cost={}\nsession_cost={}\n{cache_line}\ncontext={}/{} ({}%)\ncompaction_near={}\nstream_retries={}",
                     telemetry.effective_model,
-                    telemetry.route_label,
-                    telemetry.route_source,
-                    prefix_status_label(telemetry.prefix_status, self.lang),
-                    telemetry.cascade_triggered,
                     telemetry.reasoning_effort,
-                    telemetry.route_reason,
+                    prefix_status_label(telemetry.prefix_status, self.lang),
                     telemetry.turn_cost.format(self.cost_currency),
                     telemetry.session_cost.format(self.cost_currency),
                     telemetry.estimated_context_tokens,
                     telemetry.context_window,
                     telemetry.context_usage_percent,
                     telemetry.near_compaction_threshold,
-                    telemetry.stream_retries,
-                    fallback
+                    telemetry.stream_retries
                 )
             }
             // No turn has run in THIS session yet: a fresh launch, or just after

@@ -215,11 +215,9 @@ fn test_state(workspace: PathBuf, auth_token: Option<String>) -> AppState {
     AppState {
         version: "0.1.0".to_string(),
         auth_token,
-        runtime: Arc::new(Mutex::new(launch_runtime(
-            &AgentConfig::builtin(),
-            workspace,
-            None,
-        ))),
+        runtime: Arc::new(Mutex::new(
+            launch_runtime(&AgentConfig::builtin(), workspace, None).unwrap(),
+        )),
         approval: Arc::new(Mutex::new(None)),
         active_turn: Arc::new(StdMutex::new(None)),
         autonomous_approvals: false,

@@ -42,15 +42,15 @@
 - 多步任务由模型用 `todo_write` 维护清单,每次更新在 transcript 里显示为勾选列表(已完成划线、进行中加粗),长回合读起来是"第 3 步,共 7 步",而不是一串工具调用。
 - 双语界面(English / 中文),`/lang` 热切换。端到端优雅停机:SIGTERM/SIGINT 有界收尾,进程组整树击杀——不会留下占着端口的孤儿 dev server。
 
-**模型路由**
+**模型与思考强度**
 
-- `auto` 按任务在 `deepseek-v4-pro` / `deepseek-flash` 间选择模型与 reasoning effort;限流或上游故障时自动降级重试。可用 `/model` 或 `provider.model` 固定。
+- DeepCode 默认使用 `deepseek-flash` 和 `high` 思考强度。可用 `/model` 选择，或设置 `provider.model` 和 `provider.reasoning_effort`。
 
 **图片理解**
 
 - **粘贴、拖入文件、在文件菜单里打 `@`、或 `/image <路径>`,四种方式都能附加图片。** `Ctrl+V` 读取系统剪贴板,能附加它承载的任何图片——截图、Finder 里复制的文件、从别的应用复制的图片——存到 `<workspace>/.deep-code/images/`,按内容寻址,同一张图贴两次只落一个文件。**终端自己的粘贴键**也有两条路能附加图片,走哪条取决于剪贴板上**有没有文本**:Finder 复制的文件**有**(就是文件名),所以"整段粘贴恰好是一个我们打不开的图片名"会让我们回头去剪贴板取文件本体;截图或从应用里复制的图片**只有像素**,终端没有任何东西可发——而那些在这种情况下仍会转发一个**空粘贴事件**的终端,等于在告诉我们"有人按了粘贴",这是第二条路。终端若在这种情况下保持静默,就只有 `Ctrl+V` 能用,所以想要确定就用它。拖入文件一如既往可用,终端本来就是把拖入的文件以路径形式交出来。输入区在图片所在位置显示 `[图片 #N PNG]` chip,`/image` 不带参数会列出已附加的图片及其位置。
 - **图片在回合开始或被 `read_file` 读取时固定为观察快照。** 会话保存按内容寻址的资产引用,源文件后续修改或删除不会改变已经观察到的图片。文本与图片保持顺序,工具结果保留原来的调用 ID。压缩会机械保留图片来源元数据,不自动重发归档图片的像素。
-- **每次模型请求都会独立准备图片。** 自动模式为新用户图片和工具新读出的图片选择支持视觉的模型,历史图片不会让后续纯文本回合一直固定在视觉模型。固定模型保持用户的选择。不支持的图片、缺失或损坏的资产、请求限额都会产生明确的省略说明和准备记录。`[vision] detail` 传给提供方处理(`low`、`original`、`auto`),本地不缩放上传字节。`<workspace>/.deep-code/images/` 中的资产不会自动清理。
+- **每次模型请求都会独立准备图片。** 在 `/model` 中选择 `flash` 即可使用 DeepSeek 支持视觉的模型。不支持的图片、缺失或损坏的资产、请求限额都会产生明确的省略说明和准备记录。`[vision] detail` 传给提供方处理（`low`、`original`、`auto`），上传图片保留原始分辨率。`<workspace>/.deep-code/images/` 中的资产不会自动清理。
 **工具工作流**
 
 - **工具长输出可以继续读取。** `read_file` 用 `next_start_byte` 读取有界文本页,支持大文件和 UTF-8 超长行,图片文件则返回视觉观察。通用工具的超长文本保存到 `.deep-code/spill/tool-results/`;执行结果分别报告 stdout/stderr 窗口、落盘位置与完整性。落盘失败时,可用 `job action=tail stream=stdout|stderr start_byte=…` 按游标分页读取仍保留在内存中的输出。
@@ -112,7 +112,7 @@ deepcode --add-dir ../host-app
 - **授权跟随本次运行**:同一次 `deepcode` 运行内授权跟人走——`/clear` 开启的新对话继承当前授权(启动横幅与转录始终列出生效集合)。
 - **决定权只在人**:配置文件不提供此项——授权要么是启动参数,要么是键盘敲出的 `/add-dir`,要么是你对模型 `request_write_root` 申请的当场批准。恶意仓库无法借项目配置自授权,申请通道也没有任何自动放行的口子:任何权限档位都不放行(含 `yolo`),配置 auto-allow 与会话记忆对它一律无效,其审批面板也刻意不提供"本会话允许"。
 - **检查点不覆盖附加目录**:`/restore` 只回滚主工作区,并会提示附加目录未回滚(它们通常本身就是 git 仓库,用各自的 git 回滚)。
-- **撞边界不烧 token**:被边界拒绝的写入是重试不可能成功的一类错误,因此单独归类处理——第一次拒绝就把这一点连同 `request_write_root` 告诉模型,一轮内撞满三次直接中止本轮并向你给出同样的指引,且全程不触发普通工具连续失败才有的 Pro 升级。
+- **同一轮内因越过写入边界被拒三次会中止本轮。** 第一次拒绝时会提示模型通过 `request_write_root` 申请扩大写入权限。中止时会向你显示相同的指引。
 
 ### 无头单发(`-p`)
 
@@ -201,7 +201,7 @@ jobs:
 配置文件:`~/.deep-code/config.toml`(可参考仓库根目录的 `config.example.toml`)。
 加载顺序:内置默认 → 全局 → 项目 `.deep-code/config.toml` → 环境变量 → CLI 参数。
 
-常用项:`provider.model`(`pro`/`flash`/`auto`)、`provider.reasoning_effort`(`none`/`low`/`high`/`max`/`auto`)、`cost.currency`、`approval.auto_allow`(预放行的工具全名,精确匹配、不是前缀)、`ui.notifications`(跑了一阵的回合或 `/compact` 结束(报错结束也算)、或有审批在等时响铃——BEL 加支持的终端上的 OSC 9 桌面通知;默认开)。`none` 关闭思考,`auto` 按任务选择强度。`provider.model = "auto"` 则独立地按任务选择 Pro 或 Flash。
+常用配置包括 `provider.model`（`pro`、`flash` 或 `deepcode doctor` 列出的模型 ID）、`provider.reasoning_effort`（`none`、`low`、`high` 或 `max`）、`cost.currency`、`approval.auto_allow`（预放行的工具全名）和 `ui.notifications`。通知默认开启，在长回合或 `/compact` 结束（含报错）或等待审批时发出 BEL 响铃，并在支持的终端发送 OSC 9 桌面通知。`none` 关闭思考。
 
 > API Key 建议放在环境变量或全局配置;项目级配置中的 `api_key` 会被忽略,以防随仓库泄露。
 
@@ -245,7 +245,7 @@ deepcode eval --split test --parallel 4 --timeout 900 --out eval-test  # test �
 deepcode eval --sample 2 --out eval-smoke --resume    # 中断后恢复同一批 2 题
 ```
 
-产物在 `eval-out/`(可用 `--out` 改):`checkpoint.json`、`predictions.json`(官方格式)和 `report.json`(含每题耗时、成本、模型与路由来源),每题结束后保存。中断后保留原参数和 `--out`,加 `--resume` 可跳过所有已保存结果,包括空 patch、超时和错误;只重新执行未保存题。恢复会核对题集和有效配置;API key 不落盘且可以更换,并发数和报告格式也可调整。新一轮不会覆盖已有 checkpoint 或报告,恢复细节见[评测指南](./crates/deep-code-eval/README.md)。
+每题结束后，评测会把 `checkpoint.json`、`predictions.json`（官方格式）和 `report.json` 写入 `eval-out/` 或 `--out` 指定的目录。报告包含每题的耗时、成本、实际模型和思考强度。中断后保留原参数和 `--out`，加 `--resume` 可跳过所有已保存结果，包括空 patch、超时和错误。恢复时会核对题集和有效配置。API key 不写入 checkpoint，可与并发数、报告格式一样调整。新一轮不会覆盖已有 checkpoint 或报告。恢复细节见 [评测指南](./crates/deep-code-eval/README.md)。
 
 官方评分:
 

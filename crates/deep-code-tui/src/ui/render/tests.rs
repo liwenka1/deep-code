@@ -2938,7 +2938,6 @@ fn the_inline_hint_leaves_footer_space_for_the_model_and_badges() {
 
 fn idle_footer_telemetry() -> deep_code_agent::TurnTelemetry {
     deep_code_agent::TurnTelemetry {
-        route_label: String::new(),
         effective_model: "deepseek-v4-pro".to_string(),
         reasoning_effort: "high".to_string(),
         prompt_tokens: 0,
@@ -2949,15 +2948,10 @@ fn idle_footer_telemetry() -> deep_code_agent::TurnTelemetry {
         session_cache_miss_tokens: 0,
         session_cache_savings: Default::default(),
         prefix_status: deep_code_agent::PrefixStatus::Stable,
-        route_reason: String::new(),
-        route_source: String::new(),
-        cascade_triggered: false,
-        fallback_reason: None,
         context_window: 100,
         estimated_context_tokens: 85,
         context_usage_percent: 85,
         near_compaction_threshold: false,
-        used_model_fallback: false,
         stream_retries: 0,
         turn_cost: Default::default(),
         session_cost: Default::default(),

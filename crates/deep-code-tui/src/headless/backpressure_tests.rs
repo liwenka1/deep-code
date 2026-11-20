@@ -244,7 +244,8 @@ fn signals_and_timeout_interrupt_all_stdout_phases() {
                 &AgentConfig::builtin(),
                 deep_code_agent::WorkspaceRoots::new(workspace_root(), Vec::new()),
                 None,
-            );
+            )
+            .unwrap();
             // Keep the normal shutdown hooks, substituting only a local model.
             let previous = std::mem::replace(
                 &mut launched.handle,

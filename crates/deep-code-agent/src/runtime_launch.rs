@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client::{DeepSeekClient, LlmClient};
 use crate::config::AgentConfig;
 use crate::echo_client::EchoClient;
+use crate::error::AgentResult;
 use crate::execution_policy::SharedPermissionMode;
 use crate::extensions::{attach_agent_extensions, build_runtime_system_prompt};
 use crate::i18n::{Lang, SharedLang};
@@ -240,6 +241,7 @@ pub fn relaunch_runtime(
     mut roots: WorkspaceRoots,
     resume: Option<SessionRecord>,
 ) -> std::io::Result<LaunchedRuntime> {
+    validate_launch_model(config)?;
     let warnings = validate_inherited_roots(&mut roots)?;
     let mut launched = launch_runtime_pinned(config, roots, resume);
     launched.warnings.splice(0..0, warnings);
@@ -255,6 +257,7 @@ pub fn prepare_runtime_resume(
     mut roots: WorkspaceRoots,
     record: SessionRecord,
 ) -> std::io::Result<LaunchedRuntime> {
+    validate_launch_model(config)?;
     let mut warnings = validate_inherited_roots(&mut roots)?;
     let session = prepare_resumed_session(record, roots.primary, roots.extras)?;
     if session.store.is_none() {
@@ -264,6 +267,13 @@ pub fn prepare_runtime_resume(
     warnings.append(&mut launched.warnings);
     launched.warnings = warnings;
     Ok(launched)
+}
+
+fn validate_launch_model(config: &AgentConfig) -> std::io::Result<()> {
+    config
+        .resolved_model()
+        .map(drop)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 fn validate_inherited_roots(roots: &mut WorkspaceRoots) -> std::io::Result<Vec<String>> {
@@ -294,6 +304,7 @@ pub fn prepare_runtime_reconfiguration(
     mut roots: WorkspaceRoots,
     snapshot: crate::runtime::LiveSessionSnapshot,
 ) -> std::io::Result<LaunchedRuntime> {
+    validate_launch_model(config)?;
     let mut warnings = validate_inherited_roots(&mut roots)?;
     let mut record = snapshot.record;
     if record.workspace != roots.primary {
@@ -348,11 +359,13 @@ pub fn prepare_runtime_reconfiguration(
     ))
 }
 
+/// Validate the configured model before creating or updating session state.
 pub fn launch_runtime(
     config: &AgentConfig,
     roots: impl Into<WorkspaceRoots>,
     resume: Option<SessionRecord>,
-) -> LaunchedRuntime {
+) -> AgentResult<LaunchedRuntime> {
+    config.resolved_model()?;
     let mut roots = roots.into();
     if let Ok(canonical) = crate::paths::canonicalize(&roots.primary) {
         roots.primary = canonical;
@@ -364,7 +377,7 @@ pub fn launch_runtime(
             *extra = canonical;
         }
     }
-    launch_runtime_pinned(config, roots, resume)
+    Ok(launch_runtime_pinned(config, roots, resume))
 }
 
 fn launch_runtime_pinned(

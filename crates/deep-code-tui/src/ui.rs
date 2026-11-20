@@ -46,26 +46,28 @@ pub(crate) fn watch_interrupt() -> io::Result<crate::interrupt::Interrupt> {
 pub async fn run(config: LaunchConfig, interrupted: &CancellationToken) -> Result<()> {
     // Configuration, prompt history and skill discovery can block in file I/O.
     // Wait interruptibly and enter raw mode only after initialization succeeds.
-    let mut initializing = tokio::task::spawn_blocking(move || {
-        // Keep background diagnostics off the eventual alternate screen. The
-        // log itself is workspace I/O, so opening it also belongs on the worker.
-        redirect_stderr_to_log();
-        install_panic_hook();
-        App::launch(config)
-    });
+    let mut initializing =
+        tokio::task::spawn_blocking(move || -> deep_code_agent::AgentResult<App> {
+            let app = App::launch(config)?;
+            // Keep background diagnostics off the eventual alternate screen. The
+            // terminal still receives initialization errors before redirection.
+            redirect_stderr_to_log();
+            install_panic_hook();
+            Ok(app)
+        });
     let mut app = tokio::select! {
         biased;
         () = interrupted.cancelled() => {
             // Dispose of a late result if the caller remains alive. No terminal
             // state has changed, so main can immediately exit with code 130.
             tokio::spawn(async move {
-                if let Ok(app) = initializing.await {
+                if let Ok(Ok(app)) = initializing.await {
                     app.shutdown_runtime().await;
                 }
             });
             return Err(deep_code_agent::SessionStoreError::Cancelled.into());
         }
-        result = &mut initializing => result?,
+        result = &mut initializing => result??,
     };
     let (mut terminal, mut cleanup) = match setup_terminal(interrupted) {
         Ok(terminal) => terminal,

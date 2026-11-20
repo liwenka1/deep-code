@@ -71,23 +71,18 @@ pub fn print_summary(report: &BenchReport) {
     println!();
 
     for r in &report.results {
-        let route = match (&r.model, &r.route_source) {
-            (Some(model), Some(source)) => format!(", {model}/{source}"),
+        let model = match (&r.model, &r.reasoning_effort) {
+            (Some(model), Some(effort)) => format!(", {model} ({effort})"),
             (Some(model), None) => format!(", {model}"),
             _ => String::new(),
         };
         println!(
-            "  {} {}  ({}s, patch={}b, ¥{:.4}{route}{}){}",
+            "  {} {}  ({}s, patch={}b, ¥{:.4}{model}){}",
             status_icon(&r.status),
             r.instance_id,
             r.duration_ms / 1000,
             r.patch.len(),
             r.cost_cny,
-            if r.cascade_triggered {
-                ", ⚡cascade"
-            } else {
-                ""
-            },
             r.error
                 .as_ref()
                 .map(|e| format!("  error={e}"))
@@ -125,18 +120,18 @@ pub fn to_markdown(report: &BenchReport) -> String {
         report.duration_ms as f64 / 1000.0
     ));
     md.push_str("\n### 实例详情\n\n");
-    md.push_str("| 实例 | 状态 | 耗时 | Patch | 成本 | 路由 |\n");
-    md.push_str("|------|------|------|-------|------|------|\n");
+    md.push_str("| 实例 | 状态 | 耗时 | Patch | 成本 | 模型 | 思考强度 |\n");
+    md.push_str("|------|------|------|-------|------|------|----------|\n");
     for r in &report.results {
         md.push_str(&format!(
-            "| {} | {} | {}s | {}b | ¥{:.4} | {}{} |\n",
+            "| {} | {} | {}s | {}b | ¥{:.4} | {} | {} |\n",
             r.instance_id,
             status_icon(&r.status),
             r.duration_ms / 1000,
             r.patch.len(),
             r.cost_cny,
             r.model.as_deref().unwrap_or("-"),
-            if r.cascade_triggered { " ⚡" } else { "" },
+            r.reasoning_effort.as_deref().unwrap_or("-"),
         ));
     }
     md

@@ -13,7 +13,7 @@ pub use write::{GlobalConfigUpdate, validate_api_key, write_global_config_update
 use crate::error::{AgentError, AgentResult};
 use crate::execution_policy::{NetworkMode, PermissionMode};
 use crate::image::ImageDetail;
-use crate::model_registry::{AUTO_MODEL, DEEPSEEK_V4_PRO};
+use crate::model_registry::{DEFAULT_MODEL, builtin_registry};
 use crate::pricing::CostCurrency;
 use crate::reasoning::ReasoningEffortSetting;
 
@@ -60,7 +60,6 @@ pub const MODEL_ENV: &str = "DEEP_CODE_MODEL";
 pub const LANG_ENV: &str = "DEEP_CODE_LANG";
 pub const REASONING_EFFORT_ENV: &str = "DEEP_CODE_REASONING_EFFORT";
 pub const COST_CURRENCY_ENV: &str = "DEEP_CODE_COST_CURRENCY";
-pub const AUTO_COST_SAVING_ENV: &str = "DEEP_CODE_AUTO_COST_SAVING";
 pub const COMPACTION_THRESHOLD_ENV: &str = "DEEP_CODE_COMPACTION_THRESHOLD";
 pub const STREAM_MAX_RETRIES_ENV: &str = "DEEP_CODE_STREAM_MAX_RETRIES";
 pub const STREAM_CHUNK_TIMEOUT_ENV: &str = "DEEP_CODE_STREAM_CHUNK_TIMEOUT_SECS";
@@ -91,7 +90,6 @@ pub struct AgentConfig {
     pub base_url: String,
     pub model: String,
     pub reasoning_effort: ReasoningEffortSetting,
-    pub auto_cost_saving: bool,
     pub cost_currency: CostCurrency,
     /// Override compaction token threshold (for dev/testing).
     pub compaction_threshold: Option<u32>,
@@ -192,9 +190,8 @@ impl AgentConfig {
         Self {
             api_key: None,
             base_url: DEFAULT_DEEPSEEK_BASE_URL.to_string(),
-            model: DEEPSEEK_V4_PRO.to_string(),
+            model: DEFAULT_MODEL.to_string(),
             reasoning_effort: ReasoningEffortSetting::High,
-            auto_cost_saving: false,
             cost_currency: CostCurrency::Cny,
             compaction_threshold: None,
             timeout: Some(Duration::from_secs(60)),
@@ -216,16 +213,16 @@ impl AgentConfig {
         }
     }
 
-    #[must_use]
-    pub fn auto_model_enabled(&self) -> bool {
-        self.model.trim().eq_ignore_ascii_case(AUTO_MODEL)
-    }
-
     pub fn require_api_key(&self) -> AgentResult<&str> {
         self.api_key
             .as_deref()
             .filter(|key| !key.trim().is_empty())
             .ok_or(AgentError::MissingApiKey)
+    }
+
+    /// Resolve the configured model to a canonical ID in the built-in catalog.
+    pub fn resolved_model(&self) -> AgentResult<&'static str> {
+        builtin_registry().resolve(Some(&self.model))
     }
 
     #[must_use]
@@ -264,7 +261,7 @@ mod tests {
         let config = AgentConfig::builtin();
 
         assert_eq!(config.base_url, DEFAULT_DEEPSEEK_BASE_URL);
-        assert_eq!(config.model, DEEPSEEK_V4_PRO);
+        assert_eq!(config.model, crate::model_registry::DEEPSEEK_FLASH);
         assert_eq!(config.cost_currency, CostCurrency::Cny);
         assert_eq!(
             config.chat_completions_url(),
@@ -307,19 +304,5 @@ mod tests {
             config.require_api_key(),
             Err(AgentError::MissingApiKey)
         ));
-    }
-
-    #[test]
-    fn auto_model_flag() {
-        let config = AgentConfig {
-            model: AUTO_MODEL.to_string(),
-            ..AgentConfig::builtin()
-        };
-        assert!(config.auto_model_enabled());
-        let fixed = AgentConfig {
-            model: DEEPSEEK_V4_PRO.to_string(),
-            ..AgentConfig::builtin()
-        };
-        assert!(!fixed.auto_model_enabled());
     }
 }

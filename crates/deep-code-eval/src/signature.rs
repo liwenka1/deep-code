@@ -123,7 +123,6 @@ fn signature_with_environment(
         base_url,
         model,
         reasoning_effort,
-        auto_cost_saving,
         cost_currency,
         compaction_threshold,
         timeout,
@@ -161,7 +160,6 @@ fn signature_with_environment(
             "base_url_sha256": sha256(base_url.as_bytes()),
             "model": model,
             "reasoning_effort": reasoning_effort,
-            "auto_cost_saving": auto_cost_saving,
             "cost_currency": cost_currency,
             "compaction_threshold": compaction_threshold,
             "timeout": timeout,
@@ -271,7 +269,7 @@ mod tests {
         let data = instances();
         let baseline = signature_with_environment(&initial, &data, &env).unwrap();
         let changes: [fn(&mut EvalConfig); 8] = [
-            |config| config.agent_config.model = "auto".into(),
+            |config| config.agent_config.model = deep_code_agent::DEEPSEEK_V4_PRO.into(),
             |config| {
                 config.agent_config.reasoning_effort =
                     serde_json::from_value(json!("none")).unwrap();

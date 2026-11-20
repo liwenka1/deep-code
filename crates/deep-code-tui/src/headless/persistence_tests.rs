@@ -54,7 +54,8 @@ async fn storage_pressure_compacts_before_headless_loses_new_messages() {
             compaction_threshold: Some(u32::MAX),
             ..AgentConfig::builtin()
         };
-        let launched = launch_runtime(&config, workspace.path().to_path_buf(), Some(record));
+        let launched =
+            launch_runtime(&config, workspace.path().to_path_buf(), Some(record)).unwrap();
         assert!(
             launched.offline,
             "the regression must never contact a provider"
@@ -107,7 +108,8 @@ async fn unsavable_current_turn_returns_an_error_instead_of_success() {
         &AgentConfig::builtin(),
         workspace.path().to_path_buf(),
         Some(record),
-    );
+    )
+    .unwrap();
     assert!(launched.offline);
     let handle = launched.handle.clone();
     let token = CancellationToken::new();

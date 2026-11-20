@@ -8,16 +8,16 @@ fn app_with_saved_target() -> (tempfile::TempDir, App, SessionRecord) {
     let mut app = App::launch(LaunchConfig {
         workspace: Some(workspace.path().to_path_buf()),
         ..Default::default()
-    });
+    })
+    .unwrap();
     app.lang = Lang::Zh;
     app.prompt_history_path = None;
     // Keep the live client offline even on a machine with user configuration.
     app.shutdown_current_runtime();
-    app.adopt_runtime(deep_code_agent::launch_runtime(
-        &AgentConfig::builtin(),
-        app.workspace.clone(),
-        None,
-    ));
+    app.adopt_runtime(
+        deep_code_agent::launch_runtime(&AgentConfig::builtin(), app.workspace.clone(), None)
+            .unwrap(),
+    );
     app.global_config_path = Some(workspace.path().join("unused-global-config.toml"));
     let store = JsonSessionStore::for_pinned_workspace(&app.workspace).unwrap();
     let mut target = SessionRecord::new(app.workspace.clone(), "saved target system prompt");
@@ -224,7 +224,10 @@ async fn a_runtime_turn_not_yet_visible_to_the_ui_prevents_resume_preparation() 
     let current_id = app.session_id.clone();
     let target_path = record_path(&app, target.id.as_str());
     let target_bytes = std::fs::read(&target_path).unwrap();
-    let turn_id = current.begin_turn("not yet consumed by the UI").await;
+    let turn_id = current
+        .begin_turn("not yet consumed by the UI")
+        .await
+        .unwrap();
     assert!(!app.runtime_busy());
     assert_eq!(current.live_turn_id().await, Some(turn_id.clone()));
 
@@ -255,7 +258,10 @@ async fn a_turn_started_after_preparation_prevents_committing_a_ready_candidate(
     let target_bytes = std::fs::read(&target_path).unwrap();
     app.switch_session(target).unwrap();
     wait_for_ready(|| app.session_switch.as_ref().unwrap().task.is_ready()).await;
-    let turn_id = current.begin_turn("started after resume preparation").await;
+    let turn_id = current
+        .begin_turn("started after resume preparation")
+        .await
+        .unwrap();
     assert!(!app.runtime_busy());
 
     assert!(app.poll_session_scan());

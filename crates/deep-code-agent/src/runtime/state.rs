@@ -227,24 +227,10 @@ pub(super) struct RuntimeState {
     /// and an offline consent never covers the egress variant. In-memory only;
     /// compound commands are never matched (they keep prompting).
     pub(super) session_trusted_shell_prefixes: HashSet<(String, bool)>,
-    /// Cascade routing latch: set once Flash visibly struggles (repeated
-    /// tool-call execution failures within a turn). Sticky for the rest of the
-    /// session, forcing auto mode onto Pro. In-memory only.
-    pub(super) cascade_escalated: bool,
-    /// Tool-call execution failures observed in the current turn; reset at the
-    /// start of each turn. Crossing the cascade threshold latches `cascade_escalated`.
-    pub(super) turn_tool_errors: u32,
-    /// True only for the turn in which `cascade_escalated` flipped on, so
-    /// telemetry can surface the escalation at the moment it triggers (the
-    /// triggering turn still finishes on Flash). Reset at the start of each turn.
-    pub(super) cascade_triggered_this_turn: bool,
     /// Boundary denials (writes refused by the granted-roots fence — tool-layer
     /// path rejections and sandboxed shell write denials) observed in the
-    /// current turn; reset at the start of each turn. Counted apart from
-    /// `turn_tool_errors` because the two classes need opposite responses: an
-    /// ordinary failure is something a stronger model might fix (cascade), a
-    /// boundary denial is something only the user can fix (`/add-dir`) — the
-    /// turn loop trips a circuit breaker on this counter instead of retrying.
+    /// current turn. The turn loop trips a circuit breaker on this counter
+    /// because only the user can grant the denied path with `/add-dir`.
     pub(super) turn_boundary_denials: u32,
     /// The most recent boundary-denied path (from the tool call's `path`
     /// argument), when one was extractable — shell denials don't carry one.

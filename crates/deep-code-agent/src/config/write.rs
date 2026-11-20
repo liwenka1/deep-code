@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use toml_edit::{Document, value};
 
 use crate::i18n::{Lang, TextId, tr, tr_with};
+use crate::model_registry::builtin_registry;
 
 /// One field update to the global config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,7 +20,7 @@ pub enum GlobalConfigUpdate {
     /// `Some(key)` sets the API key, `None` removes it (logout).
     ApiKey(Option<String>),
     Model(String),
-    /// Provider reasoning effort (`none`, `low`, `high`, `max`, or `auto`).
+    /// Provider reasoning effort (`none`, `low`, `high`, or `max`).
     ReasoningEffort(String),
     /// Atomically update the model and reasoning effort selected together by
     /// the interactive picker. Keeping both fields in one document write
@@ -56,6 +57,14 @@ pub fn write_global_config_update(
     update: &GlobalConfigUpdate,
     lang: Lang,
 ) -> Result<PathBuf, String> {
+    if let GlobalConfigUpdate::Model(model) | GlobalConfigUpdate::ModelAndReasoning { model, .. } =
+        update
+    {
+        builtin_registry()
+            .resolve(Some(model))
+            .map_err(|error| error.user_message(lang))?;
+    }
+
     let mut document = match fs::read_to_string(path) {
         Ok(existing) => existing.parse::<Document>().map_err(|error| {
             tr_with(
@@ -305,7 +314,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
-            "# 用户自己的注释\n[provider]\napi_key = \"sk-oldoldoldoldold\"\nmodel = \"auto\" # 行尾注释\n\n[cost]\ncurrency = \"usd\"\n",
+            "# 用户自己的注释\n[provider]\napi_key = \"sk-oldoldoldoldold\"\nmodel = \"deepseek-v4-pro\" # 行尾注释\n\n[cost]\ncurrency = \"usd\"\n",
         )
         .unwrap();
 
@@ -329,7 +338,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
-            "[provider]\nmodel = \"auto\"\nreasoning_effort = \"auto\"\n",
+            "[provider]\nmodel = \"deepseek-v4-pro\"\nreasoning_effort = \"high\"\n",
         )
         .unwrap();
 
@@ -355,10 +364,32 @@ mod tests {
     }
 
     #[test]
+    fn unknown_model_update_leaves_config_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "[provider]\nmodel = \"pro\"\nreasoning_effort = \"high\"\n";
+        fs::write(&path, original).unwrap();
+
+        let unknown = "unrecognized-model-value";
+        for update in [
+            GlobalConfigUpdate::Model(unknown.to_owned()),
+            GlobalConfigUpdate::ModelAndReasoning {
+                model: unknown.to_owned(),
+                reasoning_effort: "low".to_owned(),
+            },
+        ] {
+            let error = write_global_config_update(&path, &update, Lang::Zh).unwrap_err();
+            assert!(error.contains("无法识别"));
+            assert!(!error.contains(unknown));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
     fn language_update_writes_ui_section() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(&path, "[provider]\nmodel = \"auto\"\n").unwrap();
+        fs::write(&path, "[provider]\nmodel = \"deepseek-v4-pro\"\n").unwrap();
 
         write_global_config_update(
             &path,
@@ -370,7 +401,10 @@ mod tests {
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("[ui]"));
         assert!(contents.contains("language = \"en\""));
-        assert!(contents.contains("model = \"auto\""), "provider untouched");
+        assert!(
+            contents.contains("model = \"deepseek-v4-pro\""),
+            "provider untouched"
+        );
 
         // The layered loader reads it back.
         let loaded = crate::config::AgentConfig::load_with(Some(path), None, &|_| None);
@@ -383,7 +417,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
-            "[provider]\napi_key = \"sk-deletemedeleteme\"\nmodel = \"auto\"\n",
+            "[provider]\napi_key = \"sk-deletemedeleteme\"\nmodel = \"deepseek-v4-pro\"\n",
         )
         .unwrap();
 
@@ -391,6 +425,6 @@ mod tests {
 
         let contents = fs::read_to_string(&path).unwrap();
         assert!(!contents.contains("api_key"));
-        assert!(contents.contains("model = \"auto\""));
+        assert!(contents.contains("model = \"deepseek-v4-pro\""));
     }
 }

@@ -155,8 +155,21 @@ impl AgentRuntime {
         let runtime = self.clone();
         let prompt = prompt.into();
         tokio::spawn(async move {
-            let id = runtime.begin_turn(prompt).await;
-            let turn = runtime.drive_turn_handle(id).await;
+            let turn = match runtime.begin_turn(prompt).await {
+                Ok(id) => runtime.drive_turn_handle(id).await,
+                Err(error) => {
+                    let id = TurnId::new();
+                    let (tx, events) = mpsc::unbounded_channel();
+                    super::event::emit(&tx, runtime.turn_start_error(Some(id.clone()), error));
+                    TurnHandle {
+                        runtime,
+                        id,
+                        events,
+                        outcome: None,
+                        cancel: tokio_util::sync::CancellationToken::new(),
+                    }
+                }
+            };
             let _ = ready.send(turn);
         });
         receive.await.expect("runtime turn bootstrap stopped")

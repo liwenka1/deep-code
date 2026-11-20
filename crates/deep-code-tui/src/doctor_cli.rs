@@ -110,18 +110,19 @@ pub fn run_doctor(json: bool) -> anyhow::Result<()> {
         }
     }
     println!("  api key: {}", report.api_key.source);
+    if let Some(model) = &report.default_model {
+        println!(
+            "  model: {} @ {} (reasoning={})",
+            clean(model),
+            clean(&report.base_url),
+            report.deepseek.reasoning_effort
+        );
+    } else if let Some(error) = &report.model_error {
+        println!("  model error: {}", clean(error));
+    }
     println!(
-        "  model: {} @ {}",
-        clean(&report.default_model),
-        clean(&report.base_url)
-    );
-    println!(
-        "  deepseek: auto_model={} reasoning={} currency={} beta={} vision_detail={}",
-        report.deepseek.auto_model,
-        report.deepseek.reasoning_effort,
-        report.deepseek.cost_currency,
-        report.deepseek.beta_endpoint,
-        report.deepseek.vision_detail
+        "  deepseek: currency={} beta={} vision_detail={}",
+        report.deepseek.cost_currency, report.deepseek.beta_endpoint, report.deepseek.vision_detail
     );
     for model in &report.deepseek.models {
         // What the model CAN do, as names. A row of `vision=false` flags is

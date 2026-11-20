@@ -7,8 +7,7 @@ use crate::compaction::estimate_token_count;
 use crate::error::AgentError;
 use crate::event::AgentEvent;
 use crate::model::{ChatRequest, Usage};
-use crate::model_registry::{DEEPSEEK_V4_PRO, context_window_for_model};
-use crate::model_route::{RouteContext, resolve_turn_route};
+use crate::model_registry::context_window_for_model;
 use crate::runtime::AgentRuntime;
 use crate::runtime::compaction_flow::{FoldOutcome, Trigger};
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
@@ -167,37 +166,18 @@ impl AgentRuntime {
         cancel: CancellationToken,
         tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let (user_prompt, route_ctx) = {
-            let state = self.state.lock().await;
-            if state.current_turn_id.as_ref() != Some(&turn_id) {
-                return;
-            }
-            let context_tokens = estimate_token_count(&state.session.wire_messages());
-            let prompt = state.current_prompt.clone().unwrap_or_default();
-            (
-                prompt.text.clone(),
-                RouteContext {
-                    context_tokens,
-                    context_window: context_window_for_model(DEEPSEEK_V4_PRO),
-                    escalated: state.cascade_escalated,
-                    has_images: state.session.turn_has_images(&turn_id),
-                },
-            )
-        };
+        if self.state.lock().await.current_turn_id.as_ref() != Some(&turn_id) {
+            return;
+        }
         if cancel.is_cancelled() {
             self.finish_turn_cancelled(&turn_id, tx).await;
             return;
         }
-        // Routing is deterministic and local (no network): Flash-first unless a
-        // hard rule or difficulty keyword forces Pro, plus the cascade latch.
-        let mut route = resolve_turn_route(
-            &self.config,
-            &self.registry,
-            &user_prompt,
-            self.is_subagent,
-            route_ctx,
-            self.ui_lang(),
-        );
+        let model = self
+            .config
+            .resolved_model()
+            .expect("begin_turn validates the model");
+        let reasoning_effort = self.config.reasoning_effort.as_setting();
 
         let mut stream_retries = 0u32;
 
@@ -274,8 +254,7 @@ impl AgentRuntime {
             // turn grew the context without ever re-checking the threshold — the
             // exact shape that overflows the window, and a context-overflow 400
             // is not retriable and has no recovery path.
-            self.maybe_compact(&route.effective_model, tx, &cancel, &turn_id)
-                .await;
+            self.maybe_compact(model, tx, &cancel, &turn_id).await;
 
             // Mid-turn steering lands here. The iteration above ran to its
             // `continue`, i.e. a tool batch finished, so the session now ends on
@@ -296,26 +275,6 @@ impl AgentRuntime {
                 let state = self.state.lock().await;
                 let (messages, image_occurrences) =
                     state.session.wire_messages_with_image_occurrences();
-                let mut selected = resolve_turn_route(
-                    &self.config,
-                    &self.registry,
-                    &user_prompt,
-                    self.is_subagent,
-                    RouteContext {
-                        context_tokens: estimate_token_count(&messages),
-                        context_window: context_window_for_model(DEEPSEEK_V4_PRO),
-                        escalated: state.cascade_escalated,
-                        has_images: state.session.turn_has_images(&turn_id),
-                    },
-                    self.ui_lang(),
-                );
-                if route.used_model_fallback {
-                    selected.effective_model = route.effective_model.clone();
-                    selected.effective_effort = route.effective_effort;
-                    selected.used_model_fallback = true;
-                    selected.fallback_reason = route.fallback_reason.clone();
-                }
-                route = selected;
                 (
                     messages,
                     state.last_prefix,
@@ -323,14 +282,9 @@ impl AgentRuntime {
                     image_occurrences,
                 )
             };
-            // Keep an unresolved template. Each attempt prepares images for
-            // its selected model; fallback must never reuse a projection that
-            // already removed observations for a different model.
-            let mut request = ChatRequest::streaming(route.effective_model.clone(), messages)
-                .with_tools(self.tools.chat_tools());
-            if let Some(effort) = route.effective_effort.as_api_value() {
-                request = request.with_reasoning_effort(effort);
-            }
+            let request = ChatRequest::streaming(model, messages)
+                .with_tools(self.tools.chat_tools())
+                .with_reasoning_effort(reasoning_effort);
 
             let estimated_context_tokens = estimate_token_count(&request.messages);
             // Our own read on how close this request is to the window, used only
@@ -338,12 +292,12 @@ impl AgentRuntime {
             // ours to rely on across versions; this number is, so the rescue has
             // a signal that does not depend on it.
             let near_window = estimated_context_tokens
-                >= context_window_for_model(&route.effective_model).saturating_mul(95) / 100;
+                >= context_window_for_model(model).saturating_mul(95) / 100;
 
             let opened = tokio::select! {
                 biased;
                 () = cancel.cancelled() => None,
-                opened = self.open_turn_stream(&mut route, request) => Some(opened),
+                opened = self.open_turn_stream(request) => Some(opened),
             };
             // A 400 the provider blames on the context window, OR any 400 at a
             // context we ourselves read as within 5% of it. Two independent
@@ -447,7 +401,7 @@ impl AgentRuntime {
                     image
                 })
                 .collect();
-            self.record_image_projection(&turn_id, &route.effective_model, &image_deliveries, tx)
+            self.record_image_projection(&turn_id, model, &image_deliveries, tx)
                 .await;
 
             let mut accumulator = ToolCallAccumulator::default();
@@ -522,8 +476,7 @@ impl AgentRuntime {
                         // session costs honest even when the turn is later
                         // cancelled or errors out mid-way.
                         if let Some(usage) = usage.as_ref() {
-                            self.accumulate_request_usage(&route.effective_model, usage)
-                                .await;
+                            self.accumulate_request_usage(model, usage).await;
                         }
                         last_usage = usage;
                     }
@@ -636,7 +589,7 @@ impl AgentRuntime {
                 let usage = last_usage.clone();
                 let telemetry = self
                     .build_turn_telemetry(
-                        &route,
+                        model,
                         usage.as_ref(),
                         prefix,
                         estimated_context_tokens,

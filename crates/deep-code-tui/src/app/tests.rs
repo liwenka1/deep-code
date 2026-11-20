@@ -517,7 +517,6 @@ fn approval_scroll_helpers_adjust_panel_offset() {
 fn status_includes_deepseek_native_telemetry() {
     let mut app = App::new();
     app.last_telemetry = Some(TurnTelemetry {
-        route_label: "auto→deepseek-flash (high)".to_string(),
         effective_model: "deepseek-flash".to_string(),
         reasoning_effort: "high".to_string(),
         prompt_tokens: 100,
@@ -528,15 +527,10 @@ fn status_includes_deepseek_native_telemetry() {
         session_cache_miss_tokens: 20,
         session_cache_savings: deep_code_agent::CostEstimate::default(),
         prefix_status: deep_code_agent::PrefixStatus::Stable,
-        route_reason: "短提示优先使用 Flash".to_string(),
-        route_source: "heuristic".to_string(),
-        cascade_triggered: false,
-        fallback_reason: None,
         context_window: 1_000_000,
         estimated_context_tokens: 120,
         context_usage_percent: 1,
         near_compaction_threshold: false,
-        used_model_fallback: false,
         stream_retries: 2,
         turn_cost: deep_code_agent::CostEstimate {
             cny: 0.001,
@@ -553,7 +547,7 @@ fn status_includes_deepseek_native_telemetry() {
         app.history.last(),
         Some(HistoryCell::System { text })
             if text.contains("effective_model=deepseek-flash")
-                && text.contains("auto_reason=短提示优先使用 Flash")
+                && text.contains("\nreasoning=high\n")
                 && text.contains("session_cost=¥0.0020")
                 && text.contains("stream_retries=2")
     ));
@@ -1095,9 +1089,12 @@ fn model_command_resolves_aliases_persists_and_keeps_session() {
     assert!(app.handle_slash_command("/model flash"));
     assert_eq!(app.configured_model, deep_code_agent::DEEPSEEK_FLASH);
 
-    assert!(app.handle_slash_command("/model nope"));
-    assert!(app.status.contains("未知模型"));
-    assert!(app.status.contains("auto"));
+    assert!(app.handle_slash_command("/model unknown-model"));
+    assert!(app.status.contains("无法识别该模型"));
+    assert!(!app.status.contains("unknown-model"));
+    assert!(app.status.contains(deep_code_agent::DEEPSEEK_V4_PRO));
+    assert!(app.status.contains(deep_code_agent::DEEPSEEK_FLASH));
+    assert_eq!(app.configured_model, deep_code_agent::DEEPSEEK_FLASH);
 
     assert!(app.handle_slash_command("/model"));
     assert!(app.model_picker_open());
@@ -1116,19 +1113,68 @@ fn model_command_resolves_aliases_persists_and_keeps_session() {
 }
 
 #[test]
+fn an_unknown_configured_model_cannot_replace_a_live_session() {
+    const CHILD: &str = "DEEP_CODE_UNKNOWN_MODEL_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::tests::an_unknown_configured_model_cannot_replace_a_live_session",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env_remove("DEEP_CODE_MODEL")
+            .env_remove("DEEPSEEK_API_KEY")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "model validation test child failed: {status}"
+        );
+        return;
+    }
+
+    let workspace = tempfile::tempdir().unwrap();
+    let launch = LaunchConfig {
+        workspace: Some(workspace.path().to_path_buf()),
+        ..LaunchConfig::default()
+    };
+    let mut app = App::launch(launch.clone()).unwrap();
+    let current = Arc::clone(&app.runtime);
+    let session = app.session_id.clone();
+    let config = workspace.path().join(".deep-code/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(config, "[provider]\nmodel = \"unknown-model\"\n").unwrap();
+
+    let Err(error) = App::launch(launch) else {
+        panic!("launch must reject an unknown model");
+    };
+    let message = error.to_string();
+    assert!(message.contains("unknown model"));
+    assert!(!message.contains("unknown-model"));
+    assert!(app.handle_slash_command("/clear"));
+    assert_eq!(app.status, error.user_message(app.lang));
+    assert!(Arc::ptr_eq(&app.runtime, &current));
+    assert_eq!(app.session_id, session);
+}
+
+#[test]
 fn model_picker_navigates_both_rows_without_applying() {
     let mut app = App::new();
+    app.configured_model = AgentConfig::builtin().model;
+    app.configured_reasoning = "high".to_string();
     app.open_model_picker();
     let picker = app.model_picker.as_ref().expect("picker open");
+    assert_eq!(picker.models.len(), 2);
     assert_eq!(
-        picker.models,
-        vec![
-            deep_code_agent::AUTO_MODEL.to_string(),
-            deep_code_agent::DEEPSEEK_V4_PRO.to_string(),
-            deep_code_agent::DEEPSEEK_FLASH.to_string(),
-        ]
+        picker.models[picker.selected_model],
+        deep_code_agent::DEEPSEEK_FLASH
     );
     assert_eq!(picker.focus, ModelPickerFocus::Model);
+    assert_eq!(picker.efforts, ["none", "low", "high", "max"]);
+    assert_eq!(picker.efforts[picker.selected_effort], "high");
     let initial_model = picker.selected_model;
     app.completion_down();
     assert_ne!(app.completion.as_ref().unwrap().selected, initial_model);
@@ -1137,9 +1183,10 @@ fn model_picker_navigates_both_rows_without_applying() {
         CompletionKind::ModelPicker
     );
     app.model_picker_accept_selection();
-    assert_ne!(
-        app.model_picker.as_ref().unwrap().selected_model,
-        initial_model
+    let picker = app.model_picker.as_ref().unwrap();
+    assert_eq!(
+        picker.models[picker.selected_model],
+        deep_code_agent::DEEPSEEK_V4_PRO
     );
     assert_eq!(
         app.model_picker.as_ref().unwrap().focus,
@@ -1156,6 +1203,7 @@ fn model_picker_navigates_both_rows_without_applying() {
     app.model_picker_cancel();
     assert!(app.model_picker.is_none());
     assert!(!app.model_picker_open());
+    assert_eq!(app.configured_model, deep_code_agent::DEEPSEEK_FLASH);
 }
 
 #[test]
@@ -2924,7 +2972,6 @@ fn status_line_is_minimal_model_and_context() {
     app.session_id = Some("session_1".to_string());
     app.last_checkpoint = Some("checkpoint_1".to_string());
     app.last_telemetry = Some(TurnTelemetry {
-        route_label: "auto->deepseek-flash (high)".to_string(),
         effective_model: "deepseek-flash".to_string(),
         reasoning_effort: "high".to_string(),
         prompt_tokens: 100,
@@ -2935,15 +2982,10 @@ fn status_line_is_minimal_model_and_context() {
         session_cache_miss_tokens: 20,
         session_cache_savings: deep_code_agent::CostEstimate::default(),
         prefix_status: deep_code_agent::PrefixStatus::Stable,
-        route_reason: "short prompt".to_string(),
-        route_source: "heuristic".to_string(),
-        cascade_triggered: false,
-        fallback_reason: None,
         context_window: 1_000_000,
         estimated_context_tokens: 120,
         context_usage_percent: 1,
         near_compaction_threshold: false,
-        used_model_fallback: false,
         stream_retries: 0,
         turn_cost: deep_code_agent::CostEstimate {
             cny: 0.001,
@@ -2961,11 +3003,10 @@ fn status_line_is_minimal_model_and_context() {
     assert!(status.contains("deepseek-flash high"), "{status}");
     assert!(!status.contains("thinking="), "{status}");
     assert!(status.contains("ctx 1%"), "{status}");
-    // Cost, session id, checkpoint, and the verbose route label are gone.
+    // Cost, session id, and checkpoint belong in /status.
     assert!(!status.contains("session"), "{status}");
     assert!(!status.contains("checkpoint"), "{status}");
     assert!(!status.contains('¥'), "{status}");
-    assert!(!status.contains("auto->"), "{status}");
 }
 
 #[test]
@@ -3107,7 +3148,8 @@ fn runtime_rebuilds_drop_redirected_inherited_grants() {
         let mut app = App::launch(LaunchConfig {
             workspace: Some(workspace.path().to_path_buf()),
             ..LaunchConfig::default()
-        });
+        })
+        .unwrap();
         let old = app.workspace.join("approved");
         std::fs::create_dir(&old).unwrap();
         app.add_dir_command(old.to_str().unwrap());
@@ -3148,7 +3190,8 @@ fn redirected_primary_refuses_rebuild_clear_and_diff_without_touching_the_target
     let mut app = App::launch(LaunchConfig {
         workspace: Some(workspace.clone()),
         ..LaunchConfig::default()
-    });
+    })
+    .unwrap();
     let runtime = Arc::clone(&app.runtime);
     let session = app.session_id.clone();
     std::fs::rename(&workspace, root.path().join("previous")).unwrap();
@@ -3201,7 +3244,8 @@ fn launch_refuses_to_hydrate_an_unverified_resume_record() {
         workspace: Some(ws),
         resume: Some(record),
         ..LaunchConfig::default()
-    });
+    })
+    .unwrap();
 
     assert_ne!(app.session_id.as_deref(), Some(rejected_id.as_str()));
     assert!(
@@ -3236,7 +3280,8 @@ fn launch_surfaces_runtime_warnings_in_the_transcript() {
     let app = App::launch(LaunchConfig {
         workspace: Some(blocker.path().join("workspace")),
         ..LaunchConfig::default()
-    });
+    })
+    .unwrap();
     let warnings: Vec<&str> = app
         .history
         .iter()
@@ -3279,7 +3324,8 @@ fn a_swap_that_degrades_keeps_its_warnings_after_the_transcript_is_rebuilt() {
     let mut app = App::launch(LaunchConfig {
         workspace: Some(directory.path().to_path_buf()),
         ..LaunchConfig::default()
-    });
+    })
+    .unwrap();
 
     // `/clear` relaunches with the same unavailable state directory.
     assert!(app.handle_slash_command("/clear"));
@@ -3329,7 +3375,8 @@ fn every_swap_path_delivers_its_warnings() {
     let mut app = App::launch(LaunchConfig {
         workspace: Some(resume_workspace.path().to_path_buf()),
         ..LaunchConfig::default()
-    });
+    })
+    .unwrap();
     let mut record = SessionRecord::new(app.workspace.clone(), "system")
         .with_extra_roots(vec![extra.path().canonicalize().unwrap()]);
     JsonSessionStore::for_pinned_workspace(&app.workspace)
@@ -3350,7 +3397,8 @@ fn every_swap_path_delivers_its_warnings() {
     let mut app = App::launch(LaunchConfig {
         workspace: Some(workspace.clone()),
         ..LaunchConfig::default()
-    });
+    })
+    .unwrap();
     app.history.clear();
     app.relaunch_runtime().unwrap();
     assert!(degraded(&app), "relaunch_runtime dropped its warnings");
@@ -3370,7 +3418,8 @@ fn every_swap_path_delivers_its_warnings() {
     let mut app = App::launch(LaunchConfig {
         workspace: Some(workspace),
         ..LaunchConfig::default()
-    });
+    })
+    .unwrap();
     app.history.clear();
     app.session_id = Some("00000000-0000-0000-0000-000000000000".to_string());
     app.relaunch_runtime().unwrap();
@@ -4010,15 +4059,12 @@ fn a_model_that_cannot_take_images_refuses_and_keeps_the_draft() {
     );
 }
 
-/// Auto mode is not a refusal: the model is chosen per turn, and the one it
-/// chooses can take an image. `/model`'s own gate would otherwise turn the
-/// default configuration into a dead end.
 #[tokio::test(flavor = "multi_thread")]
-async fn auto_mode_does_not_refuse_an_image_turn() {
+async fn flash_accepts_an_image_turn() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_test_png(dir.path(), "shot.png");
     let mut app = App::new();
-    app.configured_model = deep_code_agent::AUTO_MODEL.to_string();
+    app.configured_model = deep_code_agent::DEEPSEEK_FLASH.to_string();
     app.input = "look at this ".to_string();
     app.cursor_to_end();
     assert!(app.attach_image(path));
@@ -4030,7 +4076,7 @@ async fn auto_mode_does_not_refuse_an_image_turn() {
     // reworded refusal would leave this test green while the behaviour broke.
     assert!(
         app.is_streaming,
-        "auto mode must accept an image turn, status was: {}",
+        "Flash must accept an image turn, status was: {}",
         app.status
     );
     assert!(app.input.is_empty(), "an accepted turn clears the draft");

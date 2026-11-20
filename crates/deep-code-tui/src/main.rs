@@ -22,7 +22,7 @@ mod startup;
 mod ui;
 
 use cli::{CliArgs, RunMode, parse_args, workspace_root};
-use deep_code_agent::JsonSessionStore;
+use deep_code_agent::{AgentConfig, JsonSessionStore};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -79,8 +79,11 @@ async fn run_tui(intent: cli::StartupIntent, add_dirs: Vec<std::path::PathBuf>) 
     };
     let result: anyhow::Result<()> = async {
         let store_workspace = workspace.clone();
-        let store = startup::blocking_io(&interrupted, move || {
-            JsonSessionStore::for_workspace(store_workspace)
+        let store = startup::blocking_io(&interrupted, move || -> anyhow::Result<_> {
+            AgentConfig::load(&store_workspace)
+                .config
+                .resolved_model()?;
+            Ok(JsonSessionStore::for_workspace(store_workspace)?)
         })
         .await??;
         // Resume scans run off-thread and service Ctrl+C before raw mode.

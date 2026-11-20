@@ -34,7 +34,6 @@ pub struct LiveSessionSnapshot {
 pub(crate) struct LiveSessionState {
     session_approved: std::collections::HashSet<String>,
     session_trusted_shell_prefixes: std::collections::HashSet<(String, bool)>,
-    cascade_escalated: bool,
     last_prefix: Option<(usize, u64)>,
     image_projections: super::state::ImageProjectionIndex,
 }
@@ -107,7 +106,6 @@ impl AgentRuntime {
         Self {
             client: Arc::new(client),
             config,
-            registry: Default::default(),
             is_subagent: false,
             tools: Arc::new(tools),
             state: Arc::new(Mutex::new(RuntimeState {
@@ -175,7 +173,6 @@ impl AgentRuntime {
             state: LiveSessionState {
                 session_approved: state.session_approved.clone(),
                 session_trusted_shell_prefixes: state.session_trusted_shell_prefixes.clone(),
-                cascade_escalated: state.cascade_escalated,
                 last_prefix: state.last_prefix,
                 image_projections: state.image_projections.clone(),
             },
@@ -190,7 +187,6 @@ impl AgentRuntime {
                 .expect("new runtime has no active tasks");
             state.session_approved = live.session_approved;
             state.session_trusted_shell_prefixes = live.session_trusted_shell_prefixes;
-            state.cascade_escalated = live.cascade_escalated;
             state.last_prefix = live.last_prefix;
             state.image_projections = live.image_projections;
         }
@@ -405,7 +401,7 @@ mod tests {
             &AgentConfig::builtin(),
         )
         .unwrap();
-        let turn_id = runtime.begin_turn("observe").await;
+        let turn_id = runtime.begin_turn("observe").await.unwrap();
         let asset = crate::image::snapshot_bytes(&workspace, b"GIF89a-observation").unwrap();
         let image = {
             let mut state = runtime.state.lock().await;
@@ -504,7 +500,6 @@ mod tests {
             state
                 .session_trusted_shell_prefixes
                 .insert(("cargo test".to_string(), false));
-            state.cascade_escalated = true;
             state.last_prefix = Some((4, 123));
             state.session_cost.usd = 0.25;
             state.session_cache_hit_tokens = 100;
@@ -522,7 +517,6 @@ mod tests {
                 .session_trusted_shell_prefixes
                 .contains(&("cargo test".to_string(), false))
         );
-        assert!(state.cascade_escalated);
         assert_eq!(state.last_prefix, Some((4, 123)));
         assert_eq!(state.session_cost.usd, 0.25);
         assert_eq!(state.session_cache_hit_tokens, 100);

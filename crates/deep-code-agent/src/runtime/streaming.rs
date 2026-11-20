@@ -1,20 +1,14 @@
 //! Provider stream acquisition and robustness guards.
 //!
 //! This module owns everything between "we want a model stream" and "the turn
-//! loop consumes `AgentEvent`s": auto-mode fallback, open-phase retry with
+//! loop consumes `AgentEvent`s": open-phase retry with
 //! exponential backoff, transparent re-open before any content arrived,
 //! per-chunk stall timeout, a total stream deadline, and a cumulative size
 //! guard. The turn loop only calls [`AgentRuntime::open_turn_stream`] and then
 //! drives [`GuardedStream::next`].
 //!
-//! Pinned retry/fallback order:
-//! 1. retriable API errors (429/5xx) at open time fall back Pro→Flash first
-//!    (existing auto-mode behavior, keeps the user-visible 降级 reason);
-//! 2. if the open still fails with a retriable/transport error, back off and
-//!    retry on the (possibly downgraded) route model;
-//! 3. mid-stream errors re-open the same model, but only while no content has
-//!    been received — once content arrived, errors surface immediately so
-//!    billed output is never silently duplicated.
+//! Opening retries transient API and transport errors with backoff.
+//! Mid-stream errors re-open the same request until the first content arrives.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +20,7 @@ use crate::client::{AgentEventStream, LlmClient};
 use crate::error::{AgentError, AgentResult};
 use crate::event::AgentEvent;
 use crate::model::ChatRequest;
-use crate::model_route::{TurnRoute, api_fallback_model, clamp_effort_to_model};
+use crate::model_registry::supports_vision_for_model;
 use crate::runtime::AgentRuntime;
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -159,69 +153,25 @@ impl GuardedStream {
 }
 
 impl AgentRuntime {
-    /// Open the model stream for one turn with all guards attached.
-    ///
-    /// Open-phase failures retry with backoff (after the auto-mode fallback
-    /// had its chance); the returned [`GuardedStream`] continues retrying
-    /// transparently until first content. The caller is expected to wrap this
-    /// future in its select-on-cancel: dropping it aborts any pending backoff.
+    /// Prepare images for the selected model and retry the prepared request.
     pub(super) async fn open_turn_stream(
         &self,
-        route: &mut TurnRoute,
         request: ChatRequest,
     ) -> AgentResult<GuardedStream> {
-        let mut retries_left = self.config.stream_max_retries;
-        let mut retries_used = 0u32;
-        let mut backoff = INITIAL_BACKOFF;
-
-        let (inner, prepared) = loop {
-            let mut attempt = request.clone();
-            attempt.model = route.effective_model.clone();
-            attempt.reasoning_effort =
-                clamp_effort_to_model(&route.effective_model, route.effective_effort)
-                    .as_api_value()
-                    .map(str::to_string);
-            match self.stream_with_fallback(route, attempt).await {
-                Ok(opened) => break opened,
-                Err(error) if retries_left > 0 && open_error_retriable(&error) => {
-                    retries_left -= 1;
-                    retries_used += 1;
-                    tokio::time::sleep(backoff).await;
-                    backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        let mut guarded =
-            self.guarded(prepared.request, inner, retries_left, retries_used, backoff);
-        guarded.images = prepared.images;
-        Ok(guarded)
+        let prepared = self.prepare_model_request(request);
+        let mut stream = self.open_stream(prepared.request).await?;
+        stream.images = prepared.images;
+        Ok(stream)
     }
 
-    pub(super) fn prepare_model_request(
-        &self,
-        request: ChatRequest,
-    ) -> crate::image::PreparedImageRequest {
-        let accepted = self
-            .registry
-            .info_for(&request.model)
-            .is_none_or(|entry| entry.supports_vision);
+    fn prepare_model_request(&self, request: ChatRequest) -> crate::image::PreparedImageRequest {
+        let accepted = supports_vision_for_model(&request.model).unwrap_or(true);
         crate::image::prepare_request_images(request, Some(self.config.vision_detail), accepted)
     }
 
-    /// Open a stream for a request no turn route governs — the compaction
-    /// handover — with the open-phase retry and the stream guards a turn
-    /// request gets. No Pro→Flash fallback: the request already names the model
-    /// it wants, and that model is the cheap one.
-    ///
-    /// The handover is the one request whose answer cannot be had later: a
-    /// fold either gets its summary now or does not happen. A single 503 at a
-    /// busy hour, unretried, used to cost the session its model-written
-    /// summary for good.
-    pub(super) async fn open_side_stream(
-        &self,
-        request: ChatRequest,
-    ) -> AgentResult<GuardedStream> {
+    /// Open a prepared turn or handover request, carrying the remaining retry
+    /// budget into the stream. Dropping the future aborts any pending backoff.
+    pub(super) async fn open_stream(&self, request: ChatRequest) -> AgentResult<GuardedStream> {
         let mut retries_left = self.config.stream_max_retries;
         let mut retries_used = 0u32;
         let mut backoff = INITIAL_BACKOFF;
@@ -237,20 +187,7 @@ impl AgentRuntime {
                 Err(error) => return Err(error),
             }
         };
-        Ok(self.guarded(request, inner, retries_left, retries_used, backoff))
-    }
-
-    /// Wrap an opened stream in the guards, carrying the retry budget the open
-    /// phase left over into the transparent re-opens.
-    fn guarded(
-        &self,
-        request: ChatRequest,
-        inner: AgentEventStream,
-        retries_left: u32,
-        retries_used: u32,
-        backoff: Duration,
-    ) -> GuardedStream {
-        GuardedStream {
+        Ok(GuardedStream {
             client: Arc::clone(&self.client),
             request,
             images: Vec::new(),
@@ -266,45 +203,7 @@ impl AgentRuntime {
             any_content: false,
             saw_done: false,
             finished: false,
-        }
-    }
-
-    async fn stream_with_fallback(
-        &self,
-        route: &mut TurnRoute,
-        request: ChatRequest,
-    ) -> Result<(AgentEventStream, crate::image::PreparedImageRequest), AgentError> {
-        let prepared = self.prepare_model_request(request.clone());
-        match self.client.stream_chat(prepared.request.clone()).await {
-            Ok(stream) => Ok((stream, prepared)),
-            Err(error) if api_error_retriable(&error) => {
-                if let Some(fallback) = api_fallback_model(route) {
-                    route.effective_model = fallback.to_string();
-                    route.used_model_fallback = true;
-                    // Keep the retry's effort aligned with the fallback model's
-                    // catalog entry. The current DeepSeek models both accept max;
-                    // future model entries can impose a different cap.
-                    route.effective_effort =
-                        clamp_effort_to_model(fallback, route.effective_effort);
-                    route.fallback_reason = Some(
-                        crate::tr(self.ui_lang(), crate::TextId::RouteFallbackProToFlash)
-                            .to_string(),
-                    );
-                    let mut retry = request;
-                    retry.model = fallback.to_string();
-                    retry.reasoning_effort =
-                        route.effective_effort.as_api_value().map(str::to_string);
-                    let prepared = self.prepare_model_request(retry);
-                    self.client
-                        .stream_chat(prepared.request.clone())
-                        .await
-                        .map(|stream| (stream, prepared))
-                } else {
-                    Err(error)
-                }
-            }
-            Err(error) => Err(error),
-        }
+        })
     }
 }
 
@@ -322,10 +221,7 @@ fn event_content_len(event: &AgentEvent) -> usize {
 
 fn api_error_retriable(error: &AgentError) -> bool {
     match error {
-        // 500 included: DeepSeek documents it as "Server Error — retry after a
-        // brief wait", and the request did not complete, so a retry is safe. It
-        // was the one 5xx missing here, so a transient 500 killed the turn
-        // outright instead of falling back Pro→Flash / retrying like 502/503/504.
+        // DeepSeek recommends retrying HTTP 500 after a brief wait.
         AgentError::Api { status, .. } => matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504),
         _ => false,
     }

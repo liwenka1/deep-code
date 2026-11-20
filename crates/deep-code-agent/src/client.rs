@@ -34,7 +34,8 @@ pub struct DeepSeekClient {
 }
 
 impl DeepSeekClient {
-    pub fn new(config: AgentConfig) -> AgentResult<Self> {
+    pub fn new(mut config: AgentConfig) -> AgentResult<Self> {
+        config.model = config.resolved_model()?.to_owned();
         config.require_api_key()?;
 
         // Deliberately no `ClientBuilder::timeout`: that clock runs until the

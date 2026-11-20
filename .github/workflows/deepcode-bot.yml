@@ -49,7 +49,7 @@ on:
         required: false
         default: 'accept_edits'
       model:
-        description: 'auto | pro | flash, or an explicit model id.'
+        description: 'pro (deepseek-v4-pro) or flash (deepseek-flash). Defaults to the configured model (Flash by default).'
         type: string
         required: false
         default: ''

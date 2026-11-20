@@ -15,18 +15,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{AgentError, AgentResult};
+
 pub const DEEPSEEK_V4_PRO: &str = "deepseek-v4-pro";
 /// Canonical id for the Flash model; `flash` is its short name.
 pub const DEEPSEEK_FLASH: &str = "deepseek-flash";
-/// Pseudo-model: lets the turn router pick pro/flash per prompt.
-pub const AUTO_MODEL: &str = "auto";
+pub(crate) const DEFAULT_MODEL: &str = DEEPSEEK_FLASH;
 
-/// Conservative context window used for an id the catalog does not know — a
-/// `Passthrough` model. A one-million-token fallback let an unlisted local or
-/// proxy model receive requests far beyond its real limit before compaction;
-/// 128k is a safer ceiling until the provider/catalog supplies an exact value.
-/// Every catalog entry carries its own window in `assets/models.toml`; this is
-/// only the fallback.
+/// Conservative context window when looking up an ID without catalog metadata.
 pub const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
 
 /// Per-model token pricing in both billing currencies.
@@ -135,28 +131,6 @@ pub struct ModelInfo {
     pub pricing: ModelPricingMeta,
 }
 
-/// How a requested model name mapped to a concrete id. `DefaultApplied` and
-/// `Passthrough` are deliberately distinct: neither is an API-level fallback,
-/// and only `Passthrough` warrants a "unknown model" warning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ResolutionKind {
-    /// Catalog id, alias, or `auto` — the catalog recognized the name.
-    Resolved,
-    /// Nothing usable requested; the flagship default was applied.
-    DefaultApplied,
-    /// Unrecognized name trusted as-is (may be newer than this binary).
-    Passthrough,
-}
-
-/// Outcome of turning a requested model name into a concrete id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelResolution {
-    /// The id the runtime should actually use.
-    pub resolved_id: String,
-    /// How the catalog arrived at `resolved_id`.
-    pub kind: ResolutionKind,
-}
-
 /// The model catalog. Construct via [`Default`] for the built-in DeepSeek
 /// entries, or [`ModelRegistry::new`] to supply a custom catalog.
 #[derive(Debug, Clone)]
@@ -182,37 +156,19 @@ impl ModelRegistry {
         &self.catalog
     }
 
-    /// Turn a requested model name into a concrete id.
-    ///
-    /// * Nothing (or only whitespace) requested → the flagship default,
-    ///   flagged as a fallback.
-    /// * `AUTO_MODEL` → passed through untouched so per-turn routing stays
-    ///   in charge.
-    /// * A catalog id or alias (case/whitespace-insensitive) → its canonical id.
-    /// * Anything else → trusted as-is (it may be a model newer than this
-    ///   binary), but flagged so callers can warn.
-    #[must_use]
-    pub fn resolve(&self, requested: Option<&str>) -> ModelResolution {
-        let Some(asked) = requested.filter(|value| !value.trim().is_empty()) else {
-            return ModelResolution {
-                resolved_id: DEEPSEEK_V4_PRO.to_string(),
-                kind: ResolutionKind::DefaultApplied,
-            };
-        };
-
-        let answer =
-            |resolved_id: String, kind: ResolutionKind| ModelResolution { resolved_id, kind };
-
-        if names_equal(asked, AUTO_MODEL) {
-            return answer(AUTO_MODEL.to_string(), ResolutionKind::Resolved);
+    /// Resolve a catalog ID or alias, ignoring case and surrounding whitespace.
+    /// A missing or blank model selects Flash. An unknown name is an error.
+    pub fn resolve(&self, requested: Option<&str>) -> AgentResult<&str> {
+        match requested.map(str::trim) {
+            None | Some("") => Ok(DEFAULT_MODEL),
+            Some(name) => self
+                .entry_matching(name)
+                .map(|entry| entry.id.as_str())
+                .ok_or(AgentError::UnknownModel),
         }
-        if let Some(entry) = self.entry_matching(asked) {
-            return answer(entry.id.clone(), ResolutionKind::Resolved);
-        }
-        answer(asked.trim().to_string(), ResolutionKind::Passthrough)
     }
 
-    /// Catalog metadata for a model id or alias, if it is a known entry.
+    /// Catalog metadata for a model ID or alias, if it is a known entry.
     #[must_use]
     pub fn info_for(&self, model_id: &str) -> Option<&ModelInfo> {
         self.entry_matching(model_id)
@@ -279,8 +235,6 @@ pub fn deepseek_default_models() -> Vec<ModelInfo> {
 /// makes that argument stronger, not weaker: the parse costs real time, and it
 /// happens exactly once here instead of once per lookup.
 ///
-/// `ModelRegistry::default()` stays as it was: callers that want an owned
-/// catalog (`runtime`, `doctor`, `/model`) keep getting one.
 pub(crate) fn builtin_registry() -> &'static ModelRegistry {
     static REGISTRY: std::sync::LazyLock<ModelRegistry> =
         std::sync::LazyLock::new(ModelRegistry::default);
@@ -298,12 +252,7 @@ pub fn context_window_for_model(model: &str) -> u32 {
 
 /// Whether `model` accepts images in the prompt.
 ///
-/// `None` means the catalog has no row for this id — a self-hosted proxy name, a
-/// name from a newer table, or a hand-written `provider.model`. Unknown is
-/// deliberately not `false`: refusing to send an image to a model we merely have
-/// no row for would break the setups that cannot be tested here, and the
-/// server's verdict is authoritative anyway. `Some(false)` is a claim we can act
-/// on, because it comes from the table.
+/// Returns `None` when the catalog has no capability information for this ID.
 #[must_use]
 pub fn supports_vision_for_model(model: &str) -> Option<bool> {
     builtin_registry()
@@ -326,9 +275,7 @@ mod tests {
     fn canonical_ids_resolve_to_themselves() {
         let registry = ModelRegistry::default();
         for id in [DEEPSEEK_V4_PRO, DEEPSEEK_FLASH] {
-            let resolution = registry.resolve(Some(id));
-            assert_eq!(resolution.resolved_id, id);
-            assert_eq!(resolution.kind, ResolutionKind::Resolved);
+            assert_eq!(registry.resolve(Some(id)).unwrap(), id);
         }
     }
 
@@ -342,9 +289,7 @@ mod tests {
             "  deepseek-flash ",
             "flash",
         ] {
-            let resolution = registry.resolve(Some(name));
-            assert_eq!(resolution.resolved_id, DEEPSEEK_FLASH, "for {name:?}");
-            assert_eq!(resolution.kind, ResolutionKind::Resolved, "for {name:?}");
+            assert_eq!(registry.resolve(Some(name)).unwrap(), DEEPSEEK_FLASH);
         }
     }
 
@@ -429,13 +374,6 @@ mod tests {
                      case and surrounding whitespace); the earlier entry wins, so the later one \
                      is unreachable"
                 );
-                // `resolve` answers the `auto` sentinel before it consults the
-                // catalog, so an entry claiming that name can never be reached.
-                assert!(
-                    folded != AUTO_MODEL,
-                    "{} claims the {AUTO_MODEL:?} sentinel, which `resolve` never looks up",
-                    entry.id
-                );
                 claimed.push(folded);
             }
 
@@ -502,17 +440,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_passes_through_for_the_router() {
-        let resolution = ModelRegistry::default().resolve(Some("Auto"));
-        assert_eq!(resolution.resolved_id, AUTO_MODEL);
-        assert_eq!(resolution.kind, ResolutionKind::Resolved);
-    }
-
-    /// The short names the README, config docs and the CI bot advertise
-    /// (`provider.model = pro|flash`) must resolve to real ids, not pass through
-    /// as unknown ones the API 400s on. This is the one place they were NOT
-    /// mapped — the TUI's `/model` did it by hand, config/env/bot did not.
-    #[test]
     fn pro_and_flash_short_names_resolve() {
         let registry = ModelRegistry::default();
         for (name, expected) in [
@@ -521,31 +448,24 @@ mod tests {
             ("flash", DEEPSEEK_FLASH),
             ("  Flash ", DEEPSEEK_FLASH),
         ] {
-            let resolution = registry.resolve(Some(name));
-            assert_eq!(resolution.resolved_id, expected, "for {name:?}");
-            assert_eq!(
-                resolution.kind,
-                ResolutionKind::Resolved,
-                "{name:?} must not pass through as an unknown id"
-            );
+            assert_eq!(registry.resolve(Some(name)).unwrap(), expected);
         }
     }
 
     #[test]
-    fn missing_or_blank_request_defaults_to_pro() {
+    fn missing_or_blank_request_defaults_to_flash() {
         let registry = ModelRegistry::default();
         for request in [None, Some(""), Some("   ")] {
-            let resolution = registry.resolve(request);
-            assert_eq!(resolution.resolved_id, DEEPSEEK_V4_PRO);
-            assert_eq!(resolution.kind, ResolutionKind::DefaultApplied);
+            assert_eq!(registry.resolve(request).unwrap(), DEEPSEEK_FLASH);
         }
     }
 
     #[test]
-    fn unlisted_id_is_trusted_but_flagged() {
-        let resolution = ModelRegistry::default().resolve(Some(" experimental-v5 "));
-        assert_eq!(resolution.resolved_id, "experimental-v5");
-        assert_eq!(resolution.kind, ResolutionKind::Passthrough);
+    fn unlisted_id_is_rejected() {
+        assert!(matches!(
+            ModelRegistry::default().resolve(Some(" experimental-v5 ")),
+            Err(AgentError::UnknownModel)
+        ));
     }
 
     #[test]

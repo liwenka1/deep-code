@@ -167,7 +167,7 @@ async fn superseded_partial_reply_stays_with_its_request_and_is_saved() {
             break;
         }
     }
-    runtime.begin_turn("second").await;
+    runtime.begin_turn("second").await.unwrap();
     drain(&mut rx).await;
     let messages = runtime.session_messages().await;
     let text: Vec<_> = messages.iter().map(|m| m.content.text()).collect();
@@ -240,7 +240,7 @@ async fn superseded_error_or_completed_reply_stays_with_its_request() {
                 // Force a successor to arrive in the same poll as the old
                 // provider error or EOF, past select!'s cancellation check.
                 let runtime = holder.lock().unwrap().take().unwrap();
-                runtime.begin_turn("second").await;
+                runtime.begin_turn("second").await.unwrap();
                 if !completed {
                     yield AgentEvent::Error { message: "provider failed".into() };
                 }
@@ -389,8 +389,7 @@ fn registry_with_auto_and_mock() -> ToolRegistry {
     registry
 }
 
-/// A tool that always returns an error result, for exercising the cascade
-/// struggle signal (repeated tool-call execution failures).
+/// A tool that always returns an error result.
 #[derive(Debug, Clone, Copy)]
 struct FailingTool;
 
@@ -1882,6 +1881,54 @@ fn runtime_event_serializes_structured_turn_started() {
 }
 
 #[tokio::test]
+async fn unknown_model_rejects_a_turn_before_persisting_or_requesting() {
+    let workspace = tempfile::tempdir().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let config = AgentConfig {
+        model: "unrecognized-model-value".into(),
+        ..AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_new_session(
+        CapturingClient {
+            scripts: Mutex::new(vec![ok_turn()]),
+            requests: requests.clone(),
+        },
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &config,
+    )
+    .unwrap()
+    .with_checkpoints(workspace.path(), &mut Vec::new());
+    let session_id = runtime.session_id().await.unwrap();
+    let sessions = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let before = sessions.load(&session_id).unwrap();
+
+    let mut turn = runtime.start_turn("keep this out of history").await;
+    assert!(matches!(
+        turn.recv().await,
+        Some(RuntimeEvent::Error { message, .. })
+            if message.contains("provider.model") && !message.contains(&config.model)
+    ));
+    assert!(turn.recv().await.is_none());
+    assert_eq!(turn.outcome().unwrap().reason, FinishReason::Failed);
+    assert!(runtime.live_turn_id().await.is_none());
+    assert_eq!(runtime.session_messages().await.len(), 1);
+    let after = sessions.load(&session_id).unwrap();
+    assert_eq!(before.entries.len(), after.entries.len());
+    assert!(
+        runtime
+            .checkpoints
+            .as_ref()
+            .unwrap()
+            .list()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn turn_snapshots_emit_checkpoint_events() {
     let workspace = tempfile::tempdir().unwrap();
     let client = ScriptedClient::new(vec![vec![
@@ -1998,7 +2045,7 @@ async fn restore_refuses_while_a_turn_is_in_progress() {
     );
 
     // A turn is now live (bookkeeping started, loop not driven).
-    runtime.begin_turn("do a thing").await;
+    runtime.begin_turn("do a thing").await.unwrap();
     let refused = runtime.restore_checkpoint(id).await;
     assert!(
         refused.is_err(),
@@ -2421,7 +2468,7 @@ async fn superseded_approval_cannot_execute_record_consent_or_drive_the_successo
         let mut approved = submit_pending_approval(&runtime, decision).await;
         // No yield between submission and supersession: the approval task has
         // not yet been polled and must retain the old turn's cancelled token.
-        runtime.begin_turn("new prompt").await;
+        runtime.begin_turn("new prompt").await.unwrap();
         let new_id = runtime.live_turn_id().await.unwrap();
         let events = drain(&mut approved).await;
         assert!(
@@ -2479,7 +2526,7 @@ async fn superseded_root_approval_cannot_widen_the_successors_boundary() {
             .any(|event| matches!(event, RuntimeEvent::ApprovalRequired { .. }))
     );
     let mut approved = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
-    runtime.begin_turn("new prompt").await;
+    runtime.begin_turn("new prompt").await.unwrap();
     let new_id = runtime.live_turn_id().await;
     let events = drain(&mut approved).await;
     assert!(
@@ -3385,125 +3432,8 @@ async fn session_cost_persists_across_resume() {
     assert_eq!(restored.session_cache_miss_tokens, 600);
 }
 
-/// Returns a retriable API error on the first `stream_chat`, then succeeds.
-#[derive(Clone)]
-struct FallbackTestClient {
-    inner: Arc<FallbackTestClientInner>,
-}
-
-struct FallbackTestClientInner {
-    models: Mutex<Vec<String>>,
-    attempts: Mutex<u32>,
-}
-
-impl FallbackTestClient {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(FallbackTestClientInner {
-                models: Mutex::new(Vec::new()),
-                attempts: Mutex::new(0),
-            }),
-        }
-    }
-
-    fn models_used(&self) -> Vec<String> {
-        self.inner.models.lock().unwrap().clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl LlmClient for FallbackTestClient {
-    fn provider_name(&self) -> &'static str {
-        "fallback-test"
-    }
-
-    fn model(&self) -> &str {
-        "fallback-test"
-    }
-
-    async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
-        self.inner
-            .models
-            .lock()
-            .unwrap()
-            .push(request.model.clone());
-        let attempt = {
-            let mut attempts = self.inner.attempts.lock().unwrap();
-            *attempts += 1;
-            *attempts
-        };
-        if attempt == 1 {
-            return Err(AgentError::Api {
-                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                message: "model overloaded".to_string(),
-            });
-        }
-
-        let stream = try_stream! {
-            yield AgentEvent::TextDelta { text: "recovered".to_string() };
-            yield AgentEvent::Done { usage: None };
-        };
-        Ok(Box::pin(stream))
-    }
-}
-
 #[tokio::test]
-async fn auto_pro_retries_with_flash_after_retriable_api_error() {
-    use crate::model_registry::{AUTO_MODEL, DEEPSEEK_FLASH, DEEPSEEK_V4_PRO};
-
-    let client = FallbackTestClient::new();
-    // Pin zh so the localized fallback-reason assertion is deterministic.
-    let config = AgentConfig {
-        model: AUTO_MODEL.to_string(),
-        language: "zh".to_string(),
-        ..AgentConfig::builtin()
-    };
-    let runtime = AgentRuntime::with_system_prompt(
-        client.clone(),
-        ToolRegistry::default(),
-        "system",
-        config,
-        false,
-    );
-
-    let mut rx = runtime.submit_user("debug this crash").await;
-    let events = drain(&mut rx).await;
-
-    assert_eq!(
-        client.models_used(),
-        vec![DEEPSEEK_V4_PRO.to_string(), DEEPSEEK_FLASH.to_string()]
-    );
-    let telemetry = events.iter().find_map(|event| match event {
-        RuntimeEvent::TurnFinished { telemetry, .. } => telemetry.as_ref(),
-        _ => None,
-    });
-    let telemetry = telemetry.expect("turn finished with telemetry");
-    assert!(telemetry.used_model_fallback);
-    assert_eq!(telemetry.effective_model, DEEPSEEK_FLASH);
-    assert!(telemetry.route_label.contains("fallback→flash"));
-    assert!(telemetry.route_reason.contains("debug"));
-    assert!(
-        telemetry
-            .fallback_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("降级"))
-    );
-    assert_eq!(
-        runtime
-            .session_messages()
-            .await
-            .last()
-            .unwrap()
-            .content
-            .text(),
-        "recovered"
-    );
-}
-
-#[tokio::test]
-async fn unauthorized_api_error_does_not_fallback() {
-    use crate::model_registry::AUTO_MODEL;
-
+async fn unauthorized_api_error_does_not_retry() {
     #[derive(Clone)]
     struct AuthFailClient {
         calls: Arc<Mutex<u32>>,
@@ -3534,7 +3464,6 @@ async fn unauthorized_api_error_does_not_fallback() {
     // Pin the language so the localized error assertion is deterministic
     // regardless of the test machine's LANG.
     let config = AgentConfig {
-        model: AUTO_MODEL.to_string(),
         language: "zh".to_string(),
         ..AgentConfig::builtin()
     };
@@ -3964,7 +3893,7 @@ async fn cancel_while_waiting_approval_synthesizes_results_for_batch() {
 }
 
 /// Per-attempt scripted behaviors for stream-robustness tests. Each
-/// `stream_chat` call consumes the next behavior and records the model used.
+/// `stream_chat` call consumes the next behavior and records its settings.
 #[derive(Debug, Clone)]
 enum AttemptBehavior {
     /// `stream_chat` itself fails with this API status.
@@ -3986,7 +3915,7 @@ struct AttemptScriptClient {
 
 struct AttemptScriptInner {
     behaviors: Mutex<Vec<AttemptBehavior>>,
-    models: Mutex<Vec<String>>,
+    request_settings: Mutex<Vec<(String, Option<String>)>>,
 }
 
 impl AttemptScriptClient {
@@ -3994,17 +3923,17 @@ impl AttemptScriptClient {
         Self {
             inner: Arc::new(AttemptScriptInner {
                 behaviors: Mutex::new(behaviors),
-                models: Mutex::new(Vec::new()),
+                request_settings: Mutex::new(Vec::new()),
             }),
         }
     }
 
-    fn models_used(&self) -> Vec<String> {
-        self.inner.models.lock().unwrap().clone()
+    fn request_settings(&self) -> Vec<(String, Option<String>)> {
+        self.inner.request_settings.lock().unwrap().clone()
     }
 
     fn attempts(&self) -> usize {
-        self.inner.models.lock().unwrap().len()
+        self.inner.request_settings.lock().unwrap().len()
     }
 }
 
@@ -4020,10 +3949,10 @@ impl LlmClient for AttemptScriptClient {
 
     async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
         self.inner
-            .models
+            .request_settings
             .lock()
             .unwrap()
-            .push(request.model.clone());
+            .push((request.model, request.reasoning_effort));
         let behavior = {
             let mut behaviors = self.inner.behaviors.lock().unwrap();
             if behaviors.is_empty() {
@@ -4190,16 +4119,16 @@ async fn cancel_during_open_backoff_finalizes_as_cancelled() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn open_retry_runs_after_fallback_exhausted_and_is_counted() {
-    use crate::model_registry::{AUTO_MODEL, DEEPSEEK_FLASH, DEEPSEEK_V4_PRO};
-
+async fn prompts_and_open_retries_use_the_configured_model_and_effort() {
     let client = AttemptScriptClient::new(vec![
-        AttemptBehavior::ConnectFail(503),
+        AttemptBehavior::Text("found".to_string()),
+        AttemptBehavior::ConnectFail(429),
         AttemptBehavior::ConnectFail(503),
         AttemptBehavior::Text("recovered".to_string()),
     ]);
     let config = AgentConfig {
-        model: AUTO_MODEL.to_string(),
+        model: "pro".to_string(),
+        reasoning_effort: crate::reasoning::ReasoningEffortSetting::Low,
         ..AgentConfig::builtin()
     };
     let runtime = AgentRuntime::with_system_prompt(
@@ -4210,22 +4139,18 @@ async fn open_retry_runs_after_fallback_exhausted_and_is_counted() {
         false,
     );
 
-    let mut rx = runtime.submit_user("debug this crash").await;
-    let events = drain(&mut rx).await;
-
-    // Pinned order: Pro fails -> immediate Flash fallback fails -> backoff
-    // retry stays on the downgraded Flash model and succeeds.
+    for (prompt, expected_retries) in [("look up this setting", 0), ("debug this crash", 2)] {
+        let mut rx = runtime.submit_user(prompt).await;
+        let events = drain(&mut rx).await;
+        let telemetry = turn_finished_telemetry(&events).expect("telemetry");
+        assert_eq!(telemetry.stream_retries, expected_retries);
+        assert_eq!(telemetry.effective_model, DEEPSEEK_V4_PRO);
+        assert_eq!(telemetry.reasoning_effort, "low");
+    }
     assert_eq!(
-        client.models_used(),
-        vec![
-            DEEPSEEK_V4_PRO.to_string(),
-            DEEPSEEK_FLASH.to_string(),
-            DEEPSEEK_FLASH.to_string()
-        ]
+        client.request_settings(),
+        vec![(DEEPSEEK_V4_PRO.to_string(), Some("low".to_string())); 4]
     );
-    let telemetry = turn_finished_telemetry(&events).expect("telemetry");
-    assert_eq!(telemetry.stream_retries, 1);
-    assert!(telemetry.used_model_fallback);
     assert_eq!(
         runtime
             .session_messages()
@@ -4288,11 +4213,8 @@ async fn cancel_turn_when_idle_is_silent_noop() {
 }
 
 #[tokio::test]
-async fn repeated_tool_errors_trigger_cascade_and_surface_in_telemetry() {
-    // The model calls a failing tool twice in one turn; both error, crossing
-    // the cascade threshold. The triggering turn still finishes on Flash, but
-    // its telemetry must flag `cascade_triggered` so the escalation is visible.
-    let client = ScriptedClient::new(vec![
+async fn repeated_tool_errors_keep_the_configured_model() {
+    let scripts = vec![
         vec![
             AgentEvent::ToolCallDelta {
                 delta: indexed_tool_call_delta(0, "c1", FailingTool::NAME, "{}"),
@@ -4302,15 +4224,16 @@ async fn repeated_tool_errors_trigger_cascade_and_surface_in_telemetry() {
             },
             AgentEvent::Done { usage: None },
         ],
-        vec![
-            AgentEvent::TextDelta {
-                text: "done".to_string(),
-            },
-            AgentEvent::Done { usage: None },
-        ],
-    ]);
+        ok_turn(),
+        ok_turn(),
+    ];
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let client = CapturingClient {
+        scripts: Mutex::new(scripts),
+        requests: requests.clone(),
+    };
     let config = AgentConfig {
-        model: crate::model_registry::AUTO_MODEL.to_string(),
+        model: DEEPSEEK_FLASH.to_string(),
         approval_auto_allow: vec![FailingTool::NAME.to_string()],
         ..AgentConfig::builtin()
     };
@@ -4320,17 +4243,25 @@ async fn repeated_tool_errors_trigger_cascade_and_surface_in_telemetry() {
 
     let mut rx = runtime.submit_user("do the thing").await;
     let events = drain(&mut rx).await;
-    let telemetry = events
+    let failed_calls = events
         .iter()
-        .rev()
-        .find_map(|event| match event {
-            RuntimeEvent::TurnFinished { telemetry, .. } => telemetry.clone(),
-            _ => None,
+        .filter(|event| {
+            matches!(event, RuntimeEvent::ToolCallFinished { result, .. }
+                if result.status == ToolResultStatus::Error)
         })
-        .expect("turn should finish with telemetry");
+        .count();
+    assert_eq!(failed_calls, 2);
+    assert!(turn_finished_telemetry(&events).is_some());
+    let mut rx = runtime.submit_user("try a separate task").await;
+    let events = drain(&mut rx).await;
+    assert!(turn_finished_telemetry(&events).is_some());
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
     assert!(
-        telemetry.cascade_triggered,
-        "two tool-call failures in one turn must trigger cascade escalation"
+        requests
+            .iter()
+            .all(|request| request["model"] == DEEPSEEK_FLASH),
+        "tool failures must leave the model fixed during and after the turn"
     );
 }
 
@@ -4408,11 +4339,7 @@ async fn boundary_denials_trip_the_breaker_with_add_dir_guidance() {
 }
 
 #[tokio::test]
-async fn boundary_denials_do_not_latch_cascade_escalation() {
-    // Two boundary denials — exactly the count that latches the cascade when
-    // the failures are ordinary — then a clean finish. Telemetry must NOT
-    // flag an escalation: a stronger model cannot move the granted-roots
-    // fence, so paying Pro prices for these retries is pure waste.
+async fn two_boundary_denials_stay_below_the_breaker_limit() {
     let workspace = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     // Canonical for the same reason as the breaker test above.
@@ -4431,7 +4358,6 @@ async fn boundary_denials_do_not_latch_cascade_escalation() {
         ],
     ]);
     let config = AgentConfig {
-        model: crate::model_registry::AUTO_MODEL.to_string(),
         approval_auto_allow: vec!["write_file".to_string()],
         ..AgentConfig::builtin()
     };
@@ -4441,17 +4367,9 @@ async fn boundary_denials_do_not_latch_cascade_escalation() {
 
     let mut rx = runtime.submit_user("edit the sibling repo").await;
     let events = drain(&mut rx).await;
-    let telemetry = events
-        .iter()
-        .rev()
-        .find_map(|event| match event {
-            RuntimeEvent::TurnFinished { telemetry, .. } => telemetry.clone(),
-            _ => None,
-        })
-        .expect("two denials stay under the breaker; the turn finishes normally");
     assert!(
-        !telemetry.cascade_triggered,
-        "boundary denials must not latch the Pro escalation"
+        turn_finished_telemetry(&events).is_some(),
+        "two denials stay under the breaker; the turn finishes normally"
     );
 }
 
@@ -4463,7 +4381,7 @@ async fn begin_turn_supersedes_live_turn_without_clobbering() {
     let client = ScriptedClient::new(vec![]);
     let runtime = AgentRuntime::new(client, ToolRegistry::default());
 
-    runtime.begin_turn("first").await;
+    runtime.begin_turn("first").await.unwrap();
     let (first_id, first_token) = {
         let state = runtime.state.lock().await;
         (
@@ -4472,7 +4390,7 @@ async fn begin_turn_supersedes_live_turn_without_clobbering() {
         )
     };
 
-    runtime.begin_turn("second").await;
+    runtime.begin_turn("second").await.unwrap();
     assert!(
         first_token.is_cancelled(),
         "superseding begin_turn must cancel the previous turn's loop"
@@ -4503,11 +4421,11 @@ async fn cancel_turn_if_only_cancels_the_named_turn() {
     let client = ScriptedClient::new(vec![]);
     let runtime = AgentRuntime::new(client, ToolRegistry::default());
 
-    runtime.begin_turn("first").await;
+    runtime.begin_turn("first").await.unwrap();
     let first_id = runtime.live_turn_id().await.expect("first turn live");
 
     // A successor turn supersedes it (fresh cancel token).
-    runtime.begin_turn("second").await;
+    runtime.begin_turn("second").await.unwrap();
     let (second_id, second_token) = {
         let state = runtime.state.lock().await;
         (
@@ -6301,7 +6219,10 @@ async fn compaction_asks_the_model_for_a_handover_summary() {
     let runtime = AgentRuntime::with_config(
         client,
         ToolRegistry::default(),
-        crate::config::AgentConfig::builtin(),
+        AgentConfig {
+            model: DEEPSEEK_V4_PRO.into(),
+            ..AgentConfig::builtin()
+        },
     )
     .with_compact_instructions(Some("- always keep the failing test names".to_string()));
     for index in 0..6 {
@@ -7209,7 +7130,7 @@ async fn a_cancelled_turn_cannot_spend_the_next_turns_threshold_fold() {
     started.notified().await;
     // The next prompt begins while turn A waits on its summarizer: its token
     // is cancelled, and its loop leaves the fold after B has begun.
-    runtime.begin_turn("turn B").await;
+    runtime.begin_turn("turn B").await.unwrap();
     drain(&mut first).await;
     stall.store(false, Ordering::SeqCst);
     let before = *handovers.lock().unwrap();
@@ -7474,8 +7395,8 @@ async fn stale_bootstrap_never_drives_or_cancels_its_successor() {
         ScriptedClient::new(vec![ok_turn()]),
         ToolRegistry::default(),
     );
-    let previous = runtime.begin_turn("disconnected request").await;
-    let successor = runtime.begin_turn("new request").await;
+    let previous = runtime.begin_turn("disconnected request").await.unwrap();
+    let successor = runtime.begin_turn("new request").await.unwrap();
     let mut abandoned = runtime.drive_turn_handle(previous).await;
     assert!(matches!(
         abandoned.recv().await,
@@ -7558,7 +7479,8 @@ async fn user_images_are_snapshotted_before_the_first_request() {
 
     runtime
         .begin_turn(UserTurn::with_images("observe", vec![source.clone()]))
-        .await;
+        .await
+        .unwrap();
     std::fs::write(&source, b"GIF89a-new-file-contents").unwrap();
     let mut receiver = runtime.drive_turn().await;
     let events = drain(&mut receiver).await;
@@ -7619,7 +7541,7 @@ impl Tool for ImageObservationTool {
 }
 
 #[tokio::test]
-async fn a_new_tool_image_reroutes_auto_for_the_next_request_and_records_delivery() {
+async fn a_new_tool_image_is_delivered_when_flash_is_configured() {
     let directory = tempfile::tempdir().unwrap();
     let workspace = directory.path().canonicalize().unwrap();
     let asset = crate::image::snapshot_bytes(&workspace, b"GIF89a-captured").unwrap();
@@ -7627,7 +7549,7 @@ async fn a_new_tool_image_reroutes_auto_for_the_next_request_and_records_deliver
     let mut tools = ToolRegistry::default();
     tools.register(ImageObservationTool(asset.clone())).unwrap();
     let config = AgentConfig {
-        model: crate::model_registry::AUTO_MODEL.into(),
+        model: DEEPSEEK_FLASH.into(),
         ..AgentConfig::builtin()
     };
     let runtime = AgentRuntime::with_new_session(
@@ -7658,7 +7580,7 @@ async fn a_new_tool_image_reroutes_auto_for_the_next_request_and_records_deliver
     )), "next request must include the tool's image: {events:?}");
     {
         let requests = requests.lock().unwrap();
-        assert_eq!(requests[0]["model"], DEEPSEEK_V4_PRO);
+        assert_eq!(requests[0]["model"], DEEPSEEK_FLASH);
         assert_eq!(requests[1]["model"], DEEPSEEK_FLASH);
         let observation = requests[1]["messages"]
             .as_array()
@@ -7675,8 +7597,8 @@ async fn a_new_tool_image_reroutes_auto_for_the_next_request_and_records_deliver
     drain(&mut receiver).await;
     assert_eq!(
         requests.lock().unwrap()[2]["model"],
-        DEEPSEEK_V4_PRO,
-        "historical images do not pin later turns to Flash"
+        DEEPSEEK_FLASH,
+        "the next turn still uses the configured model"
     );
     let store = crate::session_store::JsonSessionStore::for_workspace(&workspace).unwrap();
     let saved = store.load(&runtime.session_id().await.unwrap()).unwrap();
@@ -8257,7 +8179,7 @@ async fn repeated_image_attachments_after_compaction_keep_distinct_reports_and_w
 }
 
 #[tokio::test]
-async fn image_report_retention_stays_bounded_across_model_switches_and_compaction() {
+async fn image_report_retention_stays_bounded_across_explicit_model_changes_and_compaction() {
     const TURNS: usize = 160;
 
     #[derive(Debug)]
@@ -8286,12 +8208,12 @@ async fn image_report_retention_stays_bounded_across_model_switches_and_compacti
         }
     }
 
-    struct SwitchingClient {
+    struct ImageBatchClient {
         calls: Mutex<usize>,
         models: Arc<Mutex<Vec<String>>>,
     }
     #[async_trait::async_trait]
-    impl LlmClient for SwitchingClient {
+    impl LlmClient for ImageBatchClient {
         fn provider_name(&self) -> &'static str {
             "retention-regression"
         }
@@ -8345,11 +8267,11 @@ async fn image_report_retention_stays_bounded_across_model_switches_and_compacti
     let mut tools = ToolRegistry::default();
     tools.register(ImageBatchTool(asset)).unwrap();
     let config = AgentConfig {
-        model: crate::model_registry::AUTO_MODEL.into(),
+        model: DEEPSEEK_V4_PRO.into(),
         ..AgentConfig::builtin()
     };
-    let runtime = AgentRuntime::with_new_session(
-        SwitchingClient {
+    let mut runtime = AgentRuntime::with_new_session(
+        ImageBatchClient {
             calls: Mutex::new(0),
             models: models.clone(),
         },
@@ -8370,6 +8292,7 @@ async fn image_report_retention_stays_bounded_across_model_switches_and_compacti
         } else {
             DEEPSEEK_V4_PRO
         };
+        runtime.config.model = expected_model.to_string();
         let mut receiver = runtime.submit_user(input).await;
         let events = drain(&mut receiver).await;
         assert!(
@@ -8466,7 +8389,7 @@ async fn image_report_retention_stays_bounded_across_model_switches_and_compacti
         .map(|turn| turn.image_reports_omitted)
         .sum::<u64>();
     let resumed = AgentRuntime::from_session_record(
-        SwitchingClient {
+        ImageBatchClient {
             calls: Mutex::new(0),
             models: Arc::new(Mutex::new(Vec::new())),
         },

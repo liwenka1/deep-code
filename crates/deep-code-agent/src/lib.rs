@@ -21,7 +21,6 @@ mod lsp;
 mod message;
 mod model;
 mod model_registry;
-mod model_route;
 mod paths;
 mod pinned_dir;
 mod pricing;
@@ -37,7 +36,6 @@ mod session_store;
 mod shell_tools;
 mod skills;
 mod subagent;
-mod task_class;
 #[cfg(test)]
 mod test_symlinks;
 mod text_sanitize;
@@ -99,7 +97,7 @@ pub use model::{
     ChatRequest, FunctionCallDelta, ToolCallDelta, ToolCallFunctionPayload, ToolCallPayload, Usage,
 };
 pub use model_registry::{
-    AUTO_MODEL, DEEPSEEK_FLASH, DEEPSEEK_V4_PRO, ModelRegistry, supports_vision_for_model,
+    DEEPSEEK_FLASH, DEEPSEEK_V4_PRO, ModelRegistry, supports_vision_for_model,
 };
 // The TUI writes into `<workspace>/.deep-code` too (the stderr log), and every
 // writer of that directory has to enforce the same "we own it, so it must be a

@@ -295,7 +295,10 @@ None.
         let services = attach_subagent_tools(
             &mut registry,
             client.clone(),
-            AgentConfig::builtin(),
+            AgentConfig {
+                model: crate::model_registry::DEEPSEEK_V4_PRO.into(),
+                ..AgentConfig::builtin()
+            },
             dir.path().to_path_buf(),
             cancel,
         );

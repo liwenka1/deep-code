@@ -10,7 +10,7 @@ use crate::execution_policy::{
     PermissionMode, RiskLevel, accept_edits_approvable, command_shape,
     dispatch_declares_allow_commands, network_requested, shell_command_of,
 };
-use crate::model_registry::{AUTO_MODEL, DEEPSEEK_FLASH};
+use crate::model_registry::DEEPSEEK_FLASH;
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::state::PendingToolBatch;
@@ -417,25 +417,19 @@ impl AgentRuntime {
             safety_notes: &request.safety_notes,
             user_task,
         };
-        let model = self.classifier_model();
         let turn_id = self.state.lock().await.current_turn_id.clone();
         // Race the judge against cancellation so Esc during a slow classifier
         // reply aborts the call into "ask" instead of blocking the turn.
         let (approved, usage) = tokio::select! {
             biased;
             () = cancel.cancelled() => return None,
-            verdict = crate::approval_classifier::approves(&*self.client, &model, &input) => verdict,
+            verdict = crate::approval_classifier::approves(&*self.client, DEEPSEEK_FLASH, &input) => verdict,
         };
         if let Some(usage) = usage {
-            self.record_classifier_cost(&model, &usage, turn_id.as_ref())
+            self.record_classifier_cost(DEEPSEEK_FLASH, &usage, turn_id.as_ref())
                 .await;
         }
         approved.then_some(AutoApproval::Judge)
-    }
-
-    /// The model the auto-mode classifier runs on (see [`classifier_model_for`]).
-    fn classifier_model(&self) -> String {
-        classifier_model_for(&self.config, &self.registry)
     }
 
     /// Fold a classifier call's token cost into the running turn and session
@@ -865,57 +859,10 @@ fn root_grant_requested_path(call: &ToolCall) -> String {
         .to_string()
 }
 
-/// The model the auto-mode classifier runs on. Flash is the cheap judge tier;
-/// `auto`/unset routing sentinels and any catalog model resolve to it. A model
-/// string the catalog does not know — a passthrough id, e.g. a newer DeepSeek
-/// model the registry hasn't caught up to — is judged on itself rather than on a
-/// Flash that may not exist for it. This stays DeepSeek-centric: cost for an
-/// off-catalog model records as zero (pricing is table-driven), so an off-DeepSeek
-/// `base_url` is best-effort, not a supported multi-provider mode. Either way the
-/// raw `auto` sentinel never leaks to the API layer.
-pub(super) fn classifier_model_for(
-    config: &crate::config::AgentConfig,
-    registry: &crate::model_registry::ModelRegistry,
-) -> String {
-    let configured = config.model.trim();
-    if configured.is_empty()
-        || configured.eq_ignore_ascii_case(AUTO_MODEL)
-        || registry.info_for(configured).is_some()
-    {
-        return DEEPSEEK_FLASH.to_string();
-    }
-    configured.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn classifier_model_maps_to_flash_or_concrete_model() {
-        use crate::config::AgentConfig;
-        use crate::model_registry::ModelRegistry;
-        let reg = ModelRegistry::default();
-        let cfg = |model: &str| AgentConfig {
-            model: model.to_string(),
-            ..AgentConfig::builtin()
-        };
-        // DeepSeek sentinels and catalog models → the cheap Flash judge.
-        assert_eq!(classifier_model_for(&cfg("auto"), &reg), DEEPSEEK_FLASH);
-        assert_eq!(classifier_model_for(&cfg(""), &reg), DEEPSEEK_FLASH);
-        assert_eq!(
-            classifier_model_for(&cfg("deepseek-v4-pro"), &reg),
-            DEEPSEEK_FLASH
-        );
-        // A passthrough id the catalog doesn't know (e.g. a newer DeepSeek model
-        // the registry hasn't caught up to) is judged on itself — and the raw
-        // "auto" sentinel never leaks to the API layer.
-        assert_eq!(
-            classifier_model_for(&cfg("deepseek-v9-experimental"), &reg),
-            "deepseek-v9-experimental"
-        );
-    }
 
     fn shell(command: &str) -> ToolCall {
         ToolCall {
@@ -1210,7 +1157,7 @@ mod tests {
             crate::echo_client::EchoClient::new(crate::i18n::SharedLang::default()),
             crate::tool::ToolRegistry::new(),
         );
-        runtime.begin_turn("approve a shell call").await;
+        runtime.begin_turn("approve a shell call").await.unwrap();
         let pending = PendingToolBatch {
             approval_id: crate::ApprovalId::new(),
             current: crate::tool::ToolCall::new(
@@ -1318,12 +1265,8 @@ mod tests {
 
         let runtime =
             crate::runtime::AgentRuntime::new(MuteClient, crate::tool::ToolRegistry::default());
-        runtime.begin_turn("original").await;
+        runtime.begin_turn("original").await.unwrap();
         let turn_id = runtime.state.lock().await.current_turn_id.clone();
-        // The wrapper around `classifier_model_for`, pinned on the same
-        // runtime: builtin config routes to the Flash judge.
-        assert_eq!(runtime.classifier_model(), DEEPSEEK_FLASH);
-
         let usage = crate::model::Usage {
             prompt_tokens: Some(100),
             completion_tokens: Some(50),
@@ -1374,7 +1317,7 @@ mod tests {
         assert!(state.session_cache_savings.cny > savings_1.cny);
         drop(state);
 
-        runtime.begin_turn("successor").await;
+        runtime.begin_turn("successor").await.unwrap();
         runtime
             .record_classifier_cost(DEEPSEEK_FLASH, &usage, turn_id.as_ref())
             .await;

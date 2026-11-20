@@ -10,6 +10,11 @@ pub type AgentResult<T> = Result<T, AgentError>;
 /// language before emitting a `RuntimeEvent::Error`.
 #[derive(Debug, Error)]
 pub enum AgentError {
+    #[error(
+        "unknown model. Set provider.model or DEEP_CODE_MODEL to a model listed by `deepcode doctor`."
+    )]
+    UnknownModel,
+
     #[error("missing DeepSeek API key")]
     MissingApiKey,
 
@@ -90,6 +95,7 @@ impl AgentError {
     #[must_use]
     pub fn user_message(&self, lang: Lang) -> String {
         match self {
+            Self::UnknownModel => tr(lang, TextId::ErrUnknownModel).to_string(),
             Self::MissingApiKey => tr(lang, TextId::ErrMissingApiKey).to_string(),
             Self::Http(error) => tr_with(lang, TextId::ErrHttp, &[("error", &error.to_string())]),
             Self::Api { status, message } => {
