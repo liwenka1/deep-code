@@ -6,6 +6,9 @@ Entries marked **Security:** change security-relevant behavior.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-21
+
+<!-- reviewed-notes:start -->
 - The default model is `deepseek-flash` with `high` reasoning effort. Configure a model ID or alias and set the effort to `none`, `low`, `high`, or `max`.
 - **Breaking:** An effective `provider.model = "auto"` is rejected before any model request. Setting `provider.reasoning_effort = "auto"` reports a configuration warning and leaves the lower-priority value in place.
 - Sub-agents inherit the parent agent's model and reasoning effort for their task requests.
@@ -13,6 +16,12 @@ Entries marked **Security:** change security-relevant behavior.
 - Global npm installation requires npm 11.16.0 or newer. Install with `npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode`.
 - Fixed the Chinese input cursor and narrow-terminal layout in the TUI.
 - The built-in model aliases are `pro` and `flash`. Image detail accepts `low`, `original`, or `auto`.
+<!-- reviewed-notes:end -->
+
+- **Breaking:** Model catalog validation is unified across the runtime, `doctor`, and eval, so a model ID outside the built-in catalog is now rejected instead of being passed through to the provider.
+- The TUI now shows the model and reasoning effort actually in effect, and where each setting comes from.
+- A headless run whose output pipe blocks now exits with the timeout exit code instead of hanging.
+- Two deep-code processes opening the same workspace at once no longer fail when the session store lock is first created.
 
 ## [0.5.1] - 2026-11-17
 
@@ -441,3 +450,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.4.20]: https://github.com/liwenka1/deep-code/compare/v0.4.19...v0.4.20
 [0.5.0]: https://github.com/liwenka1/deep-code/compare/v0.4.20...v0.5.0
 [0.5.1]: https://github.com/liwenka1/deep-code/compare/v0.5.0...v0.5.1
+[0.5.2]: https://github.com/liwenka1/deep-code/compare/v0.5.1...v0.5.2
