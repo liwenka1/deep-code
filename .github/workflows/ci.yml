@@ -259,5 +259,8 @@ jobs:
       - name: Check the asset map and the npm tarball
         run: bash scripts/check-packaging.sh
 
+      - name: Check release notes preparation and rendering
+        run: node --test scripts/release-notes.test.mjs
+
       - name: Check the service canary runner without live calls
         run: node --test scripts/run-service-canary.test.mjs

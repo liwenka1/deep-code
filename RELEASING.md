@@ -6,11 +6,13 @@
 Actions → Release Prep → 输入新版本号（不带 v）→ Run
 ```
 
-之后全自动：起草 CHANGELOG → bump 版本 → commit → 打 tag → 5 平台构建与自检 →
+启动前在 CHANGELOG 的 `Unreleased` 节确认需要原样发布的说明。之后自动归档
+`Unreleased` 并补充起草条目 → bump 版本 → commit → 打 tag → 5 平台构建与自检 →
 建 GitHub Release → 5 平台安装验证 → `npm publish`。
 
 Release Prep 以 `main` 历史上版本号最高且已发布到 npm 的正式 tag 为基线起草
-CHANGELOG。起草器的版本固定在工作流里，需要升级时在验证新版已发布后更新。
+CHANGELOG。上一次准备的 tag 如果尚未发布到 npm，已审阅的条目会带入下一次发版。
+起草器的版本固定在工作流里，需要升级时在验证新版已发布后更新。
 
 **不需要人工 promote、不需要人工回退、不需要 AI 参与决策。** 一个装不上的版本
 根本到不了 npm。
@@ -140,16 +142,12 @@ npm exec --yes --package=npm@12.2.3 -- bash scripts/verify-install.sh \
 - 打包契约（`check-packaging.sh`）—— 资产映射与验证矩阵比对 + tarball 内容比对
 - 安装验证 —— 宿主平台断言 + 退出码 + `deepcode <版本>` 精确匹配
 
-唯一一处 AI 在链路里：**`release-prep.yml` 用模型起草 CHANGELOG**，且无人过目
-（这是仓库里写明了的知情选择）。它是**写作**，不是验证，所以不制造"审不完"的问题。
-但它有两个必须知道的后果：
+`release-prep.yml` 用模型补充 CHANGELOG 条目，已审阅的说明原样保留。API 调用失败
+或草稿格式错误时，流程停在打 tag 之前。草稿可以为空，只要该版本已有审阅过的条目。
 
-1. 起草是 **fail-closed** 的 —— 缺 `DEEPSEEK_API_KEY` 或起草失败，发版停在打 tag
-   **之前**。所以 API 故障 = 发版等 API。它不会产生"版本推了但 changelog 是坏的"
-   这种中间态。
-2. `release.yml` 要求 `CHANGELOG.md` 里有该版本节，所以本节内容会**未经人眼**直接
-   发布。事后修正路径是 main 上补一个 docs commit + 编辑 GitHub Release 正文；tag
-   树里的那份不可改。
+`release.yml` 从 tag 的 CHANGELOG 中读取对应版本节作为 GitHub Release 正文。
+需要更正已发布正文时，更新 GitHub Release，并在 main 上提交文档修订。tag 保留
+发版时的版本节。
 
 ---
 
@@ -165,4 +163,4 @@ npm exec --yes --package=npm@12.2.3 -- bash scripts/verify-install.sh \
 | 闸门失败时 GitHub Release 已公开 | 会留下"有 Release、npm 上没有"的孤儿版本 | 用户不受影响（`latest` 没动）。修好代码后发下一个 patch；若是验证脚本自身的问题，"Re-run failed jobs" 可以走通（建 Release 是幂等更新） |
 | npm 12 默认要求批准安装脚本 | 安装步骤可能退出成功，但 CLI 缺少二进制 | `verify-install` 在 npm 12 上授权本地 tarball 的安装脚本并实际启动 CLI。公开安装命令按包名授权 |
 | 逻辑错误、安全边界绕过、UI 异常 | 闸门**不覆盖** | 机器只能判"能不能用"，判不了"用得对不对"。这一类靠 PR 时的 CI 与人工评审 |
-| CHANGELOG 内容无人过目 | 文案质量与准确性 | 见上一节；知情选择 |
+| CHANGELOG 的补充草稿未经审阅 | 补充条目的文案质量与准确性 | 必须保留的说明由 `Unreleased` 提供 |

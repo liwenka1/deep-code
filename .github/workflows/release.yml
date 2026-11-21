@@ -197,7 +197,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Verify tag matches package versions
+      - name: Verify tag matches package versions and render release notes
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           NPM=$(grep -m1 '"version"' packages/deepcode/package.json \
@@ -212,13 +212,7 @@ jobs:
             echo "::error::git tag v$TAG does not match Cargo.toml ($CARGO)"
             exit 1
           fi
-          # Changelog gate: a release without its CHANGELOG section fails
-          # here, whether the tag came from release-prep or was pushed by
-          # hand. Fail-closed: the fix is a section, not a bypass.
-          if ! grep -q "^## \[${TAG}\]" CHANGELOG.md; then
-            echo "::error::CHANGELOG.md has no section for ${TAG} — run the Release Prep workflow (or add the section) before tagging"
-            exit 1
-          fi
+          node scripts/release-notes.mjs render "$TAG" > "$RUNNER_TEMP/release-notes.md"
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -262,6 +256,7 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: release-assets/*
+          body_path: ${{ runner.temp }}/release-notes.md
           generate_release_notes: true
           fail_on_unmatched_files: true
 
