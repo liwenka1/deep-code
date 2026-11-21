@@ -578,7 +578,7 @@ impl App {
         };
         match deep_code_agent::write_global_config_update(&config_path, &update, self.lang) {
             Ok(path) => match self.relaunch_runtime() {
-                Ok(()) => {
+                Ok(_) => {
                     self.history.push(HistoryCell::system(self.tr_with(
                         TextId::ApiKeySaved,
                         &[
@@ -607,30 +607,7 @@ impl App {
             self.status = self.tr_with(TextId::ModelUnknown, &[("available", &available)]);
             return;
         };
-        let resolved = info.id.clone();
-        // Before the write, for the reason `set_api_key` gives.
-        if self.runtime_busy() {
-            self.status = self.busy_status(TextId::BusyRelaunchConfig);
-            return;
-        }
-        let update = deep_code_agent::GlobalConfigUpdate::Model(resolved.clone());
-        let Some(config_path) = self.global_config_path.clone() else {
-            self.status = self.tr(TextId::GlobalConfigUnavailable).to_string();
-            return;
-        };
-        match deep_code_agent::write_global_config_update(&config_path, &update, self.lang) {
-            Ok(_) => match self.relaunch_runtime() {
-                Ok(()) => {
-                    self.history.push(HistoryCell::system(self.tr_with(
-                        TextId::ModelSwitched,
-                        &[("model", &resolved), ("backend", &self.backend_label)],
-                    )));
-                    self.status = format!("model = {resolved} - {}", self.backend_label);
-                }
-                Err(message) => self.status = message,
-            },
-            Err(message) => self.status = message,
-        }
+        self.save_model_settings(info.id.clone(), None);
     }
 
     fn logout(&mut self) {
@@ -646,7 +623,7 @@ impl App {
         };
         match deep_code_agent::write_global_config_update(&config_path, &update, self.lang) {
             Ok(_) => match self.relaunch_runtime() {
-                Ok(()) => {
+                Ok(_) => {
                     self.history
                         .push(HistoryCell::system(self.tr(TextId::LogoutDone)));
                     self.status =

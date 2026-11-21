@@ -1,7 +1,6 @@
 # Release Prep —— 一键发版入口
 #
-# 触发：Actions 页面 workflow_dispatch，输入要发布的新版本号（不带 v；
-#       输入框提示会显示当前已发布的版本，见下）。
+# 触发：Actions 页面 workflow_dispatch，输入要发布的新版本号（不带 v）。
 # 执行：deepcode 起草 CHANGELOG 新节 → bump 三个版本文件 → chore(release)
 #       commit → 打 v 标签 → 推送。推送用 GitHub App 身份 —— 这是硬要求，
 #       不是装饰：GITHUB_TOKEN 推的 tag 不会触发其他 workflow，release.yml
@@ -15,13 +14,8 @@
 # 锚点注释）。事后修正路径：main 上补 docs commit + 编辑 GitHub Release
 # 正文；tag 树里的那份历史文件不可改，是全自动的固有代价。
 #
-# 输入框提示里的 "Current version: X" 与起草器的 npm 锁版本都由发版流程
-# 自我维护：dispatch 的 description 是静态 YAML（GitHub 不支持在这里取
-# 动态值），锁版本则是供应链要求，所以发布成功后由最后一步把两者刷成刚
-# 发布的版本、单独 commit 单独 push。best-effort：改的是 workflow 文件，
-# App 需要 Workflows 写权限；缺权限或 main 恰好被推进时只告警不失败——
-# 发版本身不受影响，代价是提示与锁版本停在上一个成功刷新的版本，直到
-# 下次刷新自愈（锁版本停旧只是用旧起草器起草，无正确性影响）。
+# CHANGELOG 从 main 历史上版本号最高、已发布到 npm 的正式 tag 起草。
+# 起草器使用独立的已发布固定版本。
 
 name: Release Prep
 
@@ -29,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Current version: 0.5.1 — enter the NEW version to release (no leading v)'
+        description: 'Version to release (MAJOR.MINOR.PATCH, no leading v)'
         required: true
 
 # 同一时刻只允许一次发版准备在跑，杜绝并发双开互相踩 tag。
@@ -93,20 +87,36 @@ jobs:
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          # Full history + tags: the draft range is <last tag>..HEAD, and the
-          # App token persists for the final push.
+          # Full history and tags for the draft range and App token for the push.
           fetch-depth: 0
           fetch-tags: true
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Verify tag is new and there is something to release
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '>=24.18.0 <25'
+
+      - name: Verify new tag and find the published changelog baseline
         id: range
         run: |
           if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
             echo "::error::tag v${VERSION} already exists"
             exit 1
           fi
-          PREV_TAG=$(git describe --tags --abbrev=0)
+          PUBLISHED=$(npm view @liwenkai/deepcode versions --json --registry https://registry.npmjs.org)
+          PREV_TAG=$(
+            git for-each-ref --merged=HEAD --sort=-version:refname --format='%(refname:strip=2)' refs/tags \
+              | jq -Rrs --argjson published "$PUBLISHED" '
+                  split("\n")
+                  | map(select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")))
+                  | map(select(.[1:] as $version | $published | arrays | index($version)))
+                  | .[0] // empty
+                '
+          )
+          if [ -z "$PREV_TAG" ]; then
+            echo "::error::no stable tag on main matches a published @liwenkai/deepcode version"
+            exit 1
+          fi
           COUNT=$(git rev-list --count "${PREV_TAG}..HEAD")
           if [ "$COUNT" -eq 0 ]; then
             echo "::error::no commits since ${PREV_TAG} — nothing to release"
@@ -122,12 +132,8 @@ jobs:
           toolchain: 1.96.0
 
       - name: Install deepcode
-        # Pinned to the last released version, and self-maintained: the
-        # refresh step at the bottom bumps this line after every release,
-        # the same way it refreshes the dispatch hint. If a release tag never
-        # actually reached npm, the next prep fails right here — loudly,
-        # which is the correct failure direction for a supply-chain pin.
-        run: npm i -g @liwenkai/deepcode@0.5.1
+        # Change this pin after verifying the new drafter is published on npm.
+        run: npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode@0.5.1
 
       # The drafter reads the existing CHANGELOG.md for style and turns the
       # commit subjects (stdin) into user-facing bullets. Contract is narrow
@@ -205,8 +211,8 @@ jobs:
       # while the TAG still landed. That orphan tag triggers release.yml, whose
       # version gate reads the tag's own tree and therefore passes — npm would
       # publish a version whose chore(release) commit never reached main, with
-      # no changelog section on main and a tag the next release-prep's
-      # `git describe` cannot see. --atomic makes the whole push fail together.
+      # no changelog section on main and a tag outside the next draft range.
+      # --atomic makes the whole push fail together.
       - name: Commit, tag, push
         env:
           BOT_NAME: ${{ steps.bot.outputs.name }}
@@ -219,47 +225,14 @@ jobs:
           git tag "v${VERSION}"
           git push --atomic origin "HEAD:main" "refs/tags/v${VERSION}"
 
-      # 发布已完成；把 dispatch 输入框的提示刷成 "Current version: 刚发布的
-      # 版本"，并把上面 Install deepcode 的起草器锁版本刷成同一个数——下次
-      # 打开触发页时"当前版本"才是真话，下次起草用的也是最新发布的二进制。
-      # 刻意不进上面的原子推送：这些是提示与自维护,不配拥有挡住一次成功
-      # 发版的能力。失败的两种已知形态（App 缺 Workflows 写权限被 GitHub
-      # 拒推、main 运行期间被推进导致非快进）都只告警跳过。
-      - name: Refresh dispatch hint and drafter pin (best-effort)
-        run: |
-          NEW_HINT="Current version: ${VERSION} — enter the NEW version to release (no leading v)"
-          # Anchored on the hint's own text, not on "any indented description:".
-          # The loose pattern happens to match exactly one line today; the day a
-          # second `workflow_dispatch` input is added, it would silently
-          # overwrite that input's description with the version hint.
-          sed -i -E "s|^( +description: )'Current version: .*'$|\1'${NEW_HINT}'|" \
-            .github/workflows/release-prep.yml
-          # Same self-maintenance for the drafter pin in "Install deepcode":
-          # the next prep drafts with the version this run just released.
-          sed -i -E "s|^( +run: npm i -g @liwenkai/deepcode)@[0-9]+\.[0-9]+\.[0-9]+$|\1@${VERSION}|" \
-            .github/workflows/release-prep.yml
-          if ! grep -qF "deepcode@${VERSION}" .github/workflows/release-prep.yml; then
-            echo "::warning::drafter pin line not found; pin left as-is"
-          fi
-          if ! grep -qF "${NEW_HINT}" .github/workflows/release-prep.yml; then
-            echo "::warning::dispatch-hint description line not found; hint left as-is"
-            exit 0
-          fi
-          if git diff --quiet -- .github/workflows/release-prep.yml; then
-            echo "dispatch hint already current"
-            exit 0
-          fi
-          git add .github/workflows/release-prep.yml
-          git commit -m "chore(ci): 发版提示与起草器锁版本刷新为 ${VERSION}"
-          git push origin "HEAD:main" \
-            || echo "::warning::hint refresh not pushed (App lacks the Workflows write permission, or main advanced mid-run); the release itself is complete — the hint self-heals on the next successful refresh."
-
       - name: Summary
         run: |
           {
-            echo "## Released v${VERSION}"
+            echo "## Release queued for v${VERSION}"
             echo
-            echo "Published changelog section (review; fix-ups go to main as a docs commit):"
+            echo "The Release workflow builds, verifies installation, and publishes to npm."
+            echo
+            echo "CHANGELOG section included in the tag"
             echo
             cat /tmp/section.md
           } >> "$GITHUB_STEP_SUMMARY"

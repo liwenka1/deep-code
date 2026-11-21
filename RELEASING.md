@@ -9,6 +9,9 @@ Actions → Release Prep → 输入新版本号（不带 v）→ Run
 之后全自动：起草 CHANGELOG → bump 版本 → commit → 打 tag → 5 平台构建与自检 →
 建 GitHub Release → 5 平台安装验证 → `npm publish`。
 
+Release Prep 以 `main` 历史上版本号最高且已发布到 npm 的正式 tag 为基线起草
+CHANGELOG。起草器的版本固定在工作流里，需要升级时在验证新版已发布后更新。
+
 **不需要人工 promote、不需要人工回退、不需要 AI 参与决策。** 一个装不上的版本
 根本到不了 npm。
 
@@ -28,7 +31,7 @@ guard ──► build(×5) ──► release ──► verify-install(×5) ─�
 | `guard` | 拒绝非 tag 触发 | 误触发的 workflow_dispatch（否则会白跑半小时矩阵再报绿） |
 | `build` ×5 | `cargo test` → `cargo build --release` → **执行产物** → 上传 | 编译失败；安全测试静默 skip；**产物起不来**；**glibc floor 被抬高** |
 | `release` | tag↔版本↔CHANGELOG 四者一致 → 资产 → `SHA256SUMS` → **校验和自检** → 建 Release | 版本不一致；缺 changelog 节；校验和生成错或漏（它是所有安装的信任根） |
-| `verify-install` ×5 | 断言宿主平台 == leg 声称的平台 → `npm pack` → 本地安装 → `deepcode --version` / `--help` | 资产名不匹配；`SHA256SUMS` 与资产不一致；postinstall 失败；启动器回归；`os`/`cpu` 标签不匹配 —— **"全平台装不上"这一整类** |
+| `verify-install` ×5 | 断言宿主平台 == leg 声称的平台 → npm 12 打包并授权本地 tarball 的安装脚本 → `deepcode --version` / `--help` | 资产名不匹配；`SHA256SUMS` 与资产不一致；postinstall 失败；启动器回归；`os`/`cpu` 标签不匹配 —— **"全平台装不上"这一整类** |
 | `publish` | `npm publish`（幂等） | 只有前四步全绿才跑得到 |
 
 > `verify-install` 使用 **5** 条原生 leg，覆盖 macOS arm64/x64、Linux arm64/x64
@@ -66,6 +69,8 @@ promote"的方案没有长生命周期 token 就做不成。把验证前移是�
 > ⚠️ **前提**：`npm pack` 产出的 tarball 必须与 `npm publish` 上传的一致。今天成立
 > ——同一个 `files` 字段，且没有 `prepack` / `prepublishOnly` 钩子。**一旦有人加了
 > 这样的钩子，这道闸门对"已发布产物"的覆盖就作废了。**
+
+npm `latest` 指向新版本后，在没有模型或思考强度覆盖的仓库验收一次 Bot。核对工作流日志的 `deepcode --version` 与 `latest` 一致，并确认任务报告记录 `deepseek-flash` 和 `high`。
 
 ---
 
@@ -114,8 +119,9 @@ Actions → Verify Install (canary) → 输入要验证的发布版本 → Run
 # 打包契约检查（PR 级，无网络、秒级）——CI 的 packaging job 跑的就是这个
 bash scripts/check-packaging.sh
 
-# 安装验证的前半段（会真的去下载资产，需要网络）
-bash scripts/verify-install.sh "$(node -p 'require("./packages/deepcode/package.json").version')"
+# 用 npm 12 验证安装（会下载 GitHub Release 资产，需要网络）
+npm exec --yes --package=npm@12.2.3 -- bash scripts/verify-install.sh \
+  "$(node -p 'require("./packages/deepcode/package.json").version')"
 
 # 完整本地闸门（fmt / clippy / 测试 / doctest）
 ./scripts/preflight.sh
@@ -157,6 +163,6 @@ bash scripts/verify-install.sh "$(node -p 'require("./packages/deepcode/package.
 |---|---|---|
 | `release` job 里新建的校验和自检，演练覆盖不到 | 首次发版时这一步是第一次运行 | 它是"照搬的已有代码 + 一个自检"，且失败会停在 npm publish 之前 |
 | 闸门失败时 GitHub Release 已公开 | 会留下"有 Release、npm 上没有"的孤儿版本 | 用户不受影响（`latest` 没动）。修好代码后发下一个 patch；若是验证脚本自身的问题，"Re-run failed jobs" 可以走通（建 Release 是幂等更新） |
-| npm 可能改为默认门禁 install scripts | 若被拦住，`npm i -g deepcode` 会"安装成功"但二进制不存在，**所有新装用户全坏** | 闸门天然覆盖：二进制不存在时 `verify-install` 当场变红；持续关注 npm 的安装脚本策略变化 |
+| npm 12 默认要求批准安装脚本 | 安装步骤可能退出成功，但 CLI 缺少二进制 | `verify-install` 在 npm 12 上授权本地 tarball 的安装脚本并实际启动 CLI。公开安装命令按包名授权 |
 | 逻辑错误、安全边界绕过、UI 异常 | 闸门**不覆盖** | 机器只能判"能不能用"，判不了"用得对不对"。这一类靠 PR 时的 CI 与人工评审 |
 | CHANGELOG 内容无人过目 | 文案质量与准确性 | 见上一节；知情选择 |

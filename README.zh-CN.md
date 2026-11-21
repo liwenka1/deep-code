@@ -9,7 +9,7 @@
 **小、快、自足**
 
 - 每平台单一原生二进制(约 4–6 MB),运行时不依赖 Node/Python。预编译覆盖 macOS(arm64/x64)、Linux(x64/arm64,glibc ≥ 2.35)、Windows(x64)。
-- `npm i -g` 按平台下载并校验 SHA-256。musl 宿主(Alpine 及多数 slim 镜像)暂不支持——安装器会检测并给出明确报错,而不是装一个跑不起来的二进制。
+- npm 安装脚本会下载对应平台的二进制并校验 SHA-256。musl 宿主(Alpine 及多数 slim 镜像)暂不支持——安装器会检测并给出明确报错,而不是装一个跑不起来的二进制。
 
 **安全优先的执行**
 
@@ -58,14 +58,16 @@
 
 ## 安装
 
+使用 Node.js 24 或更新版本，npm 最低版本为 11.16.0。`--allow-scripts` 显式授权 DeepCode 包的安装脚本。
+
 ```sh
-npm i -g @liwenkai/deepcode
+npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode
 ```
 
-安装后命令为 `deepcode`(postinstall 会按平台从 GitHub Releases 下载预编译二进制并校验 SHA-256)。更新:
+安装后命令为 `deepcode`。安装脚本会从 GitHub Releases 下载对应平台的二进制并校验 SHA-256。更新时指定 `latest`。
 
 ```sh
-npm i -g @liwenkai/deepcode@latest
+npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode@latest
 ```
 
 ## 快速开始
@@ -192,7 +194,7 @@ jobs:
 
 **可选的 bot 身份**:不配就以 `github-actions[bot]` 干活,一切正常。配一个自己的 GitHub App(`--with-app` 会一步步带你走)能多拿两样——提交计入贡献者、评论带 `[bot]` 徽章;以及 bot 推的分支**会正常触发你其他 workflow**,而 `GITHUB_TOKEN` 的推送永远不触发(GitHub 防环规则),也就是说不配 App 时 bot 开的 PR 上没有 CI 检查。
 
-触发前缀、允许触发的人、语言、模型、权限档等全部可调,说明见 [`deepcode-bot.yml`](./.github/workflows/deepcode-bot.yml) 顶部。想自己拼流程(PR review、issue 分类、定时任务)不必用这套管线,两行就够:`npm i -g @liwenkai/deepcode` 然后 `deepcode -p --output-format json`。
+触发前缀、允许触发的人、语言、模型和权限档都可配置，见 [`deepcode-bot.yml`](./.github/workflows/deepcode-bot.yml) 顶部。工作流会记录实际安装的 CLI 版本，调用方和项目均未指定模型时采用该版本的默认模型。自己编写流程时，可沿用上面的安装命令，再运行 `deepcode -p --output-format json`。
 
 > **放宽触发权限前请想清楚**:默认只有仓库 Owner 能触发(`allowed-associations`)。放开它等于把"在你的 CI 里、挨着你的 secrets 跑 shell"交给能评论的人。安全靠三条腿——可信触发者、CLI 的 deny 底板、PR 从不自动合并——拆一条另外两条撑不住。
 

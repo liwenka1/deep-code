@@ -31,7 +31,11 @@ Entries marked **Security:** change security-relevant behavior.
 ## [Unreleased]
 
 - The default model is `deepseek-flash` with `high` reasoning effort. Configure a model ID or alias and set the effort to `none`, `low`, `high`, or `max`.
+- **Breaking:** An effective `provider.model = "auto"` is rejected before any model request. Setting `provider.reasoning_effort = "auto"` reports a configuration warning and leaves the lower-priority value in place.
 - Sub-agents inherit the parent agent's model and reasoning effort for their task requests.
+- Headless returns a structured error for an unknown model in both `json` and `stream-json` output.
+- Global npm installation requires npm 11.16.0 or newer. Use `--allow-scripts=@liwenkai/deepcode` to approve the package's binary download script.
+- Fixed the Chinese input cursor and narrow-terminal layout in the TUI.
 - The built-in model aliases are `pro` and `flash`. Image detail accepts `low`, `original`, or `auto`.
 - Image requests now fit the complete 48 MiB JSON body limit, including text and tools, and reject an oversized non-image request with a clear error.
 - The supported build floors are Rust 1.96 and Node.js 24.

@@ -1,4 +1,5 @@
 use super::*;
+use deep_code_agent::{GlobalConfigUpdate, LoadedAgentConfig, write_global_config_update};
 
 #[cfg(test)]
 mod switch_tests;
@@ -167,12 +168,11 @@ impl App {
     /// `.deep-code/config.toml` + env. Routing all three swap paths through one
     /// loader keeps `/resume`, `/clear`, and `/model` from drifting — a plain
     /// `AgentConfig::load` here once dropped the saved key on `/resume`.
-    fn load_layered_config(&self) -> AgentConfig {
+    fn load_layered_config(&self) -> LoadedAgentConfig {
         let project = self.workspace.join(".deep-code").join("config.toml");
         AgentConfig::load_with(self.global_config_path.clone(), Some(project), &|name| {
             std::env::var(name).ok()
         })
-        .config
     }
 
     /// Stop the subagent supervisor and flush + tear down the live runtime.
@@ -316,7 +316,7 @@ impl App {
         }
         self.extra_roots.push(canonical.clone());
         match self.relaunch_runtime() {
-            Ok(()) => {
+            Ok(_) => {
                 self.push_extra_roots_banner();
                 self.status = self.tr_with(
                     TextId::AddDirGranted,
@@ -331,14 +331,15 @@ impl App {
     }
 
     /// Prepare the replacement from live memory before retiring the old runtime.
-    pub(crate) fn relaunch_runtime(&mut self) -> Result<(), String> {
+    pub(crate) fn relaunch_runtime(&mut self) -> Result<LoadedAgentConfig, String> {
         if self.runtime_busy() {
             return Err(self.busy_status(TextId::BusyRelaunchConfig));
         }
 
         deep_code_agent::validate_pinned_workspace(&self.workspace)
             .map_err(|error| error.to_string())?;
-        let agent_config = self.load_layered_config();
+        let loaded = self.load_layered_config();
+        let agent_config = &loaded.config;
         run_runtime_future(async {
             let snapshot = self
                 .runtime
@@ -346,7 +347,7 @@ impl App {
                 .await
                 .map_err(|error| error.to_string())?;
             let launched = deep_code_agent::prepare_runtime_reconfiguration(
-                &agent_config,
+                agent_config,
                 deep_code_agent::WorkspaceRoots::new(
                     self.workspace.clone(),
                     self.extra_roots.clone(),
@@ -355,7 +356,7 @@ impl App {
             )
             .map_err(|error| error.to_string())?;
             self.stop_current_runtime().await;
-            self.adopt_configured_runtime(launched, &agent_config);
+            self.adopt_configured_runtime(launched, agent_config);
             if let Some(error) = self.runtime.flush_session().await {
                 self.pending_launch_warnings
                     .push(format!("failed to persist reconfigured session: {error}"));
@@ -365,7 +366,64 @@ impl App {
         // No rebuild on this path (`/model`, `/apikey`, `/add-dir` keep the
         // transcript), so the warnings belong at the end of it, immediately.
         self.flush_launch_warnings();
-        Ok(())
+        Ok(loaded)
+    }
+
+    pub(crate) fn save_model_settings(&mut self, model: String, reasoning_effort: Option<String>) {
+        if self.runtime_busy() {
+            self.status = self.busy_status(TextId::BusyRelaunchConfig);
+            return;
+        }
+        let Some(config_path) = self.global_config_path.as_deref() else {
+            self.status = self.tr(TextId::GlobalConfigUnavailable).to_string();
+            return;
+        };
+        let (update, saved) = match reasoning_effort {
+            Some(reasoning_effort) => {
+                let saved = self.tr_with(
+                    TextId::GlobalModelAndReasoningSaved,
+                    &[("model", &model), ("reasoning", &reasoning_effort)],
+                );
+                (
+                    GlobalConfigUpdate::ModelAndReasoning {
+                        model,
+                        reasoning_effort,
+                    },
+                    saved,
+                )
+            }
+            None => {
+                let saved = self.tr_with(TextId::GlobalModelSaved, &[("model", &model)]);
+                (GlobalConfigUpdate::Model(model), saved)
+            }
+        };
+        match write_global_config_update(config_path, &update, self.lang)
+            .and_then(|_| self.relaunch_runtime())
+        {
+            Ok(loaded) => {
+                let model = loaded
+                    .config
+                    .resolved_model()
+                    .expect("runtime reconfiguration validates the model");
+                let sources = loaded.report.sources;
+                self.status = self.tr_with(
+                    TextId::ActiveModelSettings,
+                    &[
+                        ("model", model),
+                        ("model_source", sources.model.localized_label(self.lang)),
+                        ("reasoning", loaded.config.reasoning_effort.as_setting()),
+                        (
+                            "reasoning_source",
+                            sources.reasoning_effort.localized_label(self.lang),
+                        ),
+                        ("backend", &self.backend_label),
+                    ],
+                );
+                self.history
+                    .push(HistoryCell::system(format!("{saved} {}", self.status)));
+            }
+            Err(message) => self.status = message,
+        }
     }
 
     pub(crate) fn resume_picker_open(&self) -> bool {
@@ -548,42 +606,7 @@ impl App {
         let Some(reasoning_effort) = picker.efforts.get(picker.selected_effort).cloned() else {
             return;
         };
-        if self.runtime_busy() {
-            self.status = self.busy_status(TextId::BusyRelaunchConfig);
-            return;
-        }
-        let Some(config_path) = self.global_config_path.clone() else {
-            self.status = self.tr(TextId::GlobalConfigUnavailable).to_string();
-            return;
-        };
-        let update = deep_code_agent::GlobalConfigUpdate::ModelAndReasoning {
-            model: model.clone(),
-            reasoning_effort: reasoning_effort.clone(),
-        };
-        match deep_code_agent::write_global_config_update(&config_path, &update, self.lang) {
-            Ok(_) => match self.relaunch_runtime() {
-                Ok(()) => {
-                    self.history.push(HistoryCell::system(self.tr_with(
-                        TextId::ModelAndReasoningSwitched,
-                        &[
-                            ("model", &model),
-                            ("reasoning", &reasoning_effort),
-                            ("backend", &self.backend_label),
-                        ],
-                    )));
-                    self.status = self.tr_with(
-                        TextId::ModelAndReasoningSwitched,
-                        &[
-                            ("model", &model),
-                            ("reasoning", &reasoning_effort),
-                            ("backend", &self.backend_label),
-                        ],
-                    );
-                }
-                Err(message) => self.status = message,
-            },
-            Err(message) => self.status = message,
-        }
+        self.save_model_settings(model, Some(reasoning_effort));
     }
 
     /// Open the in-app `/resume` modal, listing the workspace's non-empty
@@ -959,7 +982,7 @@ impl App {
             self.status = error.to_string();
             return;
         }
-        let agent_config = self.load_layered_config();
+        let agent_config = self.load_layered_config().config;
         if let Err(error) = agent_config.resolved_model() {
             self.status = error.user_message(self.lang);
             return;

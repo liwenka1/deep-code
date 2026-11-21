@@ -101,7 +101,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
+          node-version: '>=24.18.0 <25'
 
       # Same assertion as release.yml's gate, for the same reason: `install.mjs`
       # chooses its asset from the HOST, so a leg whose runner contradicts its
@@ -116,5 +116,5 @@ jobs:
             exit 1
           fi
 
-      - name: Install from the local tarball and run it
-        run: bash scripts/verify-install.sh "${{ inputs.version }}" released/packages/deepcode
+      - name: Install and run the local tarball with npm 12
+        run: npm exec --yes --package=npm@12.2.3 -- bash scripts/verify-install.sh "${{ inputs.version }}" released/packages/deepcode

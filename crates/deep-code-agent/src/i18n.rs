@@ -377,8 +377,9 @@ text_ids! {
     ApiKeySaved,
     StatusConnected,
     ModelUnknown,
-    ModelSwitched,
-    ModelAndReasoningSwitched,
+    GlobalModelSaved,
+    GlobalModelAndReasoningSaved,
+    ActiveModelSettings,
     StatusModelPickerCancelled,
     LogoutDone,
     StatusLoggedOut,
@@ -476,6 +477,10 @@ text_ids! {
     WebHostNoAddrs,
     WebPrivateResolvedBlocked,
     // 配置加载警告(layers.rs)
+    CfgLayerBuiltin,
+    CfgLayerGlobal,
+    CfgLayerProject,
+    CfgLayerEnv,
     CfgFileUnusable,
     CfgProjectApiKeyIgnored,
     CfgProjectBaseUrlIgnored,
@@ -669,8 +674,8 @@ mod tests {
         // emitted verbatim, not re-expanded by that later arg (single-pass).
         let out = tr_with(
             Lang::En,
-            TextId::ModelSwitched,
-            &[("model", "{backend}"), ("backend", "deepseek")],
+            TextId::ApiKeySaved,
+            &[("path", "{backend}"), ("backend", "deepseek")],
         );
         assert!(out.contains("{backend}"), "value re-substituted: {out}");
     }

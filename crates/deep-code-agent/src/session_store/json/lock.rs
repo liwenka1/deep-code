@@ -3,6 +3,8 @@
 
 use super::*;
 
+const LOCK_FILE: &str = ".store.lock";
+
 pub(super) struct StoreLock(std::fs::File);
 
 impl StoreLock {
@@ -12,24 +14,29 @@ impl StoreLock {
         cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<Self, SessionStoreError> {
         let mut options = OpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        if exclusive {
-            options.write(true).create(true);
-        }
+        options
+            .read(true)
+            .write(exclusive)
+            .follow(FollowSymlinks::No);
         #[cfg(unix)]
         {
             use cap_std::fs::OpenOptionsExt;
             options.mode(0o600).custom_flags(libc::O_NONBLOCK);
         }
-        let file = match directory.open_with(".store.lock", &options) {
-            Err(error) if !exclusive && error.kind() == std::io::ErrorKind::NotFound => {
-                options.write(true).create(true);
-                directory
-                    .open_with(".store.lock", &options)
-                    .map_err(store_io)?
+        let file = match directory.open_with(LOCK_FILE, &options) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut create = options.clone();
+                create.write(true).create_new(true);
+                match directory.open_with(LOCK_FILE, &create) {
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        directory.open_with(LOCK_FILE, &options)
+                    }
+                    result => result,
+                }
             }
-            result => result.map_err(store_io)?,
-        };
+            result => result,
+        }
+        .map_err(store_io)?;
         if !file.metadata().map_err(store_io)?.is_file() {
             return Err(store_io(std::io::Error::other(
                 "session lock is not a regular file",
@@ -72,6 +79,23 @@ impl Drop for StoreLock {
 mod tests {
     use super::*;
 
+    #[test]
+    fn concurrent_first_reader_and_writer_both_acquire_the_lock() {
+        for _ in 0..128 {
+            let workspace = tempfile::tempdir().unwrap();
+            let store = JsonSessionStore::for_workspace(workspace.path()).unwrap();
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    start.wait();
+                    StoreLock::acquire(&store.directory, true, None).unwrap();
+                });
+                start.wait();
+                StoreLock::acquire(&store.directory, false, None).unwrap();
+            });
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn reading_an_existing_archive_does_not_require_writable_lock_access() {
@@ -81,7 +105,7 @@ mod tests {
         let mut record = SessionRecord::new(workspace.path().to_path_buf(), "system");
         store.save(&mut record).unwrap();
         std::fs::set_permissions(
-            store.root.join(".store.lock"),
+            store.root.join(LOCK_FILE),
             std::fs::Permissions::from_mode(0o400),
         )
         .unwrap();
@@ -96,7 +120,7 @@ mod tests {
         let second = StoreLock::acquire(&store.directory, false, None).unwrap();
         let writer = store
             .directory
-            .open_with(".store.lock", OpenOptions::new().read(true).write(true))
+            .open_with(LOCK_FILE, OpenOptions::new().read(true).write(true))
             .unwrap()
             .into_std();
         assert!(matches!(

@@ -1113,6 +1113,87 @@ fn model_command_resolves_aliases_persists_and_keeps_session() {
 }
 
 #[test]
+fn model_updates_report_the_active_settings_and_their_sources() {
+    const CHILD: &str = "DEEP_CODE_MODEL_FEEDBACK_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::tests::model_updates_report_the_active_settings_and_their_sources",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env_remove("DEEP_CODE_MODEL")
+            .env("DEEP_CODE_REASONING_EFFORT", "max")
+            .env_remove("DEEPSEEK_API_KEY")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "model feedback test child failed: {status}"
+        );
+        return;
+    }
+
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join(".deep-code/config.toml");
+    let project_settings = "[provider]\nmodel = \" pro \"\nreasoning_effort = \"high\"\n";
+    std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+    std::fs::write(&project, project_settings).unwrap();
+    let mut app = App::launch(LaunchConfig {
+        workspace: Some(workspace.path().to_path_buf()),
+        ..LaunchConfig::default()
+    })
+    .unwrap();
+    app.lang = Lang::En;
+    app.global_config_path = Some(workspace.path().join("global.toml"));
+    let session = app.session_id.clone();
+    let flash = deep_code_agent::DEEPSEEK_FLASH;
+    let pro = deep_code_agent::DEEPSEEK_V4_PRO;
+    let assert_feedback = |app: &App, saved: String| {
+        assert!(
+            app.status.contains(&format!("{pro} (project config)")),
+            "{}",
+            app.status
+        );
+        assert!(app.status.contains("max (environment)"), "{}", app.status);
+        assert!(
+            matches!(app.history.last(), Some(HistoryCell::System { text })
+            if text.contains(&saved) && text.contains(&app.status))
+        );
+    };
+
+    assert!(app.handle_slash_command("/model flash"));
+    assert_feedback(&app, format!("Saved {flash} as the global default model."));
+
+    assert!(app.handle_slash_command("/model"));
+    let picker = app.model_picker.as_mut().unwrap();
+    picker.selected_model = picker
+        .models
+        .iter()
+        .position(|model| model == flash)
+        .unwrap();
+    picker.selected_effort = picker
+        .efforts
+        .iter()
+        .position(|effort| effort == "low")
+        .unwrap();
+    app.model_picker_accept();
+    assert_feedback(
+        &app,
+        format!("Saved {flash} and low thinking as global defaults."),
+    );
+
+    let global = AgentConfig::load_with(app.global_config_path.clone(), None, &|_| None).config;
+    assert_eq!(global.resolved_model().unwrap(), flash);
+    assert_eq!(global.reasoning_effort.as_setting(), "low");
+    assert_eq!(std::fs::read_to_string(project).unwrap(), project_settings);
+    assert_eq!(app.session_id, session);
+}
+
+#[test]
 fn an_unknown_configured_model_cannot_replace_a_live_session() {
     const CHILD: &str = "DEEP_CODE_UNKNOWN_MODEL_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {

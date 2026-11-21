@@ -30,7 +30,7 @@ use std::collections::HashMap;
 
 use deep_code_agent::{
     AgentConfig, JsonSessionStore, PermissionMode, RuntimeEvent, SessionId, SessionRecord,
-    SessionStore, launch_runtime, neutralize_display_text, now_ms,
+    SessionStore, launch_runtime, neutralize_display_text,
 };
 
 use crate::cli::{PrintArgs, StartupIntent, program_name};
@@ -82,12 +82,20 @@ pub async fn run_print(args: PrintArgs) -> i32 {
     };
     let interruption = interrupted.cancelled();
     tokio::pin!(interruption);
-    let code =
-        run_with_diagnostics(args, &diagnostics, &stdout, &interrupted, &mut interruption).await;
+    let mut config_error_deadline = None;
+    let code = run_with_diagnostics(
+        args,
+        &diagnostics,
+        &stdout,
+        &interrupted,
+        &mut interruption,
+        &mut config_error_deadline,
+    )
+    .await;
     if interrupted.is_cancelled() {
         return EXIT_INTERRUPT;
     }
-    if code == EXIT_TIMEOUT {
+    if code == EXIT_TIMEOUT && config_error_deadline.is_none() {
         let _ =
             tokio::time::timeout(std::time::Duration::from_millis(200), diagnostics.flush()).await;
         return if interrupted.is_cancelled() {
@@ -99,6 +107,7 @@ pub async fn run_print(args: PrintArgs) -> i32 {
     tokio::select! {
         biased;
         () = interrupted.cancelled() => EXIT_INTERRUPT,
+        () = sleep_until(config_error_deadline) => EXIT_TIMEOUT,
         () = diagnostics.flush() => code,
     }
 }
@@ -109,7 +118,9 @@ async fn run_with_diagnostics(
     stdout: &Output,
     interrupted_token: &CancellationToken,
     interruption: &mut (impl std::future::Future<Output = ()> + Unpin),
+    config_error_deadline: &mut Option<std::time::Instant>,
 ) -> i32 {
+    let started = std::time::Instant::now();
     let has_positional = args
         .prompt
         .as_deref()
@@ -158,7 +169,33 @@ async fn run_with_diagnostics(
         emit(diagnostics, "config", &warning);
     }
     if let Err(error) = loaded.config.resolved_model() {
-        emit(diagnostics, "config", &error.to_string());
+        let message = error.to_string();
+        emit(diagnostics, "config", &message);
+        let report = output::PrintReport {
+            status: "error",
+            result: String::new(),
+            reasoning: String::new(),
+            error: Some(message),
+            session_id: None,
+            denied_approvals: 0,
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            cost: None,
+            usage: None,
+            telemetry: None,
+        };
+        let bytes = output::encode_report(&report, args.output, None);
+        let deadline = std::time::Instant::now().checked_add(std::time::Duration::from_secs(
+            effective_headless_timeout_secs(args.timeout_secs),
+        ));
+        // Share the error report's budget with the final stderr flush.
+        *config_error_deadline = deadline;
+        if let Err(error) = stdout.with_deadline(deadline).send(&bytes).await {
+            if deadline_reached(deadline) {
+                diagnostics.line("timeout while writing the configuration error report");
+                return EXIT_TIMEOUT;
+            }
+            emit(diagnostics, "output error", &error.to_string());
+        }
         return EXIT_FAILURE;
     }
 
@@ -304,8 +341,8 @@ async fn run_turn(
     tokio::pin!(interruption);
     // stream-json mirrors the SSE contract, including the leading
     // user.message envelope, so existing jq consumers port over unchanged.
-    let mut emitter = matches!(args.output, OutputFormat::StreamJson)
-        .then(|| output::NdjsonEmitter::new(format!("print_{}", now_ms()), Vec::new()));
+    let mut emitter =
+        matches!(args.output, OutputFormat::StreamJson).then(output::NdjsonEmitter::for_print);
     if let Some(emitter) = emitter.as_mut() {
         emitter.manual("user.message", serde_json::json!({
             "content": deep_code_agent::Content::<deep_code_agent::ImageAsset>::from_text(&prompt)
@@ -464,28 +501,11 @@ async fn run_turn(
     } else {
         stdout.clone()
     };
-    let bytes = match args.output {
-        OutputFormat::StreamJson => {
-            if let (Some(emitter), Ok(payload)) = (emitter.as_mut(), serde_json::to_value(&report))
-            {
-                emitter.manual("print.result", payload);
-                emitter.take_pending()
-            } else {
-                Vec::new()
-            }
-        }
-        OutputFormat::Json => format!("{}\n", output::report_to_json(&report)).into_bytes(),
-        OutputFormat::Text => {
-            if !report.result.is_empty() {
-                format!("{}\n", report.result).into_bytes()
-            } else {
-                if report.status == "finished" {
-                    diagnostics.line("(the turn finished without assistant text)");
-                }
-                Vec::new()
-            }
-        }
-    };
+    if args.output == OutputFormat::Text && report.status == "finished" && report.result.is_empty()
+    {
+        diagnostics.line("(the turn finished without assistant text)");
+    }
+    let bytes = output::encode_report(&report, args.output, emitter);
     // Never append a new JSON envelope after cancelling a partial frame.
     let delivered = if output_abandoned.get() {
         Ok(())

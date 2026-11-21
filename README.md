@@ -9,7 +9,7 @@ A DeepSeek-powered terminal coding agent, written in Rust. One small binary: str
 **Small, fast, self-contained**
 
 - Single native binary (~4–6 MB) per platform — no Node/Python runtime needed at run time. Prebuilt for macOS (arm64/x64), Linux (x64/arm64, glibc ≥ 2.35), and Windows (x64).
-- `npm i -g` fetches the right binary and verifies its SHA-256. musl hosts (Alpine and most slim images) are not supported yet — the installer detects and refuses them with a clear error instead of installing a broken binary.
+- The npm installer fetches the platform binary and verifies its SHA-256. musl hosts (Alpine and most slim images) are not supported yet — the installer detects and refuses them with a clear error instead of installing a broken binary.
 
 **Safety-first execution**
 
@@ -58,14 +58,16 @@ A DeepSeek-powered terminal coding agent, written in Rust. One small binary: str
 
 ## Install
 
+Use Node.js 24 or newer with npm 11.16.0 or newer. The `--allow-scripts` flag approves the DeepCode package's installation script.
+
 ```sh
-npm i -g @liwenkai/deepcode
+npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode
 ```
 
-The command is `deepcode` (postinstall downloads the platform binary from GitHub Releases and verifies SHA-256). To update:
+The command is `deepcode` (postinstall downloads the platform binary from GitHub Releases and verifies SHA-256). Use the `latest` tag to update.
 
 ```sh
-npm i -g @liwenkai/deepcode@latest
+npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode@latest
 ```
 
 ## Quick start
@@ -192,7 +194,7 @@ jobs:
 
 **Optional bot identity.** Without an App the bot works fine, acting as `github-actions[bot]`. Configuring your own GitHub App (`--with-app` walks you through it) buys two things: commits count toward contributors and comments carry a `[bot]` badge; and the bot's pushes trigger your other workflows, which a `GITHUB_TOKEN` push never does — meaning without an App, bot PRs get no CI checks.
 
-Trigger prefix, who may trigger it, language, model and permission tier are all configurable — see the header of [`deepcode-bot.yml`](./.github/workflows/deepcode-bot.yml). For your own pipeline (PR review, issue triage, scheduled maintenance) you don't need this workflow at all; two lines do it: `npm i -g @liwenkai/deepcode` then `deepcode -p --output-format json`.
+Trigger prefix, who may trigger it, language, model and permission tier are all configurable — see the header of [`deepcode-bot.yml`](./.github/workflows/deepcode-bot.yml). The workflow logs the installed CLI version, whose default model applies when neither the caller nor the project selects one. For your own pipeline, use the installation command above and run `deepcode -p --output-format json`.
 
 > **Think before widening who can trigger it.** Only the repository owner can by default (`allowed-associations`). Opening that up hands anyone who can comment the ability to run shell in your CI, next to your secrets. Safety rests on three legs — trusted triggers, the CLI's deny floor, and PRs never auto-merging — and removing one is not carried by the other two.
 

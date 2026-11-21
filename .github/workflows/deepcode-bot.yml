@@ -17,8 +17,7 @@ name: deep-code bot (reusable)
 #
 # Self-contained on purpose: no companion action to resolve. A `./`-relative
 # action inside a reusable workflow would resolve against the *caller's*
-# checkout, not this repository, so installing and running the CLI is inlined
-# below — it is only two commands.
+# checkout, not this repository. This workflow installs and runs the CLI itself.
 
 on:
   workflow_call:
@@ -49,7 +48,7 @@ on:
         required: false
         default: 'accept_edits'
       model:
-        description: 'pro (deepseek-v4-pro) or flash (deepseek-flash). Defaults to the configured model (Flash by default).'
+        description: 'pro (deepseek-v4-pro) or flash (deepseek-flash). An empty value uses the configured model or the default of the installed CLI.'
         type: string
         required: false
         default: ''
@@ -344,6 +343,15 @@ jobs:
             core.setOutput('user_prompt', current);
             return T.rules + history + '\n---\n' + T.now + current;
 
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '>=24.18.0 <25'
+
+      - name: Install deepcode and record its version
+        run: |
+          npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode
+          deepcode --version
+
       # One process, one turn, then exit. Failure surfaces as a non-zero exit
       # code (1 error / 124 timeout), which the failure reporter below catches
       # — no guessing from an empty output file.
@@ -365,7 +373,6 @@ jobs:
         run: |
           set -uo pipefail
           [ -z "${DEEP_CODE_MODEL}" ] && unset DEEP_CODE_MODEL
-          npm i -g @liwenkai/deepcode
 
           printf '%s' "$DEEPCODE_PROMPT" > /tmp/deepcode-prompt.txt
           # `|| EXIT=$?` because GitHub launches this step as `bash -e {0}`,
@@ -421,6 +428,7 @@ jobs:
           fi
           echo "denied approvals: $(jq -r '.denied_approvals // 0' /tmp/deepcode-result.json)"
           echo "cost: ¥$(jq -r '.cost.cny // 0' /tmp/deepcode-result.json)"
+          jq -c '.telemetry | objects | {model: .effective_model, reasoning_effort}' /tmp/deepcode-result.json
 
           # Not `-s`: stripping the commit block can leave a file of nothing but
           # newlines, which still counts as non-empty and would post a blank reply.

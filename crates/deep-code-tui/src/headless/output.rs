@@ -13,7 +13,7 @@
 
 use std::io::Write;
 
-use deep_code_agent::{CostEstimate, RuntimeEvent, TurnTelemetry, Usage};
+use deep_code_agent::{CostEstimate, RuntimeEvent, TurnTelemetry, Usage, now_ms};
 use deep_code_runtime::EnvelopeStream;
 use serde::Serialize;
 use serde_json::Value;
@@ -70,6 +70,29 @@ pub(crate) fn report_to_json(report: &PrintReport) -> String {
     })
 }
 
+pub(super) fn encode_report(
+    report: &PrintReport,
+    format: OutputFormat,
+    emitter: Option<NdjsonEmitter<Vec<u8>>>,
+) -> Vec<u8> {
+    match format {
+        OutputFormat::Json => format!("{}\n", report_to_json(report)).into_bytes(),
+        OutputFormat::StreamJson => {
+            let mut emitter = emitter.unwrap_or_else(NdjsonEmitter::for_print);
+            if let Ok(payload) = serde_json::to_value(report) {
+                emitter.manual("print.result", payload);
+                emitter.take_pending()
+            } else {
+                Vec::new()
+            }
+        }
+        OutputFormat::Text if !report.result.is_empty() => {
+            format!("{}\n", report.result).into_bytes()
+        }
+        OutputFormat::Text => Vec::new(),
+    }
+}
+
 /// NDJSON emitter: one SSE-shaped envelope per line, flushed per line so a
 /// piped consumer sees events as they happen rather than on process exit.
 pub(crate) struct NdjsonEmitter<W: Write> {
@@ -106,6 +129,10 @@ impl<W: Write> NdjsonEmitter<W> {
 }
 
 impl NdjsonEmitter<Vec<u8>> {
+    pub(super) fn for_print() -> Self {
+        Self::new(format!("print_{}", now_ms()), Vec::new())
+    }
+
     pub(crate) fn take_pending(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.out)
     }

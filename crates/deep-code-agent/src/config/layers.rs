@@ -16,7 +16,7 @@ use super::{
     STREAM_TOTAL_TIMEOUT_ENV,
 };
 use crate::execution_policy::{NetworkMode, PermissionMode};
-use crate::i18n::{Lang, TextId, tr_with};
+use crate::i18n::{Lang, TextId, tr, tr_with};
 use crate::image::ImageDetail;
 use crate::paths::home_dir;
 use crate::pricing::CostCurrency;
@@ -97,6 +97,17 @@ impl ConfigLayer {
             Self::Project => "project",
             Self::Env => "env",
         }
+    }
+
+    #[must_use]
+    pub fn localized_label(self, lang: Lang) -> &'static str {
+        let id = match self {
+            Self::Builtin => TextId::CfgLayerBuiltin,
+            Self::Global => TextId::CfgLayerGlobal,
+            Self::Project => TextId::CfgLayerProject,
+            Self::Env => TextId::CfgLayerEnv,
+        };
+        tr(lang, id)
     }
 }
 

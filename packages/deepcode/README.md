@@ -4,8 +4,10 @@ AI coding assistant in your terminal — powered by DeepSeek.
 
 ## Install
 
+Use Node.js 24 or newer with npm 11.16.0 or newer. Approve the DeepCode package's installation script when installing it globally.
+
 ```sh
-npm install -g @liwenkai/deepcode
+npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode
 ```
 
 (The installed command is `deepcode`.)
@@ -61,7 +63,7 @@ Full contract, flags and approval posture: [README](https://github.com/liwenka1/
 
 ## Notes
 
-- Requires Node.js >= 24 (for the installer only; the CLI itself is a native binary).
+- The CLI itself is a native binary. The npm installer and launcher use Node.js.
 - If your network blocks GitHub, grab a binary from the
   [releases page](https://github.com/liwenka1/deep-code/releases) manually, or
   build from source: clone `liwenka1/deep-code` and run

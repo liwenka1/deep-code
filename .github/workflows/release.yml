@@ -318,7 +318,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
+          node-version: '>=24.18.0 <25'
 
       # Assert this leg IS the platform it claims. See the matrix comment: the
       # asset is chosen from the host, so nothing else in this job ties the leg's
@@ -340,9 +340,9 @@ jobs:
 
       # `shell: bash` is required, not cosmetic: the default shell on a Windows
       # runner is pwsh, where `${GITHUB_REF_NAME#v}` is a parse error.
-      - name: Install from the local tarball and run it
+      - name: Install and run the local tarball with npm 12
         shell: bash
-        run: bash scripts/verify-install.sh "${GITHUB_REF_NAME#v}"
+        run: npm exec --yes --package=npm@12.2.3 -- bash scripts/verify-install.sh "${GITHUB_REF_NAME#v}"
 
   # ═══════════════════════════════════════════════
   # 阶段 4：npm publish

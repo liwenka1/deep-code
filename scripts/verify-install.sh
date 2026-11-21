@@ -49,14 +49,8 @@ fi
 
 cd "$PKG_DIR"
 
-# Deliberately a path inside the tree, handed to npm as a RELATIVE path.
-#
-# Not `mktemp -d`: this script runs on a Windows runner too, where `npm` is a
-# native process and an absolute POSIX `/tmp/...` argument is subject to MSYS
-# path translation that may or may not fire. A path relative to the working
-# directory means the same thing to bash and to npm on every platform, and that
-# is a property worth more here than a tidier temp directory. Removed on exit so
-# it never becomes an untracked file somebody has to notice.
+# Keep the pack directory relative to the package so npm receives a native
+# path even under Git Bash on Windows. Remove the directory on exit.
 PACK_DIR=".verify-install-tmp"
 rm -rf "$PACK_DIR"
 mkdir -p "$PACK_DIR"
@@ -68,12 +62,16 @@ trap 'rm -rf "$PACK_DIR"' EXIT
 export npm_config_cache="$PWD/$PACK_DIR/npm-cache"
 export npm_config_logs_dir="$PWD/$PACK_DIR/npm-logs"
 
-printf '=== packing @liwenkai/deepcode@%s ===\n' "$EXPECTED"
+printf '=== packing @liwenkai/deepcode@%s with npm %s ===\n' "$EXPECTED" "$(npm --version)"
 npm pack --pack-destination "$PACK_DIR"
 
 TARBALL="$(ls -1 "$PACK_DIR"/*.tgz | head -n1)"
-printf '=== installing from %s (postinstall downloads the release asset) ===\n' "$TARBALL"
-npm i -g "$TARBALL"
+# npm resolves relative script approvals against the global install prefix.
+# An absolute npm file spec ties the approval to this tarball. Pass the
+# native path as-is because npm encodes path characters while parsing it.
+TARBALL_SPEC="$(node -p '"file:" + require("node:path").resolve(process.argv[1])' "$TARBALL")"
+printf '=== installing from %s (postinstall downloads the release asset) ===\n' "$TARBALL_SPEC"
+npm install -g --allow-scripts="$TARBALL_SPEC" "$TARBALL_SPEC"
 
 # `npm i -g` just put a new executable in a directory bash has already searched.
 # Without this, bash can hand back its cached (failed) lookup and report the
