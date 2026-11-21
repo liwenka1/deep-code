@@ -105,22 +105,6 @@ impl SubAgentRole {
         // `role: implementer` choice, not the silent default.
         matches!(self, Self::Implementer)
     }
-
-    /// The model a child of this role is pinned to, or `None` to inherit the
-    /// parent's configured model. Reconnaissance roles (explore / review /
-    /// verifier) run the flash tier: their product is a report distilled from
-    /// reads, and fan-out is where per-child token spend multiplies. Roles
-    /// that write or plan (implementer / plan / general) inherit the parent's
-    /// model: their output quality is the point of dispatching them.
-    #[must_use]
-    pub fn model_override(self) -> Option<&'static str> {
-        match self {
-            Self::Explore | Self::Review | Self::Verifier => {
-                Some(crate::model_registry::DEEPSEEK_FLASH)
-            }
-            Self::General | Self::Plan | Self::Implementer => None,
-        }
-    }
 }
 
 impl FromStr for SubAgentRole {

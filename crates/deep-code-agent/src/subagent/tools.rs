@@ -27,21 +27,20 @@ use crate::workspace_policy::invalid;
 
 const AGENT_TOOL: &str = "agent";
 
-/// A child's runtime: the parent's client and mode handle, the role's tools
-/// and prompt, and what the parent read from AGENTS.md — the block in the
-/// prompt, the `Compact Instructions` for the child's own compactions.
+/// Build a child runtime with the parent's client, configuration, and
+/// permission mode. The child receives the role's tools and prompt, plus the
+/// parent's project instructions and `Compact Instructions`.
 pub(super) fn child_runtime(
     services: &SubAgentServices,
     role: SubAgentRole,
     network: bool,
     tools: crate::tool::ToolRegistry,
-    config: crate::config::AgentConfig,
 ) -> AgentRuntime {
     AgentRuntime::with_system_prompt_shared(
         Arc::clone(&services.client),
         tools,
         child_system_prompt(role, network, services.instructions.as_deref()),
-        config,
+        services.agent_config.clone(),
         true,
     )
     // The child shares the parent's mode handle (see
@@ -94,8 +93,7 @@ pub struct AgentParams {
     task: String,
     /// Capability profile: general | explore | plan | review | implementer |
     /// verifier (common aliases like explorer/reviewer/tester are accepted).
-    /// Read-only roles cannot write files and run on the fast model tier.
-    /// Defaults to general.
+    /// Only implementer can write files. Defaults to general.
     role: Option<String>,
     /// Set true when the child task needs network access (fetching docs/URLs,
     /// installing dependencies). Routes the dispatch through user approval; an
@@ -229,13 +227,7 @@ impl Tool for AgentTool {
             // parent: same provider endpoint, same key.
             &crate::web_tools::WebBackend::from_config(&self.services.agent_config),
         );
-        // Reconnaissance roles use Flash; other roles inherit the parent's
-        // configured model. See `SubAgentRole::model_override`.
-        let mut child_config = self.services.agent_config.clone();
-        if let Some(model) = role.model_override() {
-            child_config.model = model.to_string();
-        }
-        let runtime = child_runtime(&self.services, role, network, child_tools, child_config);
+        let runtime = child_runtime(&self.services, role, network, child_tools);
 
         {
             let mut manager = self
@@ -490,7 +482,6 @@ mod tests {
             super::SubAgentRole::Explore,
             false,
             crate::tool::ToolRegistry::new(),
-            crate::config::AgentConfig::builtin(),
         );
         assert_eq!(
             runtime.compact_instructions_for_test().as_deref(),
@@ -548,7 +539,6 @@ mod tests {
                     role,
                     network,
                     crate::tool::ToolRegistry::new(),
-                    crate::config::AgentConfig::builtin(),
                 );
                 let system = runtime.session_messages().await[0].content.text();
                 assert!(

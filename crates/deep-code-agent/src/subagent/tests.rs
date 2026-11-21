@@ -59,24 +59,23 @@ None.
         }
     }
 
-    /// Streams the canonical report while recording each request's model id,
-    /// so tests can assert which tier a child actually ran on.
-    struct ModelRecordingClient {
-        models: StdMutex<Vec<String>>,
+    /// Streams a report and records the requests sent by the child runtime.
+    struct RequestRecordingClient {
+        requests: StdMutex<Vec<ChatRequest>>,
     }
 
     #[async_trait::async_trait]
-    impl LlmClient for ModelRecordingClient {
+    impl LlmClient for RequestRecordingClient {
         fn provider_name(&self) -> &'static str {
-            "model-recording"
+            "request-recording"
         }
 
         fn model(&self) -> &str {
-            "model-recording"
+            "request-recording"
         }
 
         async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
-            self.models.lock().unwrap().push(request.model.clone());
+            self.requests.lock().unwrap().push(request);
             let stream = try_stream! {
                 yield AgentEvent::TextDelta {
                     text: "### SUMMARY\nok\n\n### EVIDENCE\nNone.\n\n### CHANGES\nNone.\n\n### RISKS\nNone.\n\n### BLOCKERS\nNone.\n".to_string(),
@@ -281,52 +280,62 @@ None.
         );
     }
 
-    /// Reconnaissance roles are pinned to the flash tier; writing/planning
-    /// roles inherit the parent's configured model (the point of dispatching
-    /// them is their output quality).
     #[tokio::test]
-    async fn reconnaissance_roles_pin_flash_and_implementer_inherits() {
+    async fn all_child_roles_inherit_the_parent_model_and_reasoning_effort() {
         let dir = tempfile::tempdir().unwrap();
-        let client = Arc::new(ModelRecordingClient {
-            models: StdMutex::new(Vec::new()),
+        let client = Arc::new(RequestRecordingClient {
+            requests: StdMutex::new(Vec::new()),
         });
         let cancel = CancellationToken::new();
         let mut registry = ToolRegistry::new();
-        let services = attach_subagent_tools(
+        let _services = attach_subagent_tools(
             &mut registry,
             client.clone(),
             AgentConfig {
                 model: crate::model_registry::DEEPSEEK_V4_PRO.into(),
+                reasoning_effort: crate::reasoning::ReasoningEffortSetting::Max,
                 ..AgentConfig::builtin()
             },
             dir.path().to_path_buf(),
             cancel,
         );
 
-        registry
-            .run_tool_call(agent_call("call_1", "map the crate", "explore"), None)
-            .await
-            .unwrap();
-        // A writing role's spawn is the write authorization, so it prompts
-        // (asserted in the policy tests); approve it here to reach the child.
-        let implementer = agent_call("call_2", "land the fix", "implementer");
-        assert!(registry.evaluate_tool(&implementer).requires_approval());
-        registry
-            .run_tool_call(implementer, Some(ApprovalDecision::Approved))
-            .await
-            .unwrap();
+        for role in [
+            "general",
+            "explore",
+            "plan",
+            "review",
+            "implementer",
+            "verifier",
+        ] {
+            let call = agent_call(role, "inspect the crate", role);
+            let approval = registry
+                .evaluate_tool(&call)
+                .requires_approval()
+                .then_some(ApprovalDecision::Approved);
+            let result = registry
+                .run_tool_call(call, approval)
+                .await
+                .unwrap()
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                result.status,
+                crate::tool::ToolResultStatus::Success,
+                "{role}"
+            );
 
-        let models = client.models.lock().unwrap().clone();
-        assert_eq!(models.len(), 2, "one child request per call: {models:?}");
-        assert_eq!(
-            models[0],
-            crate::model_registry::DEEPSEEK_FLASH,
-            "explore child must run on the flash tier"
-        );
-        assert_eq!(
-            models[1], services.agent_config.model,
-            "implementer child must inherit the parent's configured model"
-        );
+            let requests = std::mem::take(&mut *client.requests.lock().unwrap());
+            let [request] = requests.as_slice() else {
+                panic!("expected one request for {role}, got {}", requests.len());
+            };
+            assert_eq!(
+                request.model,
+                crate::model_registry::DEEPSEEK_V4_PRO,
+                "{role}"
+            );
+            assert_eq!(request.reasoning_effort.as_deref(), Some("max"), "{role}");
+        }
     }
 
     /// A child's tool calls stream one progress line each into the parent's
