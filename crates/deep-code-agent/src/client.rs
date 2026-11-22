@@ -48,6 +48,23 @@ impl DeepSeekClient {
             config,
         })
     }
+
+    async fn read_api_error(&self, response: reqwest::Response) -> AgentError {
+        let status = response.status();
+        // Bound the diagnostic read independently after headers arrive.
+        // Preserve the status so 429/5xx still reach the retry/fallback policy.
+        let timeout = self
+            .config
+            .timeout
+            .unwrap_or(ERROR_BODY_TIMEOUT)
+            .min(ERROR_BODY_TIMEOUT);
+        let message = match tokio::time::timeout(timeout, read_error_body(response)).await {
+            Ok(Ok(message)) => message,
+            Ok(Err(error)) => format!("{status} (error body could not be read: {error})"),
+            Err(_) => format!("{status} (error body timed out)"),
+        };
+        AgentError::Api { status, message }
+    }
 }
 
 #[async_trait]
@@ -99,21 +116,7 @@ impl LlmClient for DeepSeekClient {
         };
 
         if !response.status().is_success() {
-            let status = response.status();
-            // The header timeout has ended and the stream guards do not exist
-            // yet. Bound this diagnostic read independently, keeping the HTTP
-            // status so 429/5xx still reach the retry/fallback policy.
-            let timeout = self
-                .config
-                .timeout
-                .unwrap_or(ERROR_BODY_TIMEOUT)
-                .min(ERROR_BODY_TIMEOUT);
-            let message = match tokio::time::timeout(timeout, read_error_body(response)).await {
-                Ok(Ok(message)) => message,
-                Ok(Err(error)) => format!("{status} (error body could not be read: {error})"),
-                Err(_) => format!("{status} (error body timed out)"),
-            };
-            return Err(AgentError::Api { status, message });
+            return Err(self.read_api_error(response).await);
         }
 
         let byte_stream = response.bytes_stream();
