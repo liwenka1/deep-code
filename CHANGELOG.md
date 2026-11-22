@@ -6,7 +6,13 @@ Entries marked **Security:** change security-relevant behavior.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-22
+
+<!-- reviewed-notes:start -->
 - Restored global installation compatibility with older npm versions.
+<!-- reviewed-notes:end -->
+
+- Clarified the Node.js version requirement for installation.
 
 ## [0.5.2] - 2026-11-21
 
@@ -453,3 +459,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.5.0]: https://github.com/liwenka1/deep-code/compare/v0.4.20...v0.5.0
 [0.5.1]: https://github.com/liwenka1/deep-code/compare/v0.5.0...v0.5.1
 [0.5.2]: https://github.com/liwenka1/deep-code/compare/v0.5.1...v0.5.2
+[0.5.3]: https://github.com/liwenka1/deep-code/compare/v0.5.2...v0.5.3
