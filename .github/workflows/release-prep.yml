@@ -1,16 +1,17 @@
 # Release Prep —— 一键发版入口
 #
 # 触发：Actions 页面 workflow_dispatch，输入要发布的新版本号（不带 v）。
-# 执行：归档 Unreleased 并补充起草条目 → bump 三个版本文件 → chore(release)
+# 执行：归档发版说明 → bump 三个版本文件 → chore(release)
 #       commit → 打 v 标签 → 推送。推送用 GitHub App 身份 —— 这是硬要求，
 #       不是装饰：GITHUB_TOKEN 推的 tag 不会触发其他 workflow，release.yml
 #       会静默不跑，发版等于没发生。缺 App secrets 时这里直接失败。
 #
-# 全链路 fail-closed：起草失败/输出不成 bullets/版本不一致/标签已存在/
+# 全链路 fail-closed：起草失败/草稿格式错误/缺少说明/版本不一致/标签已存在/
 # main 在运行期间被推进（push 非快进被拒，tag 一并不推），任何一处失败都
 # 停在 tag 之前，不存在"版本推了、changelog 是坏的"的中间态。
 #
-# 已审阅的 Unreleased 条目原样进入版本节，模型负责补充其他条目。
+# 已审阅的 Unreleased 条目原样进入版本节，默认由模型补充其他条目。
+# reviewed_only 跳过补充起草，直接归档已审阅的说明。
 # GitHub Release 的正文取自 tag 中同一个版本节。
 #
 # CHANGELOG 从 main 历史上版本号最高、已发布到 npm 的正式 tag 起草。
@@ -24,6 +25,10 @@ on:
       version:
         description: 'Version to release (MAJOR.MINOR.PATCH, no leading v)'
         required: true
+      reviewed_only:
+        description: 'Use only reviewed changelog entries'
+        type: boolean
+        default: false
 
 # 同一时刻只允许一次发版准备在跑，杜绝并发双开互相踩 tag。
 concurrency:
@@ -43,6 +48,7 @@ jobs:
     timeout-minutes: 20
     env:
       VERSION: ${{ inputs.version }}
+      REVIEWED_ONLY: ${{ inputs.reviewed_only }}
       HAS_APP: ${{ secrets.DEEPCODE_APP_ID != '' && secrets.DEEPCODE_APP_PRIVATE_KEY != '' }}
       HAS_KEY: ${{ secrets.DEEPSEEK_API_KEY != '' }}
     steps:
@@ -56,7 +62,7 @@ jobs:
             echo "::error::DEEPCODE_APP_ID / DEEPCODE_APP_PRIVATE_KEY secrets are required: a GITHUB_TOKEN-pushed tag does not trigger release.yml, so the release would silently not happen."
             exit 1
           fi
-          if [ "$HAS_KEY" != "true" ]; then
+          if [ "$REVIEWED_ONLY" != "true" ] && [ "$HAS_KEY" != "true" ]; then
             echo "::error::DEEPSEEK_API_KEY secret is required to draft the changelog."
             exit 1
           fi
@@ -131,11 +137,13 @@ jobs:
           toolchain: 1.96.0
 
       - name: Install deepcode
+        if: ${{ !inputs.reviewed_only }}
         # Change this pin after verifying the new drafter is published on npm.
         run: npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode@0.5.1
 
       # Keep supplemental notes in bullet form so the merge can validate them.
       - name: Draft additional changelog entries
+        if: ${{ !inputs.reviewed_only }}
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEP_CODE_DISABLE_WEB: '1'
@@ -152,7 +160,11 @@ jobs:
         env:
           PREV_TAG: ${{ steps.range.outputs.prev_tag }}
         run: |
-          node scripts/release-notes.mjs prepare "$VERSION" "$PREV_TAG" "$RUNNER_TEMP/changelog-draft.md" \
+          draft_path="$RUNNER_TEMP/changelog-draft.md"
+          if [ "$REVIEWED_ONLY" = "true" ]; then
+            draft_path=/dev/null
+          fi
+          node scripts/release-notes.mjs prepare "$VERSION" "$PREV_TAG" "$draft_path" \
             > "$RUNNER_TEMP/release-notes.md"
 
       - name: Bump versions

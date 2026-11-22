@@ -6,8 +6,9 @@
 Actions → Release Prep → 输入新版本号（不带 v）→ Run
 ```
 
-启动前在 CHANGELOG 的 `Unreleased` 节确认需要原样发布的说明。之后自动归档
-`Unreleased` 并补充起草条目 → bump 版本 → commit → 打 tag → 5 平台构建与自检 →
+启动前在 CHANGELOG 的 `Unreleased` 节确认需要原样发布的说明。如果已审阅的条目覆盖了
+本次改动，勾选 `reviewed_only` 直接使用这些说明。Release Prep 归档发布说明 →
+bump 版本 → commit → 打 tag → 5 平台构建与自检 →
 建 GitHub Release → 5 平台安装验证 → `npm publish`。
 
 Release Prep 以 `main` 历史上版本号最高且已发布到 npm 的正式 tag 为基线起草
@@ -145,8 +146,9 @@ npm exec --yes --package=npm@12.2.3 -- bash scripts/verify-install.sh \
 - 打包契约（`check-packaging.sh`）—— 资产映射与验证矩阵比对 + tarball 内容比对
 - 安装验证 —— 宿主平台断言 + 退出码 + `deepcode <版本>` 精确匹配
 
-`release-prep.yml` 用模型补充 CHANGELOG 条目，已审阅的说明原样保留。API 调用失败
-或草稿格式错误时，流程停在打 tag 之前。草稿可以为空，只要该版本已有审阅过的条目。
+`release-prep.yml` 默认用模型补充 CHANGELOG 条目。API 调用失败、草稿格式错误或缺少
+发版说明时，流程会在打 tag 前停止。勾选 `reviewed_only` 会跳过起草，直接归档本次的
+已审阅条目，包括仍应带入的未发布版本说明。
 
 `release.yml` 从 tag 的 CHANGELOG 中读取对应版本节作为 GitHub Release 正文。
 需要更正已发布正文时，更新 GitHub Release，并在 main 上提交文档修订。tag 保留

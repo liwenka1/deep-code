@@ -54,6 +54,24 @@ test("reviewed notes survive an incomplete draft and supply the release body", (
   assert.equal(rendered.stdout, prepared.stdout);
 });
 
+test("reviewed notes can publish with an empty draft, while a malformed draft is rejected", (t) => {
+  const directory = workspace(t, reviewed);
+  const path = join(directory, "CHANGELOG.md");
+  const original = readFileSync(path, "utf8");
+
+  const malformed = prepare(directory, "0.5.2", "v0.5.1", "No additional changelog entries.");
+  assert.equal(malformed.status, 1, malformed.stderr);
+  assert.match(malformed.stderr, /changelog draft must contain bullets/);
+  assert.equal(readFileSync(path, "utf8"), original);
+
+  const prepared = prepare(directory, "0.5.2", "v0.5.1", "");
+  assert.equal(prepared.status, 0, prepared.stderr);
+  assert.ok(prepared.stdout.includes(reviewed));
+  const rendered = run(directory, "render", "0.5.2");
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.equal(rendered.stdout, prepared.stdout);
+});
+
 test("reviewed notes survive failed tags and stop carrying forward once published", (t) => {
   const directory = workspace(t, reviewed);
   const firstAttempt = prepare(directory, "0.5.2", "v0.5.1", draft);

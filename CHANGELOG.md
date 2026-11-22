@@ -8,7 +8,9 @@ Entries marked **Security:** change security-relevant behavior.
 
 ## [0.5.4] - 2026-11-22
 
+<!-- reviewed-notes:start -->
 - **Security:** The `url` dependency is upgraded, clearing RUSTSEC-2026-0592.
+<!-- reviewed-notes:end -->
 
 ## [0.5.3] - 2026-11-22
 
