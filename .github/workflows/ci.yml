@@ -259,6 +259,9 @@ jobs:
       - name: Check the asset map and the npm tarball
         run: bash scripts/check-packaging.sh
 
+      - name: Check registry installs with npm 11.6.1
+        run: npm exec --yes --package=npm@11.6.1 -- node --test packages/deepcode/check-registry-install.mjs
+
       - name: Check release notes preparation and rendering
         run: node --test scripts/release-notes.test.mjs
 

@@ -121,6 +121,9 @@ Actions → Verify Install (canary) → 输入要验证的发布版本 → Run
 # 打包契约检查（PR 级，无网络、秒级）——CI 的 packaging job 跑的就是这个
 bash scripts/check-packaging.sh
 
+# 用 npm 11.6.1 验证从本地 registry 按包名安装并选中最新版本（仅 macOS 和 Linux）
+npm exec --yes --package=npm@11.6.1 -- node --test packages/deepcode/check-registry-install.mjs
+
 # 用 npm 12 验证安装（会下载 GitHub Release 资产，需要网络）
 npm exec --yes --package=npm@12.2.3 -- bash scripts/verify-install.sh \
   "$(node -p 'require("./packages/deepcode/package.json").version')"

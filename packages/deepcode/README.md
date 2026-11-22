@@ -4,13 +4,19 @@ AI coding assistant in your terminal — powered by DeepSeek.
 
 ## Install
 
-Use Node.js 24 or newer with npm 11.16.0 or newer. Approve the DeepCode package's installation script when installing it globally.
+Use Node.js 24 or newer. With npm 12 or newer, explicitly approve DeepCode's installation script. Use the same command with npm 11.16.0 or newer if `strict-allow-scripts=true` is enabled.
 
 ```sh
-npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode
+npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode@latest
 ```
 
-(The installed command is `deepcode`.)
+With npm 11 or earlier, the default script policy lets you use the standard global install command.
+
+```sh
+npm install -g @liwenkai/deepcode@latest
+```
+
+Use the same command to update.
 
 The `postinstall` step downloads the prebuilt binary for your platform from
 [GitHub Releases](https://github.com/liwenka1/deep-code/releases) and verifies

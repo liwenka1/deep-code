@@ -30,8 +30,11 @@ const invokedAs = basename(process.argv[1] || 'deepcode');
 
 if (!existsSync(binary)) {
   console.error('deepcode: native binary not found.');
-  console.error('Reinstall with npm 11.16.0 or newer and approve the DeepCode installation script.');
-  console.error('  npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode');
+  console.error('Reinstall with install scripts enabled.');
+  console.error('  With npm 12 or newer, or with strict-allow-scripts enabled on npm 11.16.0 or newer');
+  console.error('    npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode@latest');
+  console.error('  With npm 11 or earlier and the default script policy');
+  console.error('    npm install -g @liwenkai/deepcode@latest');
   console.error('Prebuilt binaries are available at https://github.com/liwenka1/deep-code/releases');
   process.exit(1);
 }

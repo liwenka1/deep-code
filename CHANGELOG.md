@@ -6,6 +6,8 @@ Entries marked **Security:** change security-relevant behavior.
 
 ## [Unreleased]
 
+- Restored global installation compatibility with older npm versions.
+
 ## [0.5.2] - 2026-11-21
 
 <!-- reviewed-notes:start -->
