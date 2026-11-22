@@ -6,6 +6,12 @@ Entries marked **Security:** change security-relevant behavior.
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-11-22
+
+<!-- reviewed-notes:start -->
+- **Security:** The `url` dependency is upgraded, clearing RUSTSEC-2026-0592.
+<!-- reviewed-notes:end -->
+
 ## [0.5.4] - 2026-11-22
 
 <!-- reviewed-notes:start -->
@@ -467,3 +473,4 @@ Entries marked **Security:** change security-relevant behavior.
 [0.5.2]: https://github.com/liwenka1/deep-code/compare/v0.5.1...v0.5.2
 [0.5.3]: https://github.com/liwenka1/deep-code/compare/v0.5.2...v0.5.3
 [0.5.4]: https://github.com/liwenka1/deep-code/compare/v0.5.3...v0.5.4
+[0.5.5]: https://github.com/liwenka1/deep-code/compare/v0.5.3...v0.5.5
