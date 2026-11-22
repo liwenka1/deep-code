@@ -58,7 +58,9 @@
 
 ## 安装
 
-使用 Node.js 24 或更新版本。npm 12 起，默认需要显式授权 DeepCode 的安装脚本。npm 11.16.0 及更新版本开启 `strict-allow-scripts=true` 时，也使用此命令。
+npm 安装器和启动器支持 Node.js 18 及以上版本。请使用与 Node.js 版本兼容的 npm。新环境推荐使用仍受维护的 LTS 版本，例如 Node.js 22 或 24。
+
+npm 12 起，默认需要显式授权 DeepCode 的安装脚本。npm 11.16.0 及更新版本开启 `strict-allow-scripts=true` 时，也使用此命令。
 
 ```sh
 npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode@latest
@@ -71,6 +73,8 @@ npm install -g @liwenkai/deepcode@latest
 ```
 
 更新时使用同一条命令。安装后运行 `deepcode`。安装脚本会从 GitHub Releases 下载对应平台的二进制并校验 SHA-256。
+
+预编译二进制可以直接运行，无需 Node.js。 [GitHub Releases](https://github.com/liwenka1/deep-code/releases)
 
 ## 快速开始
 

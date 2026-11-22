@@ -58,7 +58,9 @@ A DeepSeek-powered terminal coding agent, written in Rust. One small binary: str
 
 ## Install
 
-Use Node.js 24 or newer. With npm 12 or newer, explicitly approve DeepCode's installation script. Use the same command with npm 11.16.0 or newer if `strict-allow-scripts=true` is enabled.
+The npm installer and launcher support Node.js 18 or newer. Use an npm version compatible with your Node.js version. For new setups, choose a maintained Node.js LTS release such as 22 or 24.
+
+With npm 12 or newer, explicitly approve DeepCode's installation script. Use the same command with npm 11.16.0 or newer if `strict-allow-scripts=true` is enabled.
 
 ```sh
 npm install -g --allow-scripts=@liwenkai/deepcode @liwenkai/deepcode@latest
@@ -71,6 +73,8 @@ npm install -g @liwenkai/deepcode@latest
 ```
 
 Use the same command to update. The installed command is `deepcode`. The installation script downloads the platform binary from GitHub Releases and verifies its SHA-256 checksum.
+
+The prebuilt binaries run directly without Node.js. [GitHub Releases](https://github.com/liwenka1/deep-code/releases)
 
 ## Quick start
 
