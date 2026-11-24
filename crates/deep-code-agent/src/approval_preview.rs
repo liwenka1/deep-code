@@ -1,4 +1,4 @@
-//! Bounded change and process-input previews for gated tool calls.
+//! Action summaries and bounded previews for gated tool calls.
 //!
 //! An approval prompt that only shows raw JSON arguments asks the user to
 //! sign off blind on large rewrites or interpreter input. Mutation previews
@@ -11,7 +11,10 @@ use std::path::Path;
 use serde_json::Value;
 use similar::TextDiff;
 
+use crate::execution_policy::{ExecPolicy, ToolKind, shell_command_of};
 use crate::i18n::{Lang, TextId, tr, tr_with};
+use crate::root_grant::REQUEST_WRITE_ROOT_TOOL;
+use crate::text_sanitize::collapse_whitespace;
 use crate::tool::ToolCall;
 use crate::workspace_policy::WorkspacePolicy;
 
@@ -23,6 +26,34 @@ const MAX_SOURCE_BYTES: u64 = crate::workspace_tools::MAX_FILE_BYTES;
 const NEW_FILE_HEAD_LINES: usize = 20;
 const STDIN_FRAGMENT_BYTES: usize = 1536;
 const STDIN_FRAGMENT_LINES: usize = 16;
+
+/// Summarize the action shown on an approval prompt in one line.
+///
+/// Write-root requests show the requested path. Job control actions show the
+/// action and job ID. These tool-specific fields keep an unrelated argument
+/// from obscuring what the user is asked to approve.
+#[must_use]
+pub fn action_summary(tool_name: &str, arguments: &Value) -> String {
+    if ExecPolicy::classify_tool(tool_name) == ToolKind::Job
+        && shell_command_of(tool_name, arguments).is_none()
+        && let Some(action) = string_arg(arguments, "action")
+    {
+        return collapse_whitespace(&match string_arg(arguments, "job_id") {
+            Some(job_id) => format!("{action} {job_id}"),
+            None => action.to_string(),
+        });
+    }
+
+    let keys: &[&str] = if tool_name == REQUEST_WRITE_ROOT_TOOL {
+        &["path"]
+    } else {
+        &["command", "path", "url", "pattern", "query", "task"]
+    };
+    if let Some(text) = keys.iter().find_map(|key| string_arg(arguments, key)) {
+        return collapse_whitespace(text);
+    }
+    collapse_whitespace(&arguments.to_string())
+}
 
 /// Build a preview against the live policy already used by the runtime. A
 /// runtime must not reconstruct a policy after a root path has been swapped:
@@ -254,6 +285,82 @@ mod tests {
     use crate::workspace_policy::WorkspaceRoots;
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn action_summary_prefers_meaningful_fields() {
+        assert_eq!(
+            action_summary("shell", &json!({"command": "cargo  test"})),
+            "cargo test"
+        );
+        assert_eq!(
+            action_summary("write_file", &json!({"path": "src/x.rs", "content": "…"})),
+            "src/x.rs"
+        );
+    }
+
+    /// A write-root request's action is its `path` and nothing else. The
+    /// generic key scan ranks `command` first, so without the tool-specific
+    /// list a decoy key would put text of the model's choosing on the action
+    /// line of a boundary prompt while the grant landed on `path`.
+    #[test]
+    fn action_summary_for_a_root_grant_ignores_a_decoy_command_key() {
+        let decoy = json!({
+            "path": "/home/u/.deep-code",
+            "command": "cat CHANGELOG.md"
+        });
+        assert_eq!(
+            action_summary(crate::root_grant::REQUEST_WRITE_ROOT_TOOL, &decoy),
+            "/home/u/.deep-code"
+        );
+        // Same payload under any other tool keeps the generic precedence.
+        assert_eq!(action_summary("shell", &decoy), "cat CHANGELOG.md");
+    }
+
+    /// A job control action shows the action and its target, never a decoy
+    /// `command` the tool would ignore; `start` is command-bearing and keeps
+    /// showing its command like `shell` does.
+    #[test]
+    fn action_summary_for_job_control_shows_the_action_not_a_decoy_command() {
+        assert_eq!(
+            action_summary(
+                "job",
+                &json!({
+                    "action": "cancel",
+                    "job_id": "job_1",
+                    "command": "cat ~/.ssh/id_rsa"
+                })
+            ),
+            "cancel job_1"
+        );
+        assert_eq!(
+            action_summary("job", &json!({ "action": "status" })),
+            "status"
+        );
+        assert_eq!(
+            action_summary(
+                "job",
+                &json!({ "action": "start", "command": "cargo  test" })
+            ),
+            "cargo test"
+        );
+    }
+
+    /// A sub-agent dispatch is described by its task, and a call matching no
+    /// key still comes out on one line.
+    #[test]
+    fn action_summary_shows_a_dispatch_by_its_task_and_collapses_the_fallback() {
+        assert_eq!(
+            action_summary(
+                "agent",
+                &json!({ "role": "implementer", "task": "land\n  it" })
+            ),
+            "land it"
+        );
+        assert_eq!(
+            action_summary("mystery", &json!({ "x": "a  b" })),
+            r#"{"x":"a b"}"#
+        );
+    }
 
     fn call(name: &str, arguments: Value) -> ToolCall {
         ToolCall::new("call_1", name, arguments)

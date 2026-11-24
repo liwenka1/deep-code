@@ -20,7 +20,7 @@ use deep_code_agent::{
 };
 use tokio::sync::mpsc;
 
-use ratatui::text::Line;
+use ratatui::{layout::Size, text::Line};
 
 use crate::active_turn::ActiveTurn;
 use crate::cli::workspace_root;
@@ -298,9 +298,8 @@ pub struct App {
     /// screen means — a user who forgot they set it must not be able to read the
     /// status line as an ordinary session.
     pub(crate) sandbox_off: bool,
-    /// One-shot latch: a first Shift+Tab that would enter Yolo arms this and
-    /// shows a confirm; the next Shift+Tab confirms. Any other key disarms.
-    pub(crate) yolo_armed: bool,
+    /// Entering Yolo requires a visible warning and two distinct keys.
+    pub(crate) yolo_confirmation: YoloConfirmation,
 }
 
 /// In-session `/resume` modal state: the resumable sessions (newest-first) and
@@ -506,6 +505,93 @@ impl RunningCompaction {
 pub(crate) enum QuitKey {
     Esc,
     CtrlC,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum YoloKey {
+    F2,
+    F7,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum YoloStep {
+    Start,
+    Retry,
+    Finish,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum YoloConfirmation {
+    Inactive,
+    AwaitingDraw,
+    AwaitingInputIdle(Size),
+    AwaitingHint(Size),
+    AwaitingHintInput { size: Size, retry: bool },
+    Ready { size: Size, step: YoloStep },
+}
+
+impl YoloConfirmation {
+    pub(crate) fn set_visible(&mut self, size: Option<Size>) {
+        *self = match (*self, size) {
+            (Self::Inactive, _) => Self::Inactive,
+            (_, None) => Self::AwaitingDraw,
+            (Self::AwaitingHint(previous), Some(size)) if previous == size => {
+                Self::AwaitingHintInput { size, retry: false }
+            }
+            (
+                state @ (Self::AwaitingInputIdle(previous)
+                | Self::AwaitingHintInput { size: previous, .. }
+                | Self::Ready { size: previous, .. }),
+                Some(size),
+            ) if previous == size => state,
+            (_, Some(size)) => Self::AwaitingInputIdle(size),
+        };
+    }
+
+    /// Return whether the key hint needs to be redrawn.
+    pub(crate) fn on_input_idle(&mut self) -> bool {
+        match *self {
+            Self::AwaitingInputIdle(size) => {
+                *self = Self::AwaitingHint(size);
+                true
+            }
+            Self::AwaitingHintInput { size, retry } => {
+                *self = Self::Ready {
+                    size,
+                    step: if retry {
+                        YoloStep::Retry
+                    } else {
+                        YoloStep::Start
+                    },
+                };
+                retry
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn hint(self, size: Size) -> Option<TextId> {
+        match self {
+            Self::AwaitingHint(previous)
+            | Self::AwaitingHintInput {
+                size: previous,
+                retry: false,
+            }
+            | Self::Ready {
+                size: previous,
+                step: YoloStep::Start,
+            } if previous == size => Some(TextId::PermModeYoloConfirm),
+            Self::Ready {
+                size: previous,
+                step: YoloStep::Retry,
+            } if previous == size => Some(TextId::PermModeYoloRetry),
+            Self::Ready {
+                size: previous,
+                step: YoloStep::Finish,
+            } if previous == size => Some(TextId::PermModeYoloFinish),
+            _ => None,
+        }
+    }
 }
 
 /// A turn shorter than this ends silently: the user is still looking.
@@ -874,7 +960,7 @@ impl App {
             lang,
             permission_mode,
             sandbox_off,
-            yolo_armed: false,
+            yolo_confirmation: YoloConfirmation::Inactive,
         })
     }
 
@@ -883,39 +969,70 @@ impl App {
         self.permission_mode.get()
     }
 
-    /// Shift+Tab: advance the permission mode. Entering Yolo requires a second
-    /// press (armed here) so the most permissive mode is never one keystroke
-    /// away by accident.
+    /// Advance the mode, request confirmation for Yolo, or skip it to Default.
     pub(crate) fn cycle_permission_mode(&mut self) {
         use deep_code_agent::PermissionMode;
-        if self.yolo_armed {
-            // Second consecutive Shift+Tab: confirm Yolo.
-            self.yolo_armed = false;
-            self.permission_mode.set(PermissionMode::Yolo);
-            self.status = self.mode_switched_status(PermissionMode::Yolo);
-            return;
+        let next = self.permission_mode().cycle();
+        if next != PermissionMode::Yolo {
+            self.set_permission_mode(next);
+        } else if self.yolo_confirmation == YoloConfirmation::Inactive {
+            self.yolo_confirmation = YoloConfirmation::AwaitingDraw;
+        } else {
+            self.set_permission_mode(PermissionMode::Default);
         }
-        let next = self.permission_mode.get().cycle();
-        if next == PermissionMode::Yolo {
-            // Arm instead of entering; the next press confirms.
-            self.yolo_armed = true;
-            self.status = self.tr(TextId::PermModeYoloArm).to_string();
-            return;
-        }
-        self.permission_mode.set(next);
-        self.status = self.mode_switched_status(next);
     }
 
-    /// Disarm the pending-Yolo confirm (any key other than Shift+Tab).
-    pub(crate) fn clear_yolo_arm(&mut self) {
-        self.yolo_armed = false;
+    pub(crate) fn yolo_confirmation_active(&self) -> bool {
+        self.yolo_confirmation != YoloConfirmation::Inactive
+            && self.permission_mode() == deep_code_agent::PermissionMode::AcceptEdits
+            && self.pending_approval.is_none()
+            && !self.resume_picker_open()
+            && !self.model_picker_open()
+            && !self.history_search_open()
     }
 
-    fn mode_switched_status(&self, mode: deep_code_agent::PermissionMode) -> String {
-        self.tr_with(
+    pub(crate) fn handle_yolo_key(&mut self, key: YoloKey) {
+        use deep_code_agent::PermissionMode;
+        if !self.yolo_confirmation_active() {
+            self.cancel_yolo_confirmation();
+            return;
+        }
+        match (self.yolo_confirmation, key) {
+            (YoloConfirmation::AwaitingHintInput { size, .. }, _) => {
+                // Discard keys queued during the hint draw, then ask for a new F2.
+                self.yolo_confirmation = YoloConfirmation::AwaitingHintInput { size, retry: true };
+            }
+            (YoloConfirmation::Ready { size, .. }, YoloKey::F2) => {
+                self.yolo_confirmation = YoloConfirmation::Ready {
+                    size,
+                    step: YoloStep::Finish,
+                };
+            }
+            (
+                YoloConfirmation::Ready {
+                    step: YoloStep::Finish,
+                    ..
+                },
+                YoloKey::F7,
+            ) => {
+                self.set_permission_mode(PermissionMode::Yolo);
+            }
+            // A key before the hint or an out-of-order key cancels the attempt.
+            _ => self.cancel_yolo_confirmation(),
+        }
+    }
+
+    pub(crate) fn cancel_yolo_confirmation(&mut self) {
+        self.yolo_confirmation = YoloConfirmation::Inactive;
+    }
+
+    fn set_permission_mode(&mut self, mode: deep_code_agent::PermissionMode) {
+        self.cancel_yolo_confirmation();
+        self.permission_mode.set(mode);
+        self.status = self.tr_with(
             TextId::PermModeSwitched,
             &[("mode", perm_mode_label(self.lang, mode))],
-        )
+        );
     }
 
     /// 当前语言下的文案(无参数)。

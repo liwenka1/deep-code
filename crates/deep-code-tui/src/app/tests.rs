@@ -1295,21 +1295,20 @@ fn shift_tab_cycles_permission_mode_with_yolo_confirm() {
 
     app.cycle_permission_mode();
     assert_eq!(app.permission_mode(), PermissionMode::AcceptEdits);
+    // Entering Yolo first requests a confirmation frame.
     app.cycle_permission_mode();
-    assert_eq!(app.permission_mode(), PermissionMode::Auto);
-
-    // Cycling from Auto arms Yolo but does NOT enter it yet.
-    app.cycle_permission_mode();
-    assert_eq!(
-        app.permission_mode(),
-        PermissionMode::Auto,
-        "armed, not entered"
-    );
-    assert!(app.yolo_armed);
-    // A second consecutive Shift+Tab confirms Yolo.
-    app.cycle_permission_mode();
+    assert_eq!(app.permission_mode(), PermissionMode::AcceptEdits);
+    assert_eq!(app.yolo_confirmation, YoloConfirmation::AwaitingDraw);
+    let size = Size::new(80, 24);
+    app.yolo_confirmation.set_visible(Some(size));
+    app.yolo_confirmation.on_input_idle();
+    app.yolo_confirmation.set_visible(Some(size));
+    app.yolo_confirmation.on_input_idle();
+    app.handle_yolo_key(YoloKey::F2);
+    assert_eq!(app.permission_mode(), PermissionMode::AcceptEdits);
+    app.handle_yolo_key(YoloKey::F7);
     assert_eq!(app.permission_mode(), PermissionMode::Yolo);
-    assert!(!app.yolo_armed);
+    assert_eq!(app.yolo_confirmation, YoloConfirmation::Inactive);
 
     // From Yolo it wraps back to Default (no confirm to leave).
     app.cycle_permission_mode();
@@ -1317,18 +1316,25 @@ fn shift_tab_cycles_permission_mode_with_yolo_confirm() {
 }
 
 #[test]
-fn any_other_key_disarms_pending_yolo() {
+fn cancelling_yolo_confirmation_requires_a_new_draw() {
     use deep_code_agent::PermissionMode;
     let mut app = App::new();
-    app.permission_mode.set(PermissionMode::Auto);
-    app.cycle_permission_mode(); // arms yolo
-    assert!(app.yolo_armed);
-    app.clear_yolo_arm();
-    assert!(!app.yolo_armed);
-    // Next cycle from Auto arms again rather than entering yolo directly.
+    app.permission_mode.set(PermissionMode::AcceptEdits);
     app.cycle_permission_mode();
-    assert!(app.yolo_armed);
-    assert_eq!(app.permission_mode(), PermissionMode::Auto);
+    let size = Size::new(80, 24);
+    app.yolo_confirmation.set_visible(Some(size));
+    app.yolo_confirmation.on_input_idle();
+    app.yolo_confirmation.set_visible(Some(size));
+    app.yolo_confirmation.on_input_idle();
+    app.cancel_yolo_confirmation();
+    assert_eq!(app.yolo_confirmation, YoloConfirmation::Inactive);
+
+    app.cycle_permission_mode();
+    app.yolo_confirmation.on_input_idle();
+    assert_eq!(app.yolo_confirmation, YoloConfirmation::AwaitingDraw);
+    app.handle_yolo_key(YoloKey::F2);
+    assert_eq!(app.yolo_confirmation, YoloConfirmation::Inactive);
+    assert_eq!(app.permission_mode(), PermissionMode::AcceptEdits);
 }
 
 #[test]

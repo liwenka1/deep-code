@@ -193,28 +193,6 @@ async fn superseded_partial_reply_stays_with_its_request_and_is_saved() {
 }
 
 #[tokio::test]
-async fn unfinished_judge_reply_cannot_approve_a_call() {
-    let input = crate::approval_classifier::ClassifierInput {
-        tool_name: "shell",
-        action: "echo hello",
-        risk_level: crate::execution_policy::RiskLevel::Low,
-        safety_notes: &[],
-        user_task: "say hello",
-    };
-    for finished in [false, true] {
-        let mut events = vec![AgentEvent::TextDelta {
-            text: r#"{"approve":true}"#.into(),
-        }];
-        if finished {
-            events.push(AgentEvent::Done { usage: None });
-        }
-        let client = ScriptedClient::new(vec![events]);
-        let (approved, _) = crate::approval_classifier::approves(&client, "test", &input).await;
-        assert_eq!(approved, finished);
-    }
-}
-
-#[tokio::test]
 async fn superseded_error_or_completed_reply_stays_with_its_request() {
     struct SupersedingClient(Arc<Mutex<Option<AgentRuntime>>>, bool);
     #[async_trait::async_trait]
@@ -771,160 +749,31 @@ async fn default_mode_still_parks_gated_tool() {
 }
 
 #[tokio::test]
-async fn auto_mode_runs_when_classifier_approves() {
+async fn accept_edits_requires_approval_to_cancel_a_background_job() {
     use crate::execution_policy::{PermissionMode, SharedPermissionMode};
-    // Script serves one response per stream_chat call: (1) the turn emits the
-    // gated call, (2) the classifier's judge call approves, (3) the turn
-    // continues to completion.
-    let client = ScriptedClient::new(vec![
-        vec![
-            AgentEvent::ToolCallDelta {
-                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
-            },
-            AgentEvent::Done { usage: None },
-        ],
-        vec![
-            AgentEvent::TextDelta {
-                text: r#"{"approve": true, "reason": "safe mock"}"#.to_string(),
-            },
-            AgentEvent::Done { usage: None },
-        ],
-        vec![
-            AgentEvent::TextDelta {
-                text: "done".to_string(),
-            },
-            AgentEvent::Done { usage: None },
-        ],
-    ]);
-    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools())
-        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
+    let workspace = tempfile::tempdir().unwrap();
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta("call_1", "job", r#"{"action":"cancel","job_id":"job_1"}"#),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
+    let registry = crate::shell_tools::ShellTools::new(workspace.path())
+        .unwrap()
+        .into_registry();
+    let runtime = AgentRuntime::new(client, registry)
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::AcceptEdits));
 
-    let mut rx = runtime.submit_user("please echo").await;
+    let mut rx = runtime.submit_user("stop the background job").await;
     let events = drain(&mut rx).await;
-
-    assert!(
-        events
-            .iter()
-            .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
-        "classifier approved → no parking"
-    );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        RuntimeEvent::ToolCallFinished { result, .. } if result.content.text() == "mock_echo: hi"
-    )));
-}
-
-#[tokio::test]
-async fn auto_mode_asks_when_classifier_denies() {
-    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
-    // (1) gated call, (2) judge denies → the batch parks on approval.
-    let client = ScriptedClient::new(vec![
-        vec![
-            AgentEvent::ToolCallDelta {
-                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
-            },
-            AgentEvent::Done { usage: None },
-        ],
-        vec![
-            AgentEvent::TextDelta {
-                text: r#"{"approve": false, "reason": "unclear"}"#.to_string(),
-            },
-            AgentEvent::Done { usage: None },
-        ],
-    ]);
-    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools())
-        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
-
-    let mut rx = runtime.submit_user("please echo").await;
-    let events = drain(&mut rx).await;
-    assert!(
-        matches!(events.last(), Some(RuntimeEvent::ApprovalRequired { .. })),
-        "classifier denied → ask the human"
-    );
-}
-
-/// A client whose first call issues a gated tool call and whose second — the
-/// Auto judge — hangs until the test cancels the turn.
-struct HangingJudgeClient {
-    first: Mutex<Option<Vec<AgentEvent>>>,
-    judge_started: Arc<tokio::sync::Notify>,
-}
-
-#[async_trait::async_trait]
-impl LlmClient for HangingJudgeClient {
-    fn provider_name(&self) -> &'static str {
-        "hanging-judge"
-    }
-
-    fn model(&self) -> &str {
-        "hanging-judge"
-    }
-
-    async fn stream_chat(&self, _request: ChatRequest) -> AgentResult<AgentEventStream> {
-        if let Some(events) = self.first.lock().unwrap().take() {
-            let stream = try_stream! {
-                for event in events {
-                    yield event;
-                }
-            };
-            return Ok(Box::pin(stream));
-        }
-        self.judge_started.notify_one();
-        let stream = try_stream! {
-            std::future::pending::<()>().await;
-            yield AgentEvent::Done { usage: None };
-        };
-        Ok(Box::pin(stream))
-    }
-}
-
-/// Cancelling while the Auto judge is mid-flight ends the turn instead of
-/// parking it. The batch loop checks the token only at call boundaries and the
-/// judge aborts into "ask" on cancel, so without the re-check right before the
-/// park site the call was parked with an already-cancelled token: nobody got a
-/// `TurnCancelled`, the turn stayed live, and any answer to the prompt could
-/// only finish it as cancelled.
-#[tokio::test]
-async fn cancel_during_the_judge_finishes_the_turn_instead_of_parking() {
-    use crate::execution_policy::{PermissionMode, SharedPermissionMode};
-    let judge_started = Arc::new(tokio::sync::Notify::new());
-    let client = HangingJudgeClient {
-        first: Mutex::new(Some(vec![
-            AgentEvent::ToolCallDelta {
-                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"hi"}"#),
-            },
-            AgentEvent::Done { usage: None },
-        ])),
-        judge_started: Arc::clone(&judge_started),
+    let Some(RuntimeEvent::ApprovalRequired { request, .. }) = events.last() else {
+        panic!("expected a job cancellation approval, got {events:?}");
     };
-    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools())
-        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
-
-    let mut rx = runtime.submit_user("please echo").await;
-    judge_started.notified().await;
-    let _ = runtime.cancel_turn().await;
-    let events = drain(&mut rx).await;
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, RuntimeEvent::TurnCancelled { .. })),
-        "the turn's own channel must carry the cancellation"
-    );
-    assert!(
-        events
-            .iter()
-            .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
-        "a cancelled turn must not park a prompt"
-    );
-    assert!(
-        runtime.live_turn_id().await.is_none(),
-        "the turn must be over, not parked"
-    );
+    assert_eq!(request.tool_name, "job");
+    assert_eq!(request.arguments["action"], "cancel");
 }
 
-/// A mock network tool that borrows the exact name `fetch_url` (the policy
-/// classifies by name). Registered so an Auto-mode call can dispatch; if the
-/// egress floor holds, it parks and this body never runs.
+/// A fake fetch_url keeps network approval tests local.
 #[derive(Debug, Clone, Copy)]
 struct NetworkMockTool;
 
@@ -959,44 +808,29 @@ impl Tool for NetworkMockTool {
     }
 }
 
-/// The auto-mode egress floor covers the network-native tools (`fetch_url`/
-/// `web_search`), not just calls carrying a declared `network: true`. The judge
-/// is scripted to APPROVE, so the only way this parks is the floor firing
-/// *before* the judge — the bug where `fetch_url` was decided by the classifier
-/// in Auto mode and could exfiltrate over a GET query string.
 #[tokio::test]
-async fn auto_mode_floors_network_tools_above_the_judge() {
+async fn accept_edits_requires_approval_for_network_tools() {
     use crate::execution_policy::{PermissionMode, SharedPermissionMode};
-    let client = ScriptedClient::new(vec![
-        vec![
-            AgentEvent::ToolCallDelta {
-                delta: tool_call_delta(
-                    "call_1",
-                    NetworkMockTool::NAME,
-                    r#"{"url":"http://example.com/"}"#,
-                ),
-            },
-            AgentEvent::Done { usage: None },
-        ],
-        // A judge verdict that WOULD approve — it must go unused because the
-        // floor parks the call before any judge request is made.
-        vec![
-            AgentEvent::TextDelta {
-                text: r#"{"approve": true, "reason": "looks fine"}"#.to_string(),
-            },
-            AgentEvent::Done { usage: None },
-        ],
-    ]);
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta(
+                "call_1",
+                NetworkMockTool::NAME,
+                r#"{"url":"https://example.com/"}"#,
+            ),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
     let mut registry = ToolRegistry::with_mock_tools();
     registry.register(NetworkMockTool).unwrap();
     let runtime = AgentRuntime::new(client, registry)
-        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::AcceptEdits));
 
     let mut rx = runtime.submit_user("fetch it").await;
     let events = drain(&mut rx).await;
     assert!(
         matches!(events.last(), Some(RuntimeEvent::ApprovalRequired { .. })),
-        "a network-native tool must be floored to the human in Auto mode, even with an approving judge"
+        "a network tool requires approval in AcceptEdits"
     );
     assert!(
         events.iter().all(|event| !matches!(
@@ -1007,14 +841,8 @@ async fn auto_mode_floors_network_tools_above_the_judge() {
     );
 }
 
-/// Mode monotonicity: Auto sits above AcceptEdits in the cycle, so it must
-/// auto-approve everything AcceptEdits does. A bounded fs-edit (`mkdir sub`)
-/// defaults to the High risk tier, which Auto's judge floor would otherwise
-/// park on — but the AcceptEdits inheritance short-circuits before the judge,
-/// so the call runs without ever emitting an approval prompt. The script has
-/// NO judge response, proving the judge was never consulted.
 #[tokio::test]
-async fn auto_mode_inherits_accept_edits_fs_grant_without_asking() {
+async fn accept_edits_runs_a_bounded_fs_edit_without_asking() {
     use crate::execution_policy::{PermissionMode, SharedPermissionMode};
     let workspace = tempfile::tempdir().unwrap();
     let client = ScriptedClient::new(vec![
@@ -1043,7 +871,7 @@ async fn auto_mode_inherits_accept_edits_fs_grant_without_asking() {
         &crate::config::AgentConfig::builtin(),
     )
     .unwrap()
-    .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
+    .with_permission_mode(SharedPermissionMode::new(PermissionMode::AcceptEdits));
 
     let mut rx = runtime.submit_user("make a dir").await;
     let events = drain(&mut rx).await;
@@ -1059,7 +887,7 @@ async fn auto_mode_inherits_accept_edits_fs_grant_without_asking() {
             events
                 .iter()
                 .all(|event| !matches!(event, RuntimeEvent::ApprovalRequired { .. })),
-            "Auto must inherit AcceptEdits's bounded fs-edit grant, not park on it"
+            "AcceptEdits covers bounded filesystem edits"
         );
         assert!(
             events
@@ -1085,8 +913,7 @@ async fn auto_mode_inherits_accept_edits_fs_grant_without_asking() {
 /// The AcceptEdits allowance covers a bounded fs-edit only when the program
 /// word comes first on the line. `PATH=evil mkdir sub` runs ./evil/mkdir —
 /// whatever the model put there with its auto-approved write tools — so it must
-/// park on a prompt like any other untrusted command, in AcceptEdits and, by
-/// inheritance, in Auto. Before the prefix rule, `program_of` skipped the
+/// park on a prompt. Before the prefix rule, `program_of` skipped the
 /// assignment, saw a bounded `mkdir`, and this ran with no prompt at all.
 #[tokio::test]
 async fn accept_edits_does_not_cover_an_env_prefixed_fs_edit() {
@@ -2625,38 +2452,25 @@ async fn the_record_says_when_a_human_was_asked() {
     );
 }
 
-/// Auto mode must park a network declaration for the human WITHOUT consulting
-/// the judge: the scripted judge slot (which would approve) stays unconsumed,
-/// so the turn ends at ApprovalRequired carrying the network badge.
 #[tokio::test]
-async fn auto_mode_parks_network_declaration_without_judging() {
+async fn accept_edits_requires_approval_for_a_networked_fs_command() {
     use crate::execution_policy::{PermissionMode, SharedPermissionMode};
-    let client = ScriptedClient::new(vec![
-        vec![
-            AgentEvent::ToolCallDelta {
-                delta: tool_call_delta(
-                    "call_1",
-                    "shell",
-                    r#"{"command":"git push origin main","network":true}"#,
-                ),
-            },
-            AgentEvent::Done { usage: None },
-        ],
-        // Judge bait: consumed (and approving) only if the network floor leaks
-        // through to the classifier — the test then fails on the last event.
-        vec![
-            AgentEvent::TextDelta {
-                text: r#"{"approve": true, "reason": "leaked"}"#.to_string(),
-            },
-            AgentEvent::Done { usage: None },
-        ],
-    ]);
+    let client = ScriptedClient::new(vec![vec![
+        AgentEvent::ToolCallDelta {
+            delta: tool_call_delta(
+                "call_1",
+                "shell",
+                r#"{"command":"mkdir sub","network":true}"#,
+            ),
+        },
+        AgentEvent::Done { usage: None },
+    ]]);
     let mut registry = ToolRegistry::default();
     registry.register(FakeShellTool).unwrap();
     let runtime = AgentRuntime::new(client, registry)
-        .with_permission_mode(SharedPermissionMode::new(PermissionMode::Auto));
+        .with_permission_mode(SharedPermissionMode::new(PermissionMode::AcceptEdits));
 
-    let mut rx = runtime.submit_user("push it").await;
+    let mut rx = runtime.submit_user("make a dir with network access").await;
     let events = drain(&mut rx).await;
     let Some(RuntimeEvent::ApprovalRequired { request, .. }) = events.last() else {
         panic!("network declaration must park for the human, got {events:?}");
@@ -4496,9 +4310,7 @@ async fn shutdown_cancels_live_turn_and_waits_for_finalize() {
 }
 
 /// Spend a tool reports out-of-band (the sub-agent shape) must fold into the
-/// parent session's lifetime totals — cost AND cache counters, the same
-/// accounting `record_classifier_cost` uses — even though the turn's own
-/// telemetry never saw those requests.
+/// parent session's lifetime cost and cache counters.
 #[tokio::test]
 async fn tool_reported_spend_folds_into_session_totals() {
     let client = ScriptedClient::new(vec![

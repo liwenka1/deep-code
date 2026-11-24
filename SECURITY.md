@@ -116,8 +116,7 @@ review to rediscover:
   whatever the platform confines: on macOS and Linux the OS sandbox, and there
   the deny floor is a UX floor. On Windows nothing confines it, and the deny
   floor is the only rule in front of it — the entry below says what that leaves
-  open. Config `auto_allow` and the `auto` judge approve text the same way, with
-  nobody reading it.
+  open. Config `auto_allow` also lets commands run without an interactive review.
 - `[sandbox] mode = "off"` removes the OS sandbox on **every** platform. What is
   left in front of a command is then the deny floor and the irreversible-outward
   floor — two best-effort readings of the text — on macOS and Linux just as much
@@ -388,7 +387,7 @@ Linux Landlock + seccomp)、工作区边界、CI bot 的触发门禁。凡是打
 - `yolo` 运行的命令没有人读过它的文本,剩下的就只有平台自己的约束:macOS 与
   Linux 上是 OS 沙箱,那里的 deny floor 确实只是体验层的地板;Windows 上没有任何
   东西约束它,deny floor 就是它前面唯一的一条规则——下一条写明那留下了什么。
-  配置的 `auto_allow` 与 `auto` 判官同样是没有人读过文本的通道。
+  配置的 `auto_allow` 也能在无人审阅命令文本时放行。
 - `[sandbox] mode = "off"` 在**每个**平台都移除 OS 沙箱。此时命令前面剩下的只有
   deny floor 与"不可逆对外"地板——两次尽力而为的文本判读——macOS 与 Linux 上同样
   如此。它是用户自己在全局层的决定(项目层可以要求 `os`,永远不能要求 `off`),

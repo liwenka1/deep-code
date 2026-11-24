@@ -18,24 +18,17 @@
 //!    For `shell` and `job action=start` its first step is the **deny floor**,
 //!    `shell_deny::builtin_deny` (via `shell_lex` parsing): a catastrophic shape
 //!    gets a `Deny` verdict before any trust rule is consulted, so nothing can
-//!    allow-list past it. Cannot be disabled by configuration. The plan's one
-//!    *configuration-driven* `Deny`s sit right after it, and there are two: a
-//!    `network: true` declaration (shell, `job start`, or a sub-agent dispatch)
-//!    under `[sandbox] network = "never"` is refused outright rather than run
-//!    offline to fail, and a **networked sub-agent dispatch** under the same
-//!    setting (the child would only burn a doomed attempt).
+//!    allow-list past it. Under `[sandbox] network = "never"`, the policy also
+//!    denies commands and dispatches that declare `network: true`, as well as
+//!    the network tools `fetch_url` and `web_search`.
 //!
 //!    The third floor is not a `Deny` but a park: an **irreversible-outward
 //!    command** — publishing, force-pushing, merging a PR, applying
 //!    infrastructure — that no `[sandbox] allow_irreversible` entry authorizes
-//!    comes back as `NeedsApproval` carrying `ApprovalAuthority::HumanOnly`. This authority
-//!    is what makes it a floor: every automatic path refuses it (stages 4, 5 and
-//!    6 all consult it, so `auto_allow`, session memory, every mode including
-//!    `Yolo`, and the judge are out), while a person can still authorize one run
-//!    — the root grant's shape, and for the same reason. Where nobody can answer
-//!    (a headless run, a child) the unanswered park becomes a denial whose note
-//!    names the remedy. Its promise is narrow and stated as such — see
-//!    `SECURITY.md`.
+//!    comes back as `NeedsApproval` carrying `ApprovalAuthority::HumanOnly`.
+//!    This requires an explicit decision for the request, just like a write-root
+//!    grant. Unattended consumers such as headless runs and sub-agents deny it
+//!    with a note explaining the requirement. See `SECURITY.md`.
 //! 2. **Yolo egress overlay** — `runtime::tool_result::yolo_ambient_network`.
 //!    The one post-hoc edit to the plan: under `Yolo`, ambient network rides a
 //!    sandboxed plan. It never touches the verdict. (`[sandbox] network =
@@ -45,11 +38,10 @@
 //!    error for a plan whose [`ToolExecutionPlan::denied_reason`] is `Some`
 //!    before consulting approval at all (the sub-agent decision path in
 //!    `runtime.rs` checks the same). A hard denial therefore never reaches
-//!    consent, the mode, or the judge. Tool registration's approval requirement
-//!    is folded into the plan during evaluation. The verdict is then the single
-//!    approval decision; no independent boolean can contradict it. Typed tool
-//!    parameters are parsed before this gate, so malformed calls return an error
-//!    without asking a human or the automatic judge.
+//!    consent or the mode. Tool registration's approval requirement is folded
+//!    into the plan during evaluation. The verdict then drives approval. The
+//!    registry parses typed tool parameters first and returns an error for
+//!    malformed arguments.
 //! 4. **Standing consent** — `runtime::approval_flow`: config `auto_allow` (the
 //!    user's explicit list, matched on the exact tool name) and session
 //!    "approve for the session". Session memory is by tool name too, except for
@@ -67,43 +59,24 @@
 //!    [`PermissionMode`]: `Default` asks, `AcceptEdits` waves through workspace
 //!    file edits, the dispatch of a writing sub-agent and filesystem-shaped
 //!    shell commands ([`accept_edits_approvable`] — by program name, operands
-//!    spelled relative and in-tree; the sandbox bounds their writes), `Auto`
-//!    inherits that
-//!    AcceptEdits allowance and consults the judge below for the rest, `Yolo`
-//!    waves through all but a root grant and a `HumanOnly` call.
-//! 6. **Auto judge** — the cheap classifier. It only ever sees a call that has
-//!    already cleared three gates it cannot override: a root grant
-//!    (`request_write_root`) — and a `HumanOnly` call, an unauthorized
-//!    irreversible command — is never auto-approved in any mode; it asks a human,
-//!    or is refused before the prompt (below), egress (a network-native
-//!    tool or a declared `network`) is decided before the judge is consulted, and
-//!    the top risk tier never reaches it: a High-tier call asks unless the
-//!    inherited AcceptEdits allowance already covers it (an untrusted `mkdir
-//!    src/x` is High by default and runs without a prompt in Auto exactly as it
-//!    does in AcceptEdits). The judge's own fail-safes — an offline backend
-//!    cannot judge, a cancel mid-flight aborts into "ask" — are documented on
-//!    `auto_mode_approves` in `runtime::approval_flow`.
+//!    spelled relative and in-tree, with sandboxed writes). `Yolo` approves
+//!    the remaining requests eligible for automatic approval.
 //!
 //! What runs once the chain says yes depends on WHO said it
 //! (`crate::tool::RunAuthority`): a call the policy's own parse let through —
 //! a trust-list `Allow`, a remembered session identity, the accept-edits
 //! allowance — is executed as the argv `shell_lex::parse_unattended` produced,
-//! with no shell in between; a call a human (or the judge, or Yolo) approved as
-//! text goes to a shell verbatim — `sh -c`, or `cmd /C` on Windows — and means
-//! what the human read. The gate therefore trusts only what that parse accepts.
+//! with no shell in between. A call approved as text goes verbatim to
+//! `sh -c` or `cmd /C` on Windows.
 //!
 //! # What is behind a command nobody read
 //!
-//! Three of the channels above hand shell text to a shell with no human having
-//! read it: config `auto_allow` (stage 4), `Yolo` (stage 5) and the Auto judge
-//! (stage 6). All three resolve to `crate::tool::RunAuthority::Approved`. What
-//! stands behind such a command is platform-dependent, and this is the one
-//! place that states it — every other site should link here rather than
-//! restate it, because the short version ("the deny floor is best-effort, the
-//! sandbox is the real containment") is false on one platform:
+//! Config `auto_allow` (stage 4) and `Yolo` (stage 5) can hand text to a shell
+//! without an interactive review. Both resolve to
+//! `crate::tool::RunAuthority::Approved`. Containment depends on the platform.
 //!
 //! * **macOS / Linux** — [`crate::sandbox`] confines writes to the granted
-//!   roots and denies network unless the call declared egress. The deny floor
+//!   roots and applies the plan's network policy. The deny floor
 //!   being best-effort is survivable here: the sandbox is the boundary. Except
 //!   under `[sandbox] mode = "off"`, which removes that boundary on every
 //!   platform: this bullet then reads exactly like the Windows one below, and
@@ -126,11 +99,8 @@
 //! `yolo` on Windows is contained by the deny floor and nothing else, and
 //! `SECURITY.md` records the spellings that floor cannot read.
 //!
-//! Only stage 1 can say an automatic hard "no" (enforced at stage 3). Every
-//! stage below can only relax a `NeedsApproval` into running — one from stage 1
-//! may still be auto-approved by stage 4, 5 or 6 — never tighten an `Allow`.
-//! Reading one stage in isolation is therefore misleading: follow the whole
-//! chain.
+//! Stage 1 supplies hard denials, which stage 3 enforces. Stages 4 and 5 can
+//! relax an eligible `NeedsApproval` into running.
 //!
 //! One more automatic refusal lives in the runtime and is not a policy verdict
 //! at all (consumers add their own on top — headless `-p` auto-denies every
@@ -150,8 +120,8 @@ mod shell_lex;
 
 pub use engine::{
     ApprovalAuthority, ExecPolicy, NetworkMode, PolicyVerdict, RiskLevel, SandboxMode,
-    ToolExecutionPlan, ToolKind, accept_edits_approvable, dispatch_declares_allow_commands,
-    justification_claimed, network_requested, normalize_allow_commands, shell_command_of,
+    ToolExecutionPlan, ToolKind, accept_edits_approvable, justification_claimed, network_requested,
+    normalize_allow_commands, shell_command_of,
 };
 pub use permission_mode::{PermissionMode, SharedPermissionMode};
 pub use shell_deny::{SafetyNote, safety_notes};

@@ -1478,8 +1478,7 @@ pub fn is_workspace_fs_edit(command: &str) -> bool {
         // the *write* side of an out-of-workspace path — the target fails there
         // — but not the *read* side: `cp ~/.ssh/id_rsa ./k` copied a credential
         // into the workspace, where `read_file` then served it to the model,
-        // with no prompt in AcceptEdits or Auto (the judge never sees an
-        // accept-edits pass). So an absolute, home-relative or climbing operand
+        // with no prompt in AcceptEdits. So an absolute, home-relative or climbing operand
         // is not a bounded edit; an in-workspace path spelled absolutely costs
         // one prompt. The safety notes flag the very same spellings. A flag's
         // value is judged as an operand too, in both spellings a program

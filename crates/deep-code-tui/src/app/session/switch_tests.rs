@@ -280,6 +280,39 @@ async fn a_turn_started_after_preparation_prevents_committing_a_ready_candidate(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committing_a_session_switch_clears_pending_yolo_confirmation() {
+    use deep_code_agent::PermissionMode;
+
+    let (_workspace, mut app, target) = app_with_saved_target();
+    let target_id = target.id.clone();
+    app.permission_mode.set(PermissionMode::AcceptEdits);
+    app.switch_session(target).unwrap();
+    app.cycle_permission_mode();
+    let size = Size::new(80, 24);
+    app.yolo_confirmation.set_visible(Some(size));
+    app.yolo_confirmation.on_input_idle();
+    app.yolo_confirmation.set_visible(Some(size));
+    app.yolo_confirmation.on_input_idle();
+    app.handle_yolo_key(YoloKey::F2);
+    assert_eq!(
+        app.yolo_confirmation,
+        YoloConfirmation::Ready {
+            size,
+            step: YoloStep::Finish
+        }
+    );
+
+    wait_for_ready(|| app.session_switch.as_ref().unwrap().task.is_ready()).await;
+    assert!(app.poll_session_scan());
+    assert_eq!(app.session_id.as_deref(), Some(target_id.as_str()));
+    assert_eq!(app.yolo_confirmation, YoloConfirmation::Inactive);
+    app.handle_yolo_key(YoloKey::F7);
+    assert_eq!(app.runtime.permission_mode(), PermissionMode::AcceptEdits);
+    assert!(app.status.contains(target_id.as_str()), "{}", app.status);
+    app.shutdown_runtime().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn committing_a_ready_switch_never_waits_for_reacquired_store_lock_and_exit_drains_save() {
     let (_workspace, mut app, target) = app_with_saved_target();
     let current_path = record_path(&app, app.session_id.as_deref().unwrap());

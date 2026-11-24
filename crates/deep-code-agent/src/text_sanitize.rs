@@ -155,7 +155,7 @@ pub fn neutralize_display_text(text: &str) -> String {
 
 /// One line out of many: every run of whitespace (newlines included) becomes a
 /// single space, leading and trailing whitespace goes. The one spelling of
-/// "flatten this for a single row" — the judge's action fence, a sub-agent's
+/// "flatten this for a single row" — an approval action, a sub-agent's
 /// result summary, a session title, a transcript summary line — so a change to
 /// what counts as a row-breaking character lands everywhere at once.
 #[must_use]

@@ -19,15 +19,8 @@ pub(super) fn risk_display(risk: RiskLevel, lang: Lang) -> (&'static str, Color)
     (tr(lang, risk.text_id()), color)
 }
 
-/// The human-meaningful action behind a tool call — the shell command, the file
-/// path, etc. — instead of the raw JSON blob. Falls back to compact arguments.
-///
-/// The key that may occupy the line — `command`, `path`, … in that order, and
-/// `path` alone for `request_write_root` — is decided by the agent's
-/// [`deep_code_agent::action_summary`], the same table the auto-mode judge
-/// reads a gated call through, so the panel and the judge can never describe
-/// one call two ways. Arguments that are not JSON at all are shown as they
-/// are, collapsed onto one line.
+/// Use the agent's summary for structured arguments and collapse raw text
+/// to one line when it cannot be parsed as JSON.
 pub(super) fn extract_action(tool_name: &str, arguments_json: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(arguments_json) {
         Ok(value) => deep_code_agent::action_summary(tool_name, &value),

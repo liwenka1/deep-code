@@ -716,19 +716,6 @@ impl RiskLevel {
             Self::High => crate::i18n::TextId::RiskHigh,
         }
     }
-
-    /// The wire spelling (`low`/`medium`/`high`), the same word serde emits.
-    /// For a place that needs a stable machine word — the auto-mode judge's
-    /// prompt — rather than the localized label or a `Debug` rendering that a
-    /// variant rename would silently change.
-    #[must_use]
-    pub fn as_setting(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-        }
-    }
 }
 
 /// Who may resolve a policy approval. This is authority, not a display rule id.
@@ -911,30 +898,8 @@ pub fn network_requested(arguments: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether an `agent` dispatch declares a non-empty `allow_commands`.
-///
-/// `allow_commands` is its own approval point — it authorizes the child to run
-/// those commands (`bash`, `git push`, …) unattended, which a person decides by
-/// seeing them named at the prompt. So neither allowance that decides on the
-/// person's behalf may approve such a dispatch: the accept-edits inherit (folded
-/// into [`accept_edits_approvable`]) and the Auto judge (the approval flow checks
-/// this above it). It mirrors [`network_requested`], the other grant a dispatch
-/// carries, and like that one it reaches no further: the consents a person gave
-/// on purpose still cover it — a config `auto_allow` entry naming `agent`, and
-/// `yolo` — because those are decisions about the tool and these are its
-/// arguments (SECURITY.md states the trade-off). Session memory never does: an
-/// "a" on a dispatch records nothing and approves that one call.
-#[must_use]
-pub fn dispatch_declares_allow_commands(tool_name: &str, arguments: &Value) -> bool {
-    matches!(ExecPolicy::classify_tool(tool_name), ToolKind::SubAgent)
-        && !subagent_allow_commands(arguments).is_empty()
-}
-
 /// The model's stated reason for a gated call (`justification` in the
-/// arguments), for the human at the approval prompt. Advisory text only: it
-/// is the model's own claim, never fed back to the auto-mode judge (a
-/// classifier reading the requester's sales pitch would let a prompt
-/// injection argue itself through) and never a gate input.
+/// arguments). The approval panel displays it as the model's own claim.
 #[must_use]
 pub fn justification_claimed(arguments: &Value) -> Option<String> {
     arguments

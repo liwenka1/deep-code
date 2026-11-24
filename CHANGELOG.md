@@ -6,6 +6,10 @@ Entries marked **Security:** change security-relevant behavior.
 
 ## [Unreleased]
 
+- **Breaking:** Removed the `auto` permission mode and its Flash approval requests. The available modes are `default`, `accept_edits`, and `yolo`.
+  Press `F2` followed by `F7` to confirm YOLO, or `Shift+Tab` again to return to `default`.
+- An invalid `approval.default_mode` selects `default` and generates a warning.
+
 ## [0.5.5] - 2026-11-22
 
 <!-- reviewed-notes:start -->

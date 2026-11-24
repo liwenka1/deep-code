@@ -360,11 +360,8 @@ impl AgentRuntime {
 
     /// Ask the model for the handover summary of `plan`'s archived range.
     ///
-    /// A separate, tool-less request on the flash tier (the same choice the
-    /// auto-mode judge makes, and for the same reason: the input is large and
-    /// the task is reading, not deciding); low reasoning effort, since the
-    /// value is in the transcript, not in deliberation. Bounded by
-    /// [`HANDOVER_DEADLINE`] and by `cancel`, which is the caller's — the
+    /// The separate, tool-less Flash request uses low reasoning effort and
+    /// observes [`HANDOVER_DEADLINE`] and `cancel`, which is the caller's — the
     /// turn's for a fold inside a turn, the user's own for `/compact`. Never
     /// the runtime's turn token from between turns: that one stays cancelled
     /// after an Esc until the next turn begins.

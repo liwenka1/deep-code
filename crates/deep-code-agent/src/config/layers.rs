@@ -32,22 +32,7 @@ fn render_warning(lang: Lang, (id, args): &PendingWarning) -> String {
     tr_with(lang, *id, &refs)
 }
 
-/// Parse a setting, warning when the value is invalid and keeping the value
-/// from the layers below it.
-///
-/// One helper rather than a warning written out per setting, because "written
-/// out per setting" is exactly how the gap appeared: of the five enum-shaped
-/// settings, two had a warning (`provider.reasoning_effort`, `cost.currency`)
-/// and three did not (`sandbox.network`, `approval.default_mode`,
-/// `ui.language`) — and the silent one that mattered degrades in the
-/// PERMISSIVE direction. `[sandbox] network` is the only switch that hard-
-/// disables egress, and `NetworkMode::parse` answering `None` drops it back to
-/// the builtin `Prompt`: a user who typed `"nevr"` had egress re-armed with
-/// nothing said, and under `yolo` (or headless `-p`, where nobody answers a
-/// prompt) `yolo_ambient_network` then hands every sandboxed command ambient
-/// network. A setting added later cannot repeat it without opting out of this
-/// function, and `every_enum_setting_warns_on_an_unrecognized_spelling`
-/// enumerates them.
+/// Parse a setting whose invalid values warn and inherit the lower layer.
 ///
 /// `field` identifies the setting to fix. A rejected value may contain a
 /// credential pasted into the wrong setting, so the warning omits it.
@@ -400,7 +385,9 @@ struct StreamSection {
 #[serde(default)]
 struct ApprovalSection {
     auto_allow: Option<Vec<String>>,
-    default_mode: Option<String>,
+    // Validate the value in the overlay so a wrong TOML type also selects
+    // Default. Rejecting the whole file here could inherit a looser mode.
+    default_mode: Option<toml::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -786,21 +773,19 @@ fn apply_file_overlay(
         }
     }
 
-    if let Some(mode) = parse_setting(
-        file.approval.default_mode.as_deref(),
-        "approval.default_mode",
-        layer,
-        pending,
-        PermissionMode::parse,
-    ) {
-        // Tighten-only from the project layer: a repo may lower the tier but
-        // never raise it. Rejecting only auto/yolo was not enough — a hostile
-        // checkout could still raise Default → AcceptEdits and thereby
-        // auto-approve every `write_file`/`apply_patch` plus in-workspace
-        // `rm/mv/cp/mkdir/touch` from turn one, with no trust-this-folder prompt
-        // anywhere. (`config.example.toml` also claimed `approval.*` was ignored
-        // in the project layer, so the code was looser than its own docs.)
-        // Unknown values degrade to the default.
+    if let Some(value) = &file.approval.default_mode {
+        let mode = value
+            .as_str()
+            .and_then(PermissionMode::parse)
+            .unwrap_or_else(|| {
+                pending.push((
+                    TextId::CfgInvalidPermissionMode,
+                    vec![("layer", layer.label().to_string())],
+                ));
+                PermissionMode::Default
+            });
+        // Project config can only tighten the user's mode. A checkout that
+        // could raise Default to AcceptEdits could grant itself write approval.
         if project && mode.to_u8() > config.default_permission_mode.to_u8() {
             pending.push((
                 TextId::CfgProjectFieldIgnored,

@@ -151,8 +151,7 @@ pub type ToolUpdateFn = Arc<dyn Fn(ToolUpdate) + Send + Sync>;
 /// Out-of-band spend one tool run reports back to the runtime — requests the
 /// parent turn's telemetry never sees (e.g. a sub-agent's own turns on the
 /// shared key). Cache traffic rides along with the cost so folding keeps the
-/// session's hit-rate and savings covering every request billed to it, the
-/// same accounting `record_classifier_cost` uses.
+/// session's hit-rate and savings covering every request billed to it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ToolSpend {
     pub cost: crate::pricing::CostEstimate,
@@ -185,8 +184,8 @@ impl ToolSpend {
 /// and each difference ran something the gate never saw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RunAuthority {
-    /// The text was approved as text: a human at the prompt, the Auto judge,
-    /// Yolo, or a config `auto_allow` naming the tool. Shell semantics.
+    /// Run the command as shell text. An explicit approval, Yolo, or an
+    /// `auto_allow` entry naming the tool can authorize this.
     #[default]
     Approved,
     /// Nobody read the text: the policy's parse of it matched a rule. The
@@ -378,8 +377,8 @@ pub struct ApprovalRequest {
     #[serde(default)]
     pub requires_sandbox: bool,
     /// The call declares it needs network access (`network: true`), so
-    /// approving runs it with egress/listening enabled. Surfaced as a badge;
-    /// AcceptEdits and the Auto judge never auto-approve a declaration.
+    /// approving runs it with egress/listening enabled. The panel shows a
+    /// network badge. The AcceptEdits allowance applies to calls without this flag.
     #[serde(default)]
     pub network: bool,
     /// The model's stated reason for the call (`justification` argument),

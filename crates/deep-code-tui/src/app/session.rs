@@ -112,6 +112,8 @@ impl App {
         // cannot catch one read and then discarded. Each caller now decides
         // where the warnings land via `flush_launch_warnings`.
         self.pending_launch_warnings = warnings;
+        // The permission warning was shown for the outgoing runtime.
+        self.cancel_yolo_confirmation();
         self.runtime = handle;
         self.backend_label = backend_label;
         self.backend_offline = offline;

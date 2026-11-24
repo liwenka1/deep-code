@@ -43,7 +43,7 @@ on:
         required: false
         default: 'deepcode/issue-'
       permission-mode:
-        description: 'default | accept_edits | auto | yolo. The default accept_edits mode permits workspace file edits and bounded filesystem commands through shell or job start (for example mkdir src/new or touch x). Other calls that still require approval are auto-denied in this headless run unless explicitly authorized.'
+        description: 'default | accept_edits | yolo. The default accept_edits mode permits workspace file edits and bounded filesystem commands through shell or job start (for example mkdir src/new or touch x). Other calls that still require approval are auto-denied in this headless run unless explicitly authorized.'
         type: string
         required: false
         default: 'accept_edits'

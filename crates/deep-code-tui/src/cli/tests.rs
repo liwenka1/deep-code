@@ -460,7 +460,7 @@ fn the_help_body_shows_every_print_flag_group() {
 fn every_documented_print_flag_parses() {
     const SAMPLES: [(&str, &[&str]); 7] = [
         ("--output-format", &["--output-format", "json"]),
-        ("--permission-mode", &["--permission-mode", "auto"]),
+        ("--permission-mode", &["--permission-mode", "yolo"]),
         ("--timeout", &["--timeout", "60"]),
         ("--verbose", &["--verbose"]),
         ("--add-dir", &["--add-dir", env!("CARGO_MANIFEST_DIR")]),

@@ -1,18 +1,9 @@
-//! Session permission mode: how far the approval gate is relaxed.
+//! Session permission modes resolve eligible approval requests.
 //!
-//! A mode only ever relaxes a `NeedsApproval` verdict into an auto-run. A hard
-//! `Deny` (rm -rf, fork bomb, `curl | sh`, …) is short-circuited by the tool
-//! registry (`run_tool_call_with_plan`) before any decision is consulted, so no
-//! mode — not even `Yolo` —
-//! runs a command the deny list *recognized*. (An unauthorized `npm publish` is
-//! a different gate: the irreversible-outward floor parks it as a `NeedsApproval`
-//! no automatic path may answer — see `ToolExecutionPlan::requires_human` — rather than a hard
-//! `Deny`, so an interactive user can still authorize it once.) Be honest about what that
-//! buys: `shell_deny` is best-effort string parsing, not a security boundary.
-//! An obfuscation it fails to parse falls through as `NeedsApproval`, which
-//! `Yolo` auto-approves — so what holds it is not this floor, and it is not the
-//! same on every platform:
-//! [what is behind a command nobody read](super#what-is-behind-a-command-nobody-read).
+//! Policy denials take precedence over every mode. Write-root grants and
+//! other `HumanOnly` requests require an explicit decision. The command
+//! deny list recognizes known command shapes. Containment depends on the
+//! platform. See [what is behind a command nobody read](super#what-is-behind-a-command-nobody-read).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -41,20 +32,8 @@ pub enum PermissionMode {
     /// into a spawn that would fail (`command_runnable_unattended` in
     /// `runtime/approval_flow.rs`).
     AcceptEdits,
-    /// Everything `AcceptEdits` waves through, plus a cheap classifier model
-    /// judging the rest — behind three floors it cannot override: a root grant
-    /// and any egress (a declared `network: true`, or a network-native tool)
-    /// ask a human, and a High-tier call never reaches the judge — it asks,
-    /// unless the inherited `AcceptEdits` allowance already covers it (an
-    /// untrusted `mkdir src/x` is High by default and runs unasked here just
-    /// as it does there). Unsure/hostile/error → prompt. The order is drawn in
-    /// the `execution_policy` module docs and lives in
-    /// `runtime::approval_flow::auto_mode_approves`.
-    Auto,
-    /// Auto-approve everything that reaches the gate except two calls, both of
-    /// which ask in every mode: a root grant (`request_write_root`) and a
-    /// `HumanOnly` plan (today: an unauthorized irreversible-outward command).
-    /// Hard denies still block, and the deny floor still runs first.
+    /// Auto-approve eligible requests and give sandboxed commands ambient
+    /// network access when the sandbox network mode permits it.
     Yolo,
 }
 
@@ -64,8 +43,7 @@ impl PermissionMode {
     pub fn cycle(self) -> Self {
         match self {
             Self::Default => Self::AcceptEdits,
-            Self::AcceptEdits => Self::Auto,
-            Self::Auto => Self::Yolo,
+            Self::AcceptEdits => Self::Yolo,
             Self::Yolo => Self::Default,
         }
     }
@@ -76,7 +54,6 @@ impl PermissionMode {
         match self {
             Self::Default => "default",
             Self::AcceptEdits => "accept_edits",
-            Self::Auto => "auto",
             Self::Yolo => "yolo",
         }
     }
@@ -89,7 +66,6 @@ impl PermissionMode {
         match self {
             Self::Default => crate::i18n::TextId::PermModeDefault,
             Self::AcceptEdits => crate::i18n::TextId::PermModeAcceptEdits,
-            Self::Auto => crate::i18n::TextId::PermModeAuto,
             Self::Yolo => crate::i18n::TextId::PermModeYolo,
         }
     }
@@ -100,29 +76,26 @@ impl PermissionMode {
         match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
             "default" => Some(Self::Default),
             "accept_edits" | "acceptedits" | "edits" => Some(Self::AcceptEdits),
-            "auto" => Some(Self::Auto),
             "yolo" => Some(Self::Yolo),
             _ => None,
         }
     }
 
-    /// Rank on the permissiveness ladder (`Default` ⊂ `AcceptEdits` ⊂ `Auto` ⊂
-    /// `Yolo`). Also used to enforce tighten-only config merges: an untrusted
-    /// layer may lower the tier, never raise it.
+    /// Rank on the permissiveness ladder (`Default` ⊂ `AcceptEdits` ⊂ `Yolo`).
+    /// The config merge uses this rank to accept project settings that tighten
+    /// the user's permission mode.
     pub(crate) fn to_u8(self) -> u8 {
         match self {
             Self::Default => 0,
             Self::AcceptEdits => 1,
-            Self::Auto => 2,
-            Self::Yolo => 3,
+            Self::Yolo => 2,
         }
     }
 
     fn from_u8(value: u8) -> Self {
         match value {
             1 => Self::AcceptEdits,
-            2 => Self::Auto,
-            3 => Self::Yolo,
+            2 => Self::Yolo,
             // Unknown byte falls back to the strictest mode — never silently
             // more permissive.
             _ => Self::Default,
@@ -171,12 +144,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cycle_is_a_four_stop_ring() {
+    fn cycle_is_a_three_stop_ring() {
         let mut m = PermissionMode::Default;
         m = m.cycle();
         assert_eq!(m, PermissionMode::AcceptEdits);
-        m = m.cycle();
-        assert_eq!(m, PermissionMode::Auto);
         m = m.cycle();
         assert_eq!(m, PermissionMode::Yolo);
         m = m.cycle();
@@ -188,7 +159,6 @@ mod tests {
         for mode in [
             PermissionMode::Default,
             PermissionMode::AcceptEdits,
-            PermissionMode::Auto,
             PermissionMode::Yolo,
         ] {
             assert_eq!(PermissionMode::parse(mode.as_setting()), Some(mode));
@@ -198,6 +168,7 @@ mod tests {
             Some(PermissionMode::AcceptEdits)
         );
         assert_eq!(PermissionMode::parse("YOLO"), Some(PermissionMode::Yolo));
+        assert_eq!(PermissionMode::parse("auto"), None);
         assert_eq!(PermissionMode::parse("nonsense"), None);
     }
 
@@ -209,7 +180,6 @@ mod tests {
         for mode in [
             PermissionMode::Default,
             PermissionMode::AcceptEdits,
-            PermissionMode::Auto,
             PermissionMode::Yolo,
         ] {
             assert_eq!(
@@ -230,8 +200,8 @@ mod tests {
         assert_eq!(shared.get(), PermissionMode::Yolo);
         // Clones share the same underlying atomic.
         let clone = shared.clone();
-        clone.set(PermissionMode::Auto);
-        assert_eq!(shared.get(), PermissionMode::Auto);
+        clone.set(PermissionMode::Default);
+        assert_eq!(shared.get(), PermissionMode::Default);
     }
 
     #[test]

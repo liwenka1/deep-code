@@ -603,6 +603,15 @@ fn picker_and_tui_cleanup_survive_both_output_pipes_being_full() {
                 };
                 display.windows(cursor.len()).any(|part| part == cursor)
             });
+            if mode == "tui" {
+                let enable_focus = b"\x1b[?1004h";
+                assert!(
+                    display
+                        .windows(enable_focus.len())
+                        .any(|part| part == enable_focus),
+                    "the TUI must subscribe to terminal focus events"
+                );
+            }
             // Stop writes briefly while filling both pipes, then restore the
             // descriptor flags before resuming. No reader drains them on exit.
             // SAFETY: the signals and wait target only our child process.

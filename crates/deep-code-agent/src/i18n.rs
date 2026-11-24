@@ -485,6 +485,7 @@ text_ids! {
     CfgProjectApiKeyIgnored,
     CfgProjectBaseUrlIgnored,
     CfgUnknownValue,
+    CfgInvalidPermissionMode,
     CfgProjectFieldIgnored,
     CfgUnknownKey,
     CfgProjectAutoAllowIgnored,
@@ -552,10 +553,13 @@ text_ids! {
     // 权限模式(Shift+Tab 循环 + 状态栏标识)
     PermModeDefault,
     PermModeAcceptEdits,
-    PermModeAuto,
     PermModeYolo,
     PermModeSwitched,
-    PermModeYoloArm,
+    PermModeYoloWarning,
+    PermModeYoloConfirm,
+    PermModeYoloRetry,
+    PermModeYoloFinish,
+    PermModeYoloResize,
 }
 
 static ZH_JSON: &str = include_str!("../locales/zh.json");

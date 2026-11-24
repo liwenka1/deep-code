@@ -55,10 +55,10 @@ fn quoted_program_word_cannot_dodge_deny() {
 /// deliberately does **not** chase it, for the same reason it does not chase
 /// `$(…)` or `$VAR` (`indirect_forms_fall_to_approval_not_deny`): an indirect
 /// form is made un-auto-approvable instead, so every channel that *parses* the
-/// command sends it to a human. Three channels do not parse it — config
-/// `auto_allow`, the Auto judge and `yolo` — and what stands behind those is
-/// the module map's business ("what is behind a command nobody read" in
-/// `execution_policy`). On Windows that is this floor and nothing else, so
+/// command sends it to a human. Config `auto_allow` and `yolo` can approve the
+/// original text. The remaining boundary is documented under
+/// "what is behind a command nobody read" in
+/// `execution_policy`. On Windows that is this floor and nothing else, so
 /// `de%PATH:~0,0%l /f/s/q C:\*` really does run there. That residual is
 /// accepted and recorded in `SECURITY.md`; closing it here would cost the
 /// ordinary commands listed below.

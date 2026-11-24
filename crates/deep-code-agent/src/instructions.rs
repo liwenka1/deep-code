@@ -13,8 +13,7 @@
 //! Instructions are context, not permission. Nothing here reaches the
 //! execution policy, the approval gate or the sandbox: a repository can tell
 //! the model how to work and cannot widen what it may do — the same posture
-//! as the skills index, which also puts repository text in the prompt. The
-//! auto-mode judge builds its own prompt and never sees this block.
+//! as the skills index, which also puts repository text in the prompt.
 //!
 //! The workspace copy is repository content, and is distrusted on one axis
 //! beyond that: a symlinked `AGENTS.md` is refused. A checkout can carry

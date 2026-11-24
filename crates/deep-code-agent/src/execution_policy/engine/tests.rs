@@ -169,54 +169,24 @@ fn spawning_a_writing_subagent_needs_approval_like_a_write() {
     ));
 }
 
-/// `allow_commands` is its own consent point: it authorizes the child to run
-/// those commands unattended, which only a person decides by seeing them named.
-/// So a dispatch carrying it must not be waved through by AcceptEdits (even for
-/// a writing role, whose plain workspace writes that mode would grant) nor by
-/// the Auto judge (which reads only the `task` text) — `dispatch_declares_allow_commands`
-/// is the predicate both consult, mirroring `network_requested`.
+/// AcceptEdits covers plain write dispatches. Granting commands to a child
+/// raises a separate approval request for either role.
 #[test]
 fn an_allow_commands_dispatch_is_its_own_consent_point() {
-    // A writing role is accept-edits-approvable on its own…
     assert!(accept_edits_approvable(
         "agent",
         &json!({"task": "fix", "role": "implementer"})
     ));
-    // …but NOT once it also carries allow_commands.
-    assert!(!accept_edits_approvable(
-        "agent",
-        &json!({"task": "fix", "role": "implementer", "allow_commands": ["bash", "python3"]})
-    ));
-    // A read-only role with allow_commands is the Auto-mode case: not
-    // accept-edits-approvable (read-only), and flagged so the Auto flow floors
-    // it before the judge.
-    assert!(!accept_edits_approvable(
-        "agent",
-        &json!({"task": "look", "role": "explore", "allow_commands": ["bash"]})
-    ));
-    assert!(dispatch_declares_allow_commands(
-        "agent",
-        &json!({"task": "look", "role": "explore", "allow_commands": ["bash"]})
-    ));
-    assert!(dispatch_declares_allow_commands(
-        "agent",
-        &json!({"task": "fix", "role": "implementer", "allow_commands": ["bash"]})
-    ));
-    // No allow_commands (or an empty list) is not flagged — the plain dispatch
-    // consent paths still apply.
-    assert!(!dispatch_declares_allow_commands(
-        "agent",
-        &json!({"task": "fix", "role": "implementer"})
-    ));
-    assert!(!dispatch_declares_allow_commands(
+    assert!(accept_edits_approvable(
         "agent",
         &json!({"task": "fix", "role": "implementer", "allow_commands": []})
     ));
-    // It is specific to the dispatch tool: the key on another tool is not it.
-    assert!(!dispatch_declares_allow_commands(
-        "shell",
-        &json!({"command": "ls", "allow_commands": ["bash"]})
-    ));
+    for role in ["implementer", "explore"] {
+        let arguments = json!({"task": "work", "role": role, "allow_commands": ["cargo test"]});
+        let plan = ExecPolicy::default().evaluate_tool("agent", &arguments);
+        assert!(plan.requires_approval(), "{role}");
+        assert!(!accept_edits_approvable("agent", &arguments), "{role}");
+    }
 }
 
 /// A `network: true` dispatch is the child's egress consent, collected at
@@ -952,17 +922,14 @@ fn job_cancel_needs_approval_for_its_stated_reason() {
     assert_eq!(plan.risk_level, RiskLevel::Low);
 }
 
-/// The judge reads the risk tier through `as_setting`; it must be the wire
-/// spelling serde emits, so the prompt and the telemetry name a tier the same
-/// way and a variant rename cannot drift one without the other.
 #[test]
-fn risk_level_setting_spelling_is_its_wire_form() {
-    for level in [RiskLevel::Low, RiskLevel::Medium, RiskLevel::High] {
-        assert_eq!(
-            serde_json::to_value(level).unwrap(),
-            serde_json::Value::String(level.as_setting().to_string()),
-            "{level:?}"
-        );
+fn risk_level_keeps_its_wire_spelling() {
+    for (level, spelling) in [
+        (RiskLevel::Low, "low"),
+        (RiskLevel::Medium, "medium"),
+        (RiskLevel::High, "high"),
+    ] {
+        assert_eq!(serde_json::to_value(level).unwrap(), json!(spelling));
     }
 }
 

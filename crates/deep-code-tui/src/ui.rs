@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event,
 };
 use crossterm::style::Print;
 use crossterm::terminal::{
@@ -23,7 +24,7 @@ use crossterm::{execute, queue};
 use deep_code_agent::CancellationToken;
 use ratatui::Terminal;
 
-use crate::app::{App, LaunchConfig};
+use crate::app::{App, LaunchConfig, YoloConfirmation};
 
 use self::backend::{FrameBackend, draw_frame};
 
@@ -33,6 +34,7 @@ const MIN_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 /// While streaming, repaint at least this often so the activity indicator
 /// animates through a long time-to-first-token wait.
 const STREAM_TICK_INTERVAL: Duration = Duration::from_millis(120);
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 type AppTerminal = Terminal<FrameBackend<Output>>;
 
 /// Install once before startup and keep SIGINT routed through the scan,
@@ -112,6 +114,7 @@ fn install_panic_hook() {
         let _ = queue_sync_end(&mut stdout);
         let _ = execute!(
             stdout,
+            DisableFocusChange,
             DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen,
@@ -137,22 +140,29 @@ fn install_panic_hook() {
 }
 
 fn setup_terminal(interrupted: &CancellationToken) -> Result<(AppTerminal, TerminalCleanup)> {
-    let cleanup = TerminalCleanup::new(interrupted, true)?;
+    let mut cleanup = TerminalCleanup::new(interrupted, true)?;
     let mut stdout = cleanup.writer();
     // Bracketed paste: paste arrives as one `Event::Paste` string. Mouse
     // capture: wheel scrolls the transcript and drag selects text (we render
     // an in-app selection + copy, since capture disables native selection).
+    // Focus reporting lets a focus change cancel pending YOLO confirmation.
     // Title: names the window or tab in terminals that show a title a program
     // sets. Not VS Code's tab, though: by default it is `${process}`, the
     // foreground process — for the npm install the `node` launcher, which leads
     // the process group — and an OSC title never reaches that label (measured
     // against VS Code's own node-pty). The shell's title is pushed first so
     // quitting can give it back.
-    execute!(
+    queue!(
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableMouseCapture,
+        EnableMouseCapture
+    )?;
+    // Account for partial writes as well as a completed startup.
+    cleanup.focus_reporting = true;
+    execute!(
+        stdout,
+        EnableFocusChange,
         TitleStack::Push,
         SetTitle("deep-code")
     )?;
@@ -172,6 +182,7 @@ fn setup_terminal(interrupted: &CancellationToken) -> Result<(AppTerminal, Termi
 pub(crate) struct TerminalCleanup {
     output: Output,
     title: bool,
+    focus_reporting: bool,
     active: bool,
 }
 
@@ -182,6 +193,7 @@ impl TerminalCleanup {
         Ok(Self {
             output,
             title,
+            focus_reporting: false,
             active: true,
         })
     }
@@ -198,6 +210,11 @@ impl TerminalCleanup {
         let raw = disable_raw_mode();
         let mut output = BufWriter::new(self.output.cleanup());
         let sync_end = queue_sync_end(&mut output);
+        let focus = if self.focus_reporting {
+            queue!(output, DisableFocusChange)
+        } else {
+            Ok(())
+        };
         let display = execute!(
             output,
             DisableMouseCapture,
@@ -209,7 +226,7 @@ impl TerminalCleanup {
             let _ = execute!(output, TitleStack::Pop);
         }
         self.output.discard_terminal_writes();
-        raw.and(sync_end).and(display)
+        raw.and(sync_end).and(focus).and(display)
     }
 }
 
@@ -376,6 +393,9 @@ fn run_loop(
     let mut needs_redraw = true;
     let mut last_draw: Option<Instant> = None;
     let mut was_streaming = app.is_streaming;
+    let mut yolo_input_deadline = None;
+    // The Windows console reports key releases and may repeat Press.
+    let mut yolo_keys = input::YoloKeys::new(cfg!(windows));
 
     while !app.should_quit && !interrupted.is_cancelled() {
         if app.drain_stream_updates() {
@@ -402,7 +422,11 @@ fn run_loop(
             app.is_streaming && last_draw.is_none_or(|at| at.elapsed() >= STREAM_TICK_INTERVAL);
         if (needs_redraw && draw_due) || tick_due {
             app.enforce_history_cap();
+            let confirmation = app.yolo_confirmation;
             draw_frame(terminal, |frame| render::render(frame, app))?;
+            if app.yolo_confirmation != confirmation {
+                yolo_input_deadline = None;
+            }
             last_draw = Some(Instant::now());
             needs_redraw = false;
         }
@@ -415,9 +439,39 @@ fn run_loop(
             let _ = execute!(terminal.backend_mut(), Print(kind.terminal_sequence()));
         }
 
-        if event::poll(Duration::from_millis(40))? {
+        // Once the hint frame is flushed, process input queued during the
+        // write before arming it. An empty queue needs no additional delay.
+        let hint_input_pending = matches!(
+            app.yolo_confirmation,
+            YoloConfirmation::AwaitingHintInput { .. }
+        );
+        let timeout = match app.yolo_confirmation {
+            YoloConfirmation::AwaitingHintInput { .. } => Duration::ZERO,
+            YoloConfirmation::AwaitingInputIdle(_) => {
+                // Pointer events carry the same deadline until the queue empties.
+                let now = Instant::now();
+                let deadline = yolo_input_deadline.get_or_insert(now + INPUT_POLL_INTERVAL);
+                deadline.saturating_duration_since(now)
+            }
+            _ => {
+                yolo_input_deadline = None;
+                INPUT_POLL_INTERVAL
+            }
+        };
+        if event::poll(timeout)? {
             let event = event::read()?;
-            needs_redraw |= input::dispatch_terminal_event(app, terminal, event)?;
+            if !matches!(event, Event::Mouse(_)) {
+                yolo_input_deadline = None;
+            }
+            needs_redraw |= input::dispatch_terminal_event(app, terminal, &mut yolo_keys, event)?;
+        } else if hint_input_pending
+            || yolo_input_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            #[cfg(windows)]
+            if !input::console_input_empty()? {
+                continue;
+            }
+            needs_redraw |= app.yolo_confirmation.on_input_idle();
         }
     }
 

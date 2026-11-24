@@ -70,7 +70,7 @@ fn sandbox_network_is_tighten_only_from_the_project_layer() {
     assert_eq!(loaded.config.sandbox_network, NetworkMode::Never);
 
     // …but must not re-arm ambient egress: a repo saying "always" is
-    // ignored with a warning, same class as auto/yolo mode injection.
+    // ignored with a warning, like attempts to raise the permission mode.
     let project_dir = tempfile::tempdir().unwrap();
     let project = write_config(project_dir.path(), "[sandbox]\nnetwork = \"always\"\n");
     let loaded = AgentConfig::load_with(None, Some(project), &no_env);
@@ -171,10 +171,8 @@ fn sandbox_mode_is_tighten_only_from_the_project_layer() {
     );
 }
 
-/// The project layer is tighten-only for the permission tier. Rejecting just
-/// auto/yolo was not enough: raising `default` → `accept_edits` already
-/// auto-approves every workspace write plus in-workspace `rm/mv/cp/mkdir`,
-/// and a repo is untrusted input parsed before any UI is drawn.
+/// A project must need the user's consent to raise a permission tier,
+/// including the step from Default to AcceptEdits.
 #[test]
 fn project_layer_may_only_lower_the_permission_tier() {
     use crate::execution_policy::PermissionMode;
@@ -200,7 +198,7 @@ fn project_layer_may_only_lower_the_permission_tier() {
     );
 
     // It may NOT raise it — not even by one notch, and not silently.
-    for evil_mode in ["accept_edits", "auto", "yolo"] {
+    for evil_mode in ["accept_edits", "yolo"] {
         let evil_dir = tempfile::tempdir().unwrap();
         let evil = write_config(
             evil_dir.path(),
@@ -219,6 +217,39 @@ fn project_layer_may_only_lower_the_permission_tier() {
                 .iter()
                 .any(|w| w.contains("default_mode")),
             "{evil_mode}: {:?}",
+            loaded.report.warnings
+        );
+    }
+}
+
+#[test]
+fn invalid_project_permission_mode_uses_default() {
+    let global_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let global = write_config(global_dir.path(), "[approval]\ndefault_mode = \"yolo\"\n");
+    let project = write_config(project_dir.path(), "[approval]\n");
+
+    let loaded = AgentConfig::load_with(Some(global.clone()), Some(project), &no_env);
+    assert_eq!(loaded.config.default_permission_mode, PermissionMode::Yolo);
+    assert!(loaded.report.warnings.is_empty());
+
+    for value in [r#""auto""#, r#""yoloo""#, r#""""#, "false"] {
+        let project = write_config(
+            project_dir.path(),
+            &format!("[approval]\ndefault_mode = {value}\n"),
+        );
+        let loaded = AgentConfig::load_with(Some(global.clone()), Some(project), &no_env);
+        assert_eq!(
+            loaded.config.default_permission_mode,
+            PermissionMode::Default,
+            "invalid project value {value} must use Default"
+        );
+        assert!(
+            loaded.report.warnings_in(Lang::En).iter().any(|warning| {
+                warning.contains("invalid approval.default_mode")
+                    && warning.contains("Using 'default'")
+            }),
+            "{value}: {:?}",
             loaded.report.warnings
         );
     }

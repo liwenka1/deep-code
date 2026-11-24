@@ -22,7 +22,7 @@
 # Five settings are tighten-only from the project layer: a repo may be
 # stricter than your global config, never looser, and an attempt to loosen is
 # ignored with a warning.
-#   - approval.default_mode may only step DOWN (auto to default, say), never up.
+#   - approval.default_mode may only tighten the user's mode (yolo to default, for example).
 #     Not even one step up: accept_edits already waves through every workspace
 #     write.
 #   - sandbox.network may only be stricter than the global value (always, then
@@ -40,12 +40,8 @@
 # with the repo, nor be injected by one), and a project-layer provider.base_url
 # override is refused outright.
 #
-# Typos are not silent. A key this file does not have (say "netwrok") and a
-# value that cannot be recognized (say "nevr" for the network mode) are each
-# named at startup and in `deepcode doctor`, together with the note that the
-# setting kept whatever the layer below it had — rather than letting you
-# believe it took effect. `deepcode doctor` also prints the sandbox network
-# mode currently in force, which is how you confirm that "never" really landed.
+# Startup and `deepcode doctor` report unknown keys and unrecognized values.
+# `deepcode doctor` also shows the effective sandbox network mode.
 
 [provider]
 # DeepSeek API key. Prefer the DEEPSEEK_API_KEY environment variable or this
@@ -118,12 +114,9 @@
 #
 # Commands that are irreversible AND outward-facing — publishing a package,
 # force-pushing over someone's commits, merging a PR, applying infrastructure,
-# deleting a bucket — are a decision only a human makes, so no automatic path may
-# approve them: not `yolo`, not an `auto_allow` entry, not the classifier, not a
-# remembered session approval. In an interactive tier they ASK (approve once, or
-# say no); where nobody can answer — a headless run, a sub-agent — they are
-# auto-denied. Listing one here is how you stop being asked: it authorizes that
-# class of command for good, which is the point of the key.
+# deleting a bucket — require explicit approval in every interactive mode.
+# Headless runs and sub-agents deny those requests. List a command here to
+# pre-authorize that class of command.
 #
 # Entries match the words the executor would run, IN ORDER, so a flag cannot
 # hide from them: `npm publish --tag next` is matched by "npm publish", and
@@ -222,46 +215,25 @@
 # example below uses tools that really are gated.
 # auto_allow = ["write_file", "apply_patch"]
 
-# Permission tier at startup:
-#   default       ask every time
-#   accept_edits  auto-approve edits inside the workspace
-#   auto          the classifier decides what is left
-#   yolo          everything except a write-root request and an unauthorized
-#                 irreversible command (see [sandbox] allow_irreversible)
+# Permission modes at startup
+#   default       prompt for gated calls without standing consent
+#   accept_edits  also approve workspace edits and bounded filesystem commands
+#   yolo          approve other eligible calls and give sandboxed commands
+#                 network access unless the sandbox network mode is never
 #
-# A project config may only be stricter than the global one (global auto with
-# project default, say); stepping up is always ignored, and auto/yolo may come
-# only from the global config, so a hostile repo cannot lift the gate.
+# Write-root requests and unauthorized irreversible commands require explicit
+# approval in every mode. Policy denials take precedence.
+# Project settings can only tighten the user's permission mode.
+# Omit default_mode to inherit the lower layer. An invalid value selects
+# the strictest mode, default, and generates a warning.
+# Shift+Tab cycles modes. At the YOLO prompt, press F2 followed by F7 to
+# confirm, or Shift+Tab again to return to default.
 #
-# "yolo" is not literally everything: request_write_root prompts at every tier.
-# Under yolo, sandboxed commands get ambient egress — with nobody in the loop, a
-# declaration-based prompt stops no attacker and only strands honest undeclared
-# commands offline. A sandbox network mode of "never" stays absolute even there.
-#
-# Shift+Tab cycles the tier at runtime.
-#
-# A deliberate limit of the auto tier: the classifier reads the command and its
-# argument text only, never the content about to be written — so what
-# write_file/apply_patch actually put on disk is not reviewed by it. (The top
-# risk tier, a network declaration and an offline backend still force a human.)
-# If that boundary matters to you, stay on default or accept_edits.
-#
-# One more rule, and it is not configurable: a command whose text carries any of
-# > < ` $ { } ( ) * ? [ ] — redirection, command substitution, variable, brace
-# or glob expansion, a subshell — always goes to a human and enters no
-# auto-approval path at all. So `echo $HOME`, `mkdir -p src/$MOD`,
-# `cp a "$HOME/b"` and `rm *.log` ask once even under accept_edits or auto:
-# an indirect form cannot be read statically for what it will finally do, and
-# handing it to a person is the deliberate conservative choice. An operand that
-# points outside the working directory by its spelling (`/...`, `~/...`,
-# `../...`) is excluded the same way: `git diff /dev/null ~/.ssh/id_rsa` asks,
-# `git diff main..HEAD` does not.
-#
-# A command that runs without a prompt (a trust-list hit, an identity remembered
-# for the session, an accept_edits file operation) never reaches a shell: the
-# words the policy parsed are execve'd directly, and `&&`, `;` and newlines are
-# sequenced by deep-code itself, while pipes and a background `&` ask. Only a
-# command a human approved as text goes through `sh -c`.
+# Trusted commands, remembered command approvals, and bounded filesystem edits
+# run using the parsed arguments. Commands with shell expansions, redirects,
+# or operands spelled outside the working directory go through the approval
+# gate. Explicit approval runs the original shell text. For calls eligible for
+# automatic approval, a matching auto_allow entry or yolo can also authorize it.
 # default_mode = "default"
 
 [stream]

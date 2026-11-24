@@ -156,9 +156,8 @@ impl AgentRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !reported.is_zero() {
-            // Cache counters fold alongside the cost for the same reason
-            // `record_classifier_cost` folds them: the session hit-rate and
-            // savings must cover every request billed to the session.
+            // Cache counters fold alongside cost so the session hit-rate and
+            // savings cover every request billed to the session.
             let mut state = self.state.lock().await;
             // Turn totals too, not only session: a sub-agent's spend is incurred
             // during THIS turn, so the turn's `cost` (what headless `-p` and the
@@ -195,8 +194,7 @@ impl AgentRuntime {
     /// has no approval gate — it cannot park the batch on a human-in-the-loop
     /// pause — so a gated dispatch (a writing role, whose spawn is the write
     /// authorization, or `network: true` under `[sandbox] network = "prompt"`)
-    /// leaves the group and takes the serial path, where standing consent, the
-    /// mode, the judge and the human all live. Read-only fan-out stays
+    /// leaves the group and takes the serial approval path. Read-only fan-out stays
     /// concurrent. Before this looked at the plan, a run of two gated
     /// dispatches failed as an error in every mode, Yolo included, while the
     /// same dispatch issued alone ran or prompted normally.
@@ -286,10 +284,10 @@ impl AgentRuntime {
                         .await;
                 }
                 Ok(ToolRunOutcome::ApprovalRequired { mut request }) => {
-                    if let Some(granted) = self.auto_approval_granted(&call, &request, cancel).await
+                    if let Some(authority) =
+                        self.auto_approval_granted(&call, request.authority).await
                     {
-                        // Audit trail: the gate fired but a standing consent
-                        // (session "a" or config auto_allow) resolved it.
+                        // Record an approval resolved without a prompt.
                         emit(
                             tx,
                             RuntimeEvent::ApprovalResolved {
@@ -298,13 +296,11 @@ impl AgentRuntime {
                                 decision: ApprovalDecision::Approved,
                             },
                         );
-                        // The layer that resolved the prompt decides whether a
-                        // shell may read the command (`AutoApproval::authority`).
                         let result = match self
                             .run_tool(
                                 &call,
                                 Some(ApprovalDecision::Approved),
-                                granted.authority(),
+                                authority,
                                 cancel,
                                 turn_id,
                                 tx,
@@ -318,11 +314,8 @@ impl AgentRuntime {
                             ),
                             Err(error) => ToolResult::error(&call, error.to_string()),
                         };
-                        // A standing consent resolved the gate WITHOUT putting
-                        // it in front of anyone: the `ApprovalResolved` above is
-                        // the only event a UI sees (no `ApprovalRequired`), so
-                        // the live view leaves this call quiet — no badge, folded
-                        // with the rest — and the record says the same.
+                        // This decision produced no ApprovalRequired event, so
+                        // the transcript records it as unasked.
                         self.record_tool_result(&call, result, Ask::Unasked, tx, turn_id.clone())
                             .await;
                         continue;
@@ -358,9 +351,8 @@ impl AgentRuntime {
                     // File I/O for a bounded diff at a human-in-the-loop
                     // pause: cheap relative to the wait, so no spawn_blocking.
                     request.preview = self.approval_preview(&call);
-                    // The loop checks the token only at call boundaries, and the
-                    // judge (or the root-grant resolution) awaited across this
-                    // one. A cancel that landed meanwhile must end the turn
+                    // The loop checks the token at call boundaries. A cancel
+                    // that lands while preparing the approval must end the turn
                     // here: parked, the prompt could only ever be answered into
                     // "cancelled" (`resolve_pending_tool` checks the token
                     // first) and no `TurnCancelled` would reach anyone until
@@ -1304,11 +1296,7 @@ mod tests {
             .network,
             "never stays absolute"
         );
-        for mode in [
-            PermissionMode::Default,
-            PermissionMode::AcceptEdits,
-            PermissionMode::Auto,
-        ] {
+        for mode in [PermissionMode::Default, PermissionMode::AcceptEdits] {
             assert!(
                 !yolo_ambient_network(plan.clone(), mode, NetworkMode::Prompt, false).network,
                 "{mode:?} must keep the human-gated behavior"

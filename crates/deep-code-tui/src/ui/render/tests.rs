@@ -596,8 +596,7 @@ fn extract_action_pulls_command_or_path() {
         extract_action("write_file", r#"{"path":"src/foo.rs","content":"x"}"#),
         "src/foo.rs"
     );
-    // The panel reads the same table as the judge: a job control action is
-    // its action and target, a dispatch is its task.
+    // A job control action shows its action and target. A dispatch shows its task.
     assert_eq!(
         extract_action(
             "job",

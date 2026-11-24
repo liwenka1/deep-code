@@ -1,6 +1,5 @@
 //! deep-code agent core library.
 
-mod approval_classifier;
 mod approval_preview;
 mod checkpoint;
 mod client;
@@ -51,10 +50,7 @@ mod workspace_tools;
 // runtime API, eval) actually consume, plus types reachable through those
 // items' signatures. Keeping it tight lets rustc's dead_code lint see the
 // rest of the crate. Re-add an export the day a consumer needs it.
-// The approval panel's action line and the auto-mode judge must read a gated
-// call through one key table; the TUI gets that table from here rather than
-// keeping a copy that drifts.
-pub use approval_classifier::action_summary;
+pub use approval_preview::action_summary;
 pub use checkpoint::{CheckpointId, CheckpointStore};
 pub use client::{AgentEventStream, LlmClient};
 // The model-visible context is only inspectable if its size is: `/context`

@@ -276,7 +276,7 @@ fn parse_print_args(mut args: Vec<String>) -> CliArgs {
                 let value = require_value(&mut args, "--permission-mode");
                 permission_mode = Some(PermissionMode::parse(&value).unwrap_or_else(|| {
                     eprintln!(
-                        "Invalid --permission-mode '{value}'. Use 'default', 'accept_edits', 'auto', or 'yolo'."
+                        "Invalid --permission-mode '{value}'. Use 'default', 'accept_edits', or 'yolo'."
                     );
                     std::process::exit(2);
                 }));
@@ -737,7 +737,7 @@ fn parse_github_command(mut args: Vec<String>) -> CliArgs {
                             Some(PermissionMode::parse(&value).unwrap_or_else(|| {
                                 eprintln!(
                                     "Invalid --permission-mode '{value}'. Use 'default', \
-                                     'accept_edits', 'auto', or 'yolo'."
+                                     'accept_edits', or 'yolo'."
                                 );
                                 std::process::exit(2);
                             }));
@@ -916,7 +916,7 @@ fn resolve_program_name(override_name: Option<String>, argv0: Option<String>) ->
 /// same set of flags the parser accepts.
 pub(crate) const PRINT_FLAG_GROUPS: [&str; 4] = [
     "[PROMPT] [--output-format text|json|stream-json]",
-    "[--permission-mode default|accept_edits|auto|yolo] [--timeout SECS]",
+    "[--permission-mode default|accept_edits|yolo] [--timeout SECS]",
     "[--verbose] [--add-dir DIR]...",
     "[--new | -c | --resume ID]",
 ];

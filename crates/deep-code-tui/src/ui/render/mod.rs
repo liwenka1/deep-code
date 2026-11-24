@@ -40,6 +40,7 @@ pub(crate) use transcript::sanitize_for_clipboard;
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(picker) = &app.resume_picker {
+        app.yolo_confirmation.set_visible(None);
         render_resume_picker(frame, picker, app.lang);
         // The overlay covers the composer: nothing of it is there to click.
         app.composer = None;
@@ -71,6 +72,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     // The composer's text rows, when it takes clicks. Under an approval panel it
     // is drawn but not editable — its keys are y/a/n — so it takes none.
     let (snapshot, composer_rows) = if searching {
+        app.yolo_confirmation.set_visible(None);
         let badges = status_badges(app);
         let badges_width: usize = badges.iter().map(Span::width).sum();
         let width = usize::from(area.width);
@@ -155,10 +157,14 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         let menu_height = menu.as_ref().map_or(0, |menu| {
             menu.items.len().min(COMPLETION_VISIBLE_ROWS) as u16 + 2
         });
-        // The draft takes the only row in a one-line pane. With more room,
-        // keep the footer, the editable text, and the selected completion.
-        // Reserve scrollback before expanding the menu.
-        let status_height = u16::from(area.height > 1);
+        let status_height = if app.yolo_confirmation_active() {
+            let badges = Line::from(status_badges(app));
+            let (_, rows) = yolo_confirmation_layout(&badges, area, app.lang);
+            rows.min(area.height)
+        } else {
+            // The draft takes the only row in a one-line pane.
+            u16::from(area.height > 1)
+        };
         let [transcript_height, menu_height, composer_height] = body_row_heights(
             area.height - status_height,
             visual_rows,
@@ -426,7 +432,6 @@ fn status_badges(app: &App) -> Vec<Span<'static>> {
     let mode = app.permission_mode();
     let chip_style = match mode {
         PermissionMode::Yolo => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        PermissionMode::Auto => Style::default().fg(Color::Yellow),
         PermissionMode::AcceptEdits => Style::default().fg(Color::Cyan),
         PermissionMode::Default => Style::default().fg(Color::DarkGray),
     };
@@ -449,6 +454,14 @@ fn status_badges(app: &App) -> Vec<Span<'static>> {
 
 fn render_status(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Rect) {
     let badges = status_badges(app);
+    if app.yolo_confirmation_active() {
+        let size = frame.area().as_size();
+        let hint = app.yolo_confirmation.hint(size);
+        let visible = render_yolo_confirmation(frame, area, badges, app.lang, hint);
+        app.yolo_confirmation.set_visible(visible.then_some(size));
+        return;
+    }
+    app.yolo_confirmation.set_visible(None);
 
     // An open Ctrl+R search owns the row while it lasts, ahead of an error or
     // a streaming turn: it takes the keys — Esc included — so a search that
@@ -475,6 +488,76 @@ fn render_status(frame: &mut Frame<'_>, app: &mut App, area: ratatui::layout::Re
     } else {
         render_idle_status(frame, area, badges, app);
     }
+}
+
+fn render_yolo_confirmation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    badges: Vec<Span<'_>>,
+    lang: Lang,
+    hint: Option<TextId>,
+) -> bool {
+    if area.is_empty() {
+        return false;
+    }
+    let badges = Line::from(badges);
+    let (fits, rows) = yolo_confirmation_layout(&badges, area, lang);
+    let buffer = frame.buffer_mut();
+    let (x, y) = if rows == 1 {
+        buffer.set_line(area.x, area.y, &badges, area.width)
+    } else {
+        let hint_y = area.bottom() - 1;
+        if rows == 2 && area.height > 1 {
+            buffer.set_line(area.x, area.y, &badges, area.width);
+        } else {
+            // Keep the sandbox badge first in priority when the pane is too
+            // short to give each badge a row above the resize hint.
+            for (row, badge) in (area.y..hint_y).rev().zip(badges.spans.iter().rev()) {
+                buffer.set_span(area.x, row, badge, area.width);
+            }
+        }
+        (area.x, hint_y)
+    };
+    let style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let text = if fits {
+        tr(lang, TextId::PermModeYoloWarning)
+    } else {
+        tr(lang, TextId::PermModeYoloResize)
+    };
+    let (x, _) = buffer.set_stringn(x, y, text, usize::from(area.right() - x), style);
+    if fits && let Some(hint) = hint {
+        buffer.set_stringn(x, y, tr(lang, hint), usize::from(area.right() - x), style);
+    }
+    fits
+}
+
+/// Whether the full prompt fits and how many footer rows it needs.
+fn yolo_confirmation_layout(badges: &Line<'_>, area: Rect, lang: Lang) -> (bool, u16) {
+    let width = usize::from(area.width);
+    let available = width.saturating_sub(badges.width());
+    let warning = status_text_width(tr(lang, TextId::PermModeYoloWarning));
+    let hint = status_text_width(tr(lang, TextId::PermModeYoloConfirm))
+        .max(status_text_width(tr(lang, TextId::PermModeYoloRetry)))
+        .max(status_text_width(tr(lang, TextId::PermModeYoloFinish)));
+    let prompt_width = warning + hint;
+    if prompt_width <= available {
+        return (true, 1);
+    }
+    let badge_rows = if badges.width().saturating_sub(1) <= width {
+        1
+    } else {
+        badges.spans.len() as u16
+    };
+    let separate_rows = badge_rows + 1;
+    if prompt_width <= width && area.height >= separate_rows {
+        return (true, separate_rows);
+    }
+    if status_text_width(tr(lang, TextId::PermModeYoloResize)) <= available {
+        return (false, 1);
+    }
+    (false, separate_rows)
 }
 
 fn render_error_status(

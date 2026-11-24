@@ -9,18 +9,91 @@ use crossterm::event::{
     MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
+use ratatui::{Terminal, backend::Backend};
 
-use crate::app::{App, QuitKey};
+use crate::app::{App, QuitKey, YoloConfirmation, YoloKey};
 use deep_code_agent::i18n::{TextId, tr_with};
 
 use super::AppTerminal;
+
+pub(super) struct YoloKeys {
+    held: [bool; 2],
+    reports_releases: bool,
+}
+
+impl YoloKeys {
+    pub(super) fn new(reports_releases: bool) -> Self {
+        Self {
+            held: [false; 2],
+            reports_releases,
+        }
+    }
+
+    fn fresh_press(&mut self, key: YoloKey, kind: KeyEventKind) -> bool {
+        let was_held =
+            std::mem::replace(&mut self.held[key as usize], kind != KeyEventKind::Release);
+        self.reports_releases |= kind == KeyEventKind::Release;
+        kind == KeyEventKind::Press && (!self.reports_releases || !was_held)
+    }
+
+    fn focus_changed(&mut self, app: &mut App, held: [bool; 2]) {
+        self.held = held;
+        app.cancel_yolo_confirmation();
+    }
+}
+
+fn focused_yolo_keys() -> [bool; 2] {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F2, VK_F7};
+
+        // Key releases may have gone to another window. The high bit is the
+        // current key-down state.
+        [VK_F2, VK_F7].map(|key| {
+            // SAFETY: Both inputs are defined Windows virtual keys.
+            let state = unsafe { GetAsyncKeyState(i32::from(key)) };
+            state < 0
+        })
+    }
+    #[cfg(not(windows))]
+    [false; 2]
+}
+
+#[cfg(windows)]
+pub(super) fn console_input_empty() -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Console::GetNumberOfConsoleInputEvents;
+
+    // A nonblocking Crossterm poll can skip a native record (such as Shift
+    // release) and return false while the console still has queued keys.
+    let console = std::fs::File::open("CONIN$")?;
+    let mut count = 0;
+    // SAFETY: The console handle and writable count both live through the call.
+    if unsafe { GetNumberOfConsoleInputEvents(console.as_raw_handle(), &mut count) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(count == 0)
+    }
+}
 
 /// Route one terminal event; returns whether a redraw is needed.
 pub(super) fn dispatch_terminal_event(
     app: &mut App,
     terminal: &mut AppTerminal,
+    yolo_keys: &mut YoloKeys,
     event: Event,
 ) -> Result<bool> {
+    if let Event::Key(key) = &event {
+        let yolo_key = match key.code {
+            KeyCode::F(2) => Some(YoloKey::F2),
+            KeyCode::F(7) => Some(YoloKey::F7),
+            _ => None,
+        };
+        if let Some(yolo_key) = yolo_key {
+            return Ok(handle_yolo_key(app, terminal, yolo_keys, yolo_key, *key));
+        }
+        yolo_keys.reports_releases |= key.kind == KeyEventKind::Release;
+    }
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             // Windows fallback: crossterm's console event source does not
@@ -51,7 +124,7 @@ pub(super) fn dispatch_terminal_event(
                     }
                 }
                 if let Some(event) = leftover {
-                    dispatch_terminal_event(app, terminal, event)?;
+                    dispatch_terminal_event(app, terminal, yolo_keys, event)?;
                 }
             } else {
                 handle_key(app, key);
@@ -78,13 +151,49 @@ pub(super) fn dispatch_terminal_event(
             }
             Ok(true)
         }
-        Event::Resize(..) => Ok(true),
-        _ => Ok(false),
+        Event::Resize(..) => {
+            app.yolo_confirmation.set_visible(None);
+            Ok(true)
+        }
+        Event::FocusLost | Event::FocusGained => {
+            let held = if matches!(event, Event::FocusGained) {
+                focused_yolo_keys()
+            } else {
+                [false; 2]
+            };
+            yolo_keys.focus_changed(app, held);
+            Ok(true)
+        }
     }
+}
+
+fn handle_yolo_key<B: Backend>(
+    app: &mut App,
+    terminal: &Terminal<B>,
+    keys: &mut YoloKeys,
+    yolo_key: YoloKey,
+    key: KeyEvent,
+) -> bool {
+    if !keys.fresh_press(yolo_key, key.kind) {
+        return false;
+    }
+    app.clear_quit_guard();
+    if !key.modifiers.is_empty() {
+        app.cancel_yolo_confirmation();
+    } else if let YoloConfirmation::Ready { size, .. } = app.yolo_confirmation
+        && terminal.size().ok() != Some(size)
+    {
+        // The key can reach us before the terminal's resize event.
+        app.yolo_confirmation.set_visible(None);
+    } else {
+        app.handle_yolo_key(yolo_key);
+    }
+    true
 }
 
 /// A terminal may deliver an IME commit as a burst of text keys.
 fn handle_paste(app: &mut App, text: String) {
+    app.cancel_yolo_confirmation();
     if app.history_search_focused() {
         app.history_search_append(&App::normalize_paste_line_endings(text));
     } else {
@@ -171,7 +280,9 @@ fn drain_key_burst(first: KeyEvent) -> Result<(Vec<KeyEvent>, Option<Event>)> {
     let mut leftover = None;
     while event::poll(Duration::from_millis(1))? {
         match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press || matches!(key.code, KeyCode::F(2 | 7)) =>
+            {
                 if key_text_payload(&key).is_some() {
                     keys.push(key);
                 } else {
@@ -212,9 +323,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     if quit_key.is_none() || app.quit_armed.as_ref().map(|(armed, _)| *armed) != quit_key {
         app.clear_quit_guard();
     }
-    // Any key other than Shift+Tab disarms the pending-Yolo confirm.
-    if !is_shift_tab(&key) {
-        app.clear_yolo_arm();
+    let shift_tab = is_shift_tab(&key);
+    if !shift_tab {
+        app.cancel_yolo_confirmation();
     }
 
     // The `/resume` modal is a full-screen overlay: it owns all keys while open.
@@ -362,8 +473,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
     }
 
-    // Shift+Tab cycles the permission mode (default → accept-edits → auto → yolo).
-    if is_shift_tab(&key) {
+    // Shift+Tab cycles permissions and can open or skip the YOLO confirmation.
+    if shift_tab {
         // Dismiss the completion popup if open — cycling the mode is not a
         // completion action, and leaving the menu up over the input misleads.
         app.close_completion();
@@ -492,6 +603,7 @@ mod tests {
         );
         assert_eq!(key_text_payload(&plain(KeyCode::Up)), None);
         assert_eq!(key_text_payload(&plain(KeyCode::Backspace)), None);
+        assert_eq!(key_text_payload(&plain(KeyCode::F(2))), None);
     }
 
     /// A decision key that was already in the queue when the approval arrived
@@ -808,6 +920,367 @@ mod tests {
             .collect();
         let caret = terminal.get_cursor_position().unwrap();
         (rows, (caret.x, caret.y))
+    }
+
+    fn show_yolo_key_hint(terminal: &mut Terminal<TestBackend>, app: &mut App) -> Vec<String> {
+        draw(terminal, app);
+        app.yolo_confirmation.on_input_idle();
+        let rows = draw(terminal, app).0;
+        app.yolo_confirmation.on_input_idle();
+        rows
+    }
+
+    fn press_yolo_key(
+        app: &mut App,
+        terminal: &Terminal<TestBackend>,
+        keys: &mut YoloKeys,
+        key: YoloKey,
+    ) {
+        let code = match key {
+            YoloKey::F2 => KeyCode::F(2),
+            YoloKey::F7 => KeyCode::F(7),
+        };
+        handle_yolo_key(
+            app,
+            terminal,
+            keys,
+            key,
+            KeyEvent::new(code, KeyModifiers::NONE),
+        );
+    }
+
+    #[test]
+    fn yolo_needs_an_explicit_confirmation_and_a_complete_warning_while_streaming() {
+        use deep_code_agent::PermissionMode;
+
+        let mut app = en_app("");
+        app.permission_mode.set(PermissionMode::AcceptEdits);
+        app.sandbox_off = true;
+        app.is_streaming = true;
+        app.streaming_since = Some(std::time::Instant::now());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let shift_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        let mut keys = YoloKeys::new(false);
+
+        let (rows, _) = draw(&mut terminal, &mut app);
+        assert!(rows.last().unwrap().contains("generating"));
+
+        handle_key(&mut app, shift_tab);
+        let (rows, _) = draw(&mut terminal, &mut app);
+        let footer = rows.last().unwrap();
+        assert!(footer.contains("[unsandboxed]"), "{footer}");
+        assert!(
+            footer.contains(app.tr(TextId::PermModeYoloWarning)),
+            "{footer}"
+        );
+        assert!(!footer.contains("F2") && !footer.contains("F7"), "{footer}");
+
+        // A poll can go idle before the key hint has been drawn.
+        app.yolo_confirmation.on_input_idle();
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F7);
+        let (rows, _) = draw(&mut terminal, &mut app);
+        assert!(!rows.last().unwrap().contains("F2"));
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::AcceptEdits);
+
+        handle_key(&mut app, shift_tab);
+        let rows = show_yolo_key_hint(&mut terminal, &mut app);
+        assert!(
+            rows.last()
+                .unwrap()
+                .contains(app.tr(TextId::PermModeYoloConfirm))
+        );
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::AcceptEdits);
+        terminal.backend_mut().resize(41, 24);
+        // F7 can arrive before the resize event and the next draw.
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F7);
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::AcceptEdits);
+        let (rows, _) = draw(&mut terminal, &mut app);
+        let footer = rows.last().unwrap();
+        assert!(
+            footer.contains(app.tr(TextId::PermModeYoloResize)),
+            "{footer}"
+        );
+        assert!(!footer.contains("F2"), "{footer}");
+        app.yolo_confirmation.on_input_idle();
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::AcceptEdits);
+        handle_key(&mut app, shift_tab);
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::AcceptEdits);
+        handle_key(&mut app, shift_tab);
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::Default);
+
+        terminal.backend_mut().resize(80, 24);
+        handle_key(&mut app, shift_tab);
+        handle_key(&mut app, shift_tab);
+        show_yolo_key_hint(&mut terminal, &mut app);
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+
+        // An unbracketed short paste replays as text keys.
+        let pasted = "Yes";
+        assert!(!burst_looks_like_paste(pasted));
+        for ch in pasted.chars() {
+            let modifiers = if ch.is_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            handle_key(&mut app, KeyEvent::new(KeyCode::Char(ch), modifiers));
+        }
+        assert_eq!(app.input, pasted);
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F7);
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::AcceptEdits);
+
+        handle_key(&mut app, shift_tab);
+        show_yolo_key_hint(&mut terminal, &mut app);
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+        let (rows, _) = draw(&mut terminal, &mut app);
+        assert!(
+            rows.last()
+                .unwrap()
+                .contains(app.tr(TextId::PermModeYoloFinish))
+        );
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F7);
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::Yolo);
+        assert!(app.is_streaming);
+    }
+
+    #[test]
+    fn queued_input_from_the_hint_draw_requires_retrying_f2() {
+        use deep_code_agent::PermissionMode;
+
+        let mut app = en_app("");
+        app.permission_mode.set(PermissionMode::AcceptEdits);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut keys = YoloKeys::new(false);
+        app.cycle_permission_mode();
+        draw(&mut terminal, &mut app);
+        app.yolo_confirmation.on_input_idle();
+
+        let (rows, _) = draw(&mut terminal, &mut app);
+        assert!(
+            rows.last()
+                .unwrap()
+                .contains(app.tr(TextId::PermModeYoloConfirm))
+        );
+        // Output can block during that draw while both keys enter the queue.
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F7);
+        let (rows, _) = draw(&mut terminal, &mut app);
+        let footer = rows.last().unwrap();
+        assert!(footer.contains(app.tr(TextId::PermModeYoloWarning)));
+        assert!(!footer.contains("F2") && !footer.contains("F7"), "{footer}");
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::AcceptEdits);
+
+        assert!(app.yolo_confirmation.on_input_idle());
+        let (rows, _) = draw(&mut terminal, &mut app);
+        assert!(
+            rows.last()
+                .unwrap()
+                .contains(app.tr(TextId::PermModeYoloRetry))
+        );
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+        let (rows, _) = draw(&mut terminal, &mut app);
+        assert!(
+            rows.last()
+                .unwrap()
+                .contains(app.tr(TextId::PermModeYoloFinish))
+        );
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F7);
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::Yolo);
+    }
+
+    #[test]
+    fn yolo_focus_changes_cancel_the_attempt_and_refresh_held_keys() {
+        use deep_code_agent::PermissionMode;
+
+        let mut app = en_app("");
+        app.permission_mode.set(PermissionMode::AcceptEdits);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut keys = YoloKeys::new(true);
+        app.cycle_permission_mode();
+        show_yolo_key_hint(&mut terminal, &mut app);
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+
+        keys.focus_changed(&mut app, [false; 2]);
+        assert_eq!(app.yolo_confirmation, YoloConfirmation::Inactive);
+        // F2 was released in the other window and F7 is down as focus returns.
+        keys.focus_changed(&mut app, [false, true]);
+        app.cycle_permission_mode();
+        show_yolo_key_hint(&mut terminal, &mut app);
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F7);
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::AcceptEdits);
+        handle_yolo_key(
+            &mut app,
+            &terminal,
+            &mut keys,
+            YoloKey::F7,
+            KeyEvent::new_with_kind(KeyCode::F(7), KeyModifiers::NONE, KeyEventKind::Release),
+        );
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F7);
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::Yolo);
+    }
+
+    #[test]
+    fn a_held_key_from_before_the_yolo_prompt_cannot_enable_yolo() {
+        use deep_code_agent::PermissionMode;
+
+        for reports_releases in [false, true] {
+            let mut app = en_app("");
+            app.permission_mode.set(PermissionMode::AcceptEdits);
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut keys = YoloKeys::new(reports_releases);
+            press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+            app.cycle_permission_mode();
+            show_yolo_key_hint(&mut terminal, &mut app);
+
+            press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+            press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+            assert_eq!(app.runtime.permission_mode(), PermissionMode::AcceptEdits);
+            if reports_releases {
+                assert!(matches!(
+                    app.yolo_confirmation,
+                    YoloConfirmation::Ready {
+                        step: crate::app::YoloStep::Start,
+                        ..
+                    }
+                ));
+                handle_yolo_key(
+                    &mut app,
+                    &terminal,
+                    &mut keys,
+                    YoloKey::F2,
+                    KeyEvent::new_with_kind(
+                        KeyCode::F(2),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Release,
+                    ),
+                );
+                press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+            }
+            press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F7);
+            assert_eq!(app.runtime.permission_mode(), PermissionMode::Yolo);
+        }
+    }
+
+    #[test]
+    fn yolo_prompt_uses_its_own_row_in_a_split_pane() {
+        use deep_code_agent::PermissionMode;
+
+        for (sandbox_off, badges) in [
+            (false, "[accept-edits]"),
+            (true, "[accept-edits] [unsandboxed]"),
+        ] {
+            let mut app = en_app("");
+            app.permission_mode.set(PermissionMode::AcceptEdits);
+            app.sandbox_off = sandbox_off;
+            let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            let mut keys = YoloKeys::new(false);
+            app.cycle_permission_mode();
+
+            let rows = show_yolo_key_hint(&mut terminal, &mut app);
+            assert_eq!(rows[22].trim_end(), badges);
+            assert_eq!(
+                rows[23].trim_end(),
+                format!(
+                    "{}{}",
+                    app.tr(TextId::PermModeYoloWarning),
+                    app.tr(TextId::PermModeYoloConfirm)
+                )
+            );
+            press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+            let (rows, _) = draw(&mut terminal, &mut app);
+            assert!(
+                rows[23]
+                    .trim_end()
+                    .ends_with(app.tr(TextId::PermModeYoloFinish))
+            );
+            press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F7);
+            assert_eq!(app.runtime.permission_mode(), PermissionMode::Yolo);
+        }
+    }
+
+    #[test]
+    fn narrow_yolo_footer_shows_the_resize_hint_and_both_badges() {
+        use deep_code_agent::PermissionMode;
+
+        let mut app = en_app("");
+        app.permission_mode.set(PermissionMode::AcceptEdits);
+        app.sandbox_off = true;
+        let mut terminal = Terminal::new(TestBackend::new(27, 24)).unwrap();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        );
+
+        let (rows, _) = draw(&mut terminal, &mut app);
+        assert_eq!(rows[21].trim_end(), "[accept-edits]");
+        assert_eq!(rows[22].trim_end(), "[unsandboxed]");
+        assert_eq!(rows[23].trim_end(), app.tr(TextId::PermModeYoloResize));
+
+        app.yolo_confirmation.on_input_idle();
+        press_yolo_key(&mut app, &terminal, &mut YoloKeys::new(false), YoloKey::F2);
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::AcceptEdits);
+    }
+
+    #[tokio::test]
+    async fn yolo_confirmation_key_cannot_approve_a_replacement_write_root_prompt() {
+        use deep_code_agent::{
+            ApprovalAuthority, ApprovalId, ApprovalRequest, PermissionMode,
+            REQUEST_WRITE_ROOT_TOOL, RiskLevel,
+        };
+
+        let mut app = en_app("");
+        app.permission_mode.set(PermissionMode::AcceptEdits);
+        app.is_streaming = true;
+        app.streaming_since = Some(std::time::Instant::now());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        );
+        let mut keys = YoloKeys::new(false);
+        let rows = show_yolo_key_hint(&mut terminal, &mut app);
+        assert!(
+            rows.last()
+                .unwrap()
+                .contains(app.tr(TextId::PermModeYoloConfirm))
+        );
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F2);
+
+        let approval_id = ApprovalId::new();
+        let target = "/tmp/requested-root";
+        app.park_approval(ApprovalRequest {
+            approval_id: approval_id.clone(),
+            authority: ApprovalAuthority::HumanOnly,
+            network: false,
+            call_id: "call_root".to_string(),
+            tool_name: REQUEST_WRITE_ROOT_TOOL.to_string(),
+            description: "Request write access".to_string(),
+            arguments: serde_json::json!({ "path": target }),
+            risk_level: RiskLevel::High,
+            requires_sandbox: false,
+            read_only: false,
+            matched_rule: None,
+            justification: Some("Write build output".to_string()),
+            resolved_target: Some(target.to_string()),
+            preview: None,
+            safety_notes: Vec::new(),
+        });
+        draw(&mut terminal, &mut app);
+        assert!(app.approval_armed);
+        app.approval_shown_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+
+        press_yolo_key(&mut app, &terminal, &mut keys, YoloKey::F7);
+        assert_eq!(
+            app.pending_approval
+                .as_ref()
+                .map(|request| &request.approval_id),
+            Some(&approval_id)
+        );
+        assert_eq!(app.runtime.permission_mode(), PermissionMode::AcceptEdits);
     }
 
     /// The cell a glyph was drawn in (the left one, for a wide glyph). The
