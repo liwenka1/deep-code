@@ -13,7 +13,7 @@ use crate::tool::ToolError;
 const CHECKPOINT_DIR: &str = ".deep-code/checkpoints";
 /// `.deep-code` and `checkpoints` inside it — the levels deep-code owns.
 const OWNED_STORAGE_DIRS: usize = 2;
-/// Directories a before-turn snapshot never copies (and `restore` never
+/// Directories a checkpoint never copies (and `restore` never
 /// clears), because they are generated, vendored or dependency trees a user
 /// does not edit by hand — copying them is what turned a 20k-source workspace
 /// with a 100k-file `.venv`/`build`/`dist` beside it into a 16-second stall per
@@ -64,7 +64,7 @@ const SKIP_DIRS: &[&str] = &[
 /// Matching these at any depth (the `c2371bf` behavior) silently dropped such
 /// files from `/restore` with a "restored" report.
 const SKIP_DIRS_TOP_LEVEL: &[&str] = &["build", "dist"];
-/// Ceiling on entries one before-turn snapshot copies. Past it the snapshot is
+/// Ceiling on entries one snapshot copies. Past it the snapshot is
 /// abandoned and per-turn checkpoints are disabled for the session (one
 /// warning, then silent) rather than paying a multi-second copy every turn.
 /// The count is of entries actually visited — [`SKIP_DIRS`] are pruned before
@@ -78,7 +78,7 @@ pub(crate) const MAX_SNAPSHOT_ENTRIES: usize = 20_000;
 /// tree is copied.
 const CANCEL_CHECK_INTERVAL: usize = 512;
 /// Default retention: snapshots beyond this count are pruned oldest-first.
-/// Every turn creates one before-turn snapshot, so without a cap the storage
+/// Each completed turn creates a snapshot, so without a cap the storage
 /// grows by one workspace copy per turn. On CoW filesystems (APFS, btrfs/XFS)
 /// snapshots clone rather than rewrite, so unchanged files cost no extra disk
 /// and the cap mostly bounds directory count, not bytes.
@@ -88,7 +88,7 @@ pub const DEFAULT_MAX_SNAPSHOTS: usize = 20;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CheckpointId(pub String);
 
-/// Why a before-turn snapshot produced no checkpoint. Distinct from an error:
+/// Why a snapshot produced no checkpoint. Distinct from an error:
 /// the turn goes on regardless, and neither reason is a failure to surface as
 /// one — a cancel is what the user asked for, and an over-budget workspace is a
 /// deliberate, one-time downgrade.
@@ -101,7 +101,7 @@ pub enum SnapshotSkip {
     TooLarge { first: bool },
 }
 
-/// What a before-turn snapshot did: created a checkpoint, or skipped with a
+/// What a snapshot did: created a checkpoint, or skipped with a
 /// reason the turn can continue past.
 #[derive(Debug, Clone)]
 pub enum SnapshotOutcome {
@@ -112,7 +112,7 @@ pub enum SnapshotOutcome {
     Skipped(SnapshotSkip),
 }
 
-/// Side-storage workspace snapshots (taken before each turn).
+/// Side-storage workspace snapshots.
 #[derive(Debug, Clone)]
 pub struct CheckpointStore {
     workspace: PathBuf,
@@ -190,14 +190,14 @@ impl CheckpointStore {
     /// Capture a full workspace snapshot under side storage, then prune the
     /// oldest snapshots beyond the retention cap.
     ///
-    /// `cancel` aborts a large copy promptly (the before-turn snapshot must not
+    /// `cancel` aborts a large copy promptly (the snapshot must not
     /// hold Esc/quit hostage for the length of a full-tree copy), and the copy
     /// is bounded by [`MAX_SNAPSHOT_ENTRIES`]: a workspace above it disables
     /// per-turn checkpoints for the session rather than paying the copy every
     /// turn. Both come back as [`SnapshotOutcome::Skipped`] — the turn continues
     /// either way — while a real I/O failure is still an `Err`.
     ///
-    /// Crate-private: its only caller is the runtime's before-turn hook, and it
+    /// Crate-private: its only caller is the runtime's completed-turn hook, and it
     /// returns [`SnapshotOutcome`], which is not re-exported — as a `pub` method
     /// on the re-exported [`CheckpointStore`] it offered outside callers a
     /// result they could not name, let alone match on.
@@ -206,6 +206,9 @@ impl CheckpointStore {
         label: &str,
         cancel: &CancellationToken,
     ) -> Result<SnapshotOutcome, ToolError> {
+        if cancel.is_cancelled() {
+            return Ok(SnapshotOutcome::Skipped(SnapshotSkip::Cancelled));
+        }
         // The storage root was validated once, at construction. Between then and
         // now a sandboxed command (a repo's build.rs run by a default-trusted
         // `cargo check`, say) can swap `.deep-code/checkpoints` for a symlink —
@@ -223,8 +226,9 @@ impl CheckpointStore {
             }));
         }
         let id = format!(
-            "{}_{}",
+            "{}_{}_{}",
             sanitize_label(label),
+            uuid::Uuid::new_v4().simple(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_millis())
@@ -248,7 +252,11 @@ impl CheckpointStore {
             Some(MAX_SNAPSHOT_ENTRIES),
             cancel,
         ) {
-            Ok(CopyStatus::Done) => {}
+            Ok(CopyStatus::Done) if !cancel.is_cancelled() => {}
+            Ok(CopyStatus::Done) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Ok(SnapshotOutcome::Skipped(SnapshotSkip::Cancelled));
+            }
             Ok(CopyStatus::Aborted) => {
                 // Cancel vs. budget: the token is the only other abort cause, so
                 // if it is not set the copy hit the entry ceiling.
@@ -575,7 +583,7 @@ fn copy_tree(
         }
         if mode == CopyMode::Snapshot && should_skip(rel) {
             // Prune, don't just `continue`: a bare `continue` still descends.
-            // Every before-turn snapshot therefore walked all of `node_modules`,
+            // Every snapshot therefore walked all of `node_modules`,
             // `target` and `.git` — and, because snapshots live at
             // `.deep-code/checkpoints` INSIDE the workspace, all of the
             // retained snapshots too, so the per-turn stat count grew with the

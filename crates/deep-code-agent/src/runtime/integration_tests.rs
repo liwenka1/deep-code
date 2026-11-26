@@ -1258,12 +1258,7 @@ async fn session_consent_on_an_agent_dispatch_does_not_cover_later_dispatches() 
     assert_eq!(ran.load(SeqCst), 2);
 }
 
-/// A failed before-turn snapshot is a degradation, not the end of the turn:
-/// `drive_turn` spawns the model loop right after it either way. It used to be
-/// emitted as `Error`, which every consumer treats as terminal — the TUI
-/// stopped observing without cancelling, so the turn ran on unobserved, tools
-/// executing and an approval parking with nobody to answer. Now it is a
-/// `Warning`, and the turn's own events follow it on the same channel.
+/// A failed snapshot still delivers the completed turn on its event stream.
 #[cfg(unix)]
 #[tokio::test]
 async fn snapshot_failure_warns_and_the_turn_still_runs_observed() {
@@ -1303,7 +1298,7 @@ async fn snapshot_failure_warns_and_the_turn_still_runs_observed() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            RuntimeEvent::Warning { message } if message.contains("before_turn")
+            RuntimeEvent::Warning { message } if message.contains("after_turn")
         )),
         "the failed snapshot must be surfaced as a warning: {events:?}"
     );
@@ -1787,23 +1782,38 @@ async fn turn_snapshots_emit_checkpoint_events() {
             _ => None,
         })
         .collect();
-    // Exactly one snapshot per turn: before_turn is what rewind/restore key
-    // off; an end-of-turn copy would duplicate the next turn's before_turn.
-    assert_eq!(checkpoints, vec!["before_turn"]);
+    assert_eq!(checkpoints, vec!["after_turn"]);
 }
 
 #[tokio::test]
 async fn persistent_runtime_records_checkpoint_metadata() {
     let workspace = tempfile::tempdir().unwrap();
-    let client = ScriptedClient::new(vec![vec![
-        AgentEvent::TextDelta {
-            text: "done".to_string(),
-        },
-        AgentEvent::Done { usage: None },
-    ]]);
+    let path = workspace.path().join("example.txt");
+    std::fs::write(&path, "before").unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut tools = ToolRegistry::default();
+    tools
+        .register(BlockingEchoTool {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        })
+        .unwrap();
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("tool", AutoEchoTool::NAME, "{}"),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        ok_turn(),
+        vec![AgentEvent::Error {
+            message: "provider refused".into(),
+        }],
+    ]);
     let runtime = AgentRuntime::with_new_session(
         client,
-        ToolRegistry::default(),
+        tools,
         "system",
         workspace.path(),
         &crate::config::AgentConfig::builtin(),
@@ -1813,7 +1823,13 @@ async fn persistent_runtime_records_checkpoint_metadata() {
     let session_id = runtime.session_id().await.expect("session id");
 
     let mut rx = runtime.submit_user("hi").await;
+    started.notified().await;
+    std::fs::write(&path, "at the end of the first turn").unwrap();
+    release.notify_one();
     drain(&mut rx).await;
+    std::fs::write(&path, "between turns").unwrap();
+    let mut rejected = runtime.submit_user("rejected").await;
+    drain(&mut rejected).await;
     runtime.shutdown().await;
 
     let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
@@ -1823,27 +1839,24 @@ async fn persistent_runtime_records_checkpoint_metadata() {
         record
             .entries
             .iter()
-            .filter(|entry| !matches!(entry.kind, crate::session_entry::EntryKind::System { .. }))
+            .filter(
+                |entry| !matches!(entry.kind, crate::session_entry::EntryKind::System { .. })
+                    && entry.unsent.is_none()
+            )
             .all(|entry| entry.turn_id.as_ref() == Some(turn_id))
     );
-    assert!(
-        record
-            .checkpoints
-            .iter()
-            .all(|checkpoint| &checkpoint.turn_id == turn_id)
-    );
-    assert!(
-        record
-            .checkpoints
-            .iter()
-            .any(|checkpoint| checkpoint.label == "before_turn")
-    );
-    assert!(
-        record
-            .checkpoints
-            .iter()
-            .all(|checkpoint| checkpoint.label != "after_turn"),
-        "end-of-turn snapshots were removed as redundant with the next before_turn"
+    let [checkpoint] = &record.checkpoints[..] else {
+        panic!("expected one checkpoint for the successful turn");
+    };
+    assert_eq!(&checkpoint.turn_id, turn_id);
+    assert_eq!(checkpoint.label, "after_turn");
+    let snapshot = workspace
+        .path()
+        .join(".deep-code/checkpoints")
+        .join(&checkpoint.id.0);
+    assert_eq!(
+        std::fs::read_to_string(snapshot.join("example.txt")).unwrap(),
+        "at the end of the first turn"
     );
 }
 

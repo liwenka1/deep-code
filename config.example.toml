@@ -64,7 +64,7 @@
 # timeout_secs = 60
 
 [checkpoints]
-# Snapshot retention. One workspace snapshot is taken before each turn; beyond
+# Snapshot retention. A workspace snapshot is taken after each completed turn. Beyond
 # this count the oldest are deleted. Zero keeps every snapshot.
 # max_snapshots = 20
 

@@ -479,11 +479,14 @@ impl AgentRuntime {
             }
 
             if calls.is_empty() {
-                // No end-of-turn snapshot: it would be near-identical to the
-                // next turn's before_turn (only edits the user makes between
-                // turns differ), and rewind/restore key off before_turn — so
-                // one snapshot per turn buys the same protection at half the
-                // copy cost and twice the retained history.
+                // Keep new turns out until the final reply and its workspace
+                // checkpoint describe the same boundary.
+                let turn_start = self.turn_start.lock().await;
+                if self.live_turn_id().await.as_ref() != Some(&turn_id) || cancel.is_cancelled() {
+                    drop(turn_start);
+                    self.finish_turn_cancelled(&turn_id, tx).await;
+                    return;
+                }
                 let usage = last_usage.clone();
                 let telemetry = self
                     .build_turn_telemetry(
@@ -494,7 +497,9 @@ impl AgentRuntime {
                         stream_retries,
                     )
                     .await;
+                self.snapshot_completed_turn(&turn_id, &cancel, tx).await;
                 self.finish_turn(&turn_id).await;
+                drop(turn_start);
                 // Publish the completed save result, not the previous batch's
                 // error (which may still be empty while this write fails).
                 if let Some(persistence) = &self.persistence {

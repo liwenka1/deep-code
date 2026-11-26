@@ -736,9 +736,6 @@ impl AgentRuntime {
                         .await;
                     return;
                 }
-                runtime
-                    .snapshot_turn(&turn_id, "before_turn", &cancel, &tx)
-                    .await;
                 runtime.run_loop(turn_id.clone(), cancel, &tx).await;
             };
             runtime.supervise_turn(&turn_id, &tx, work).await;
