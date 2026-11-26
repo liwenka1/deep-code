@@ -6,6 +6,7 @@
 
 mod export;
 mod json;
+mod restore;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub use json::JsonSessionStore;
+pub use restore::RestorePoint;
 
 /// Make sure `<state_dir>/.gitignore` excludes everything, for every writer of
 /// `<workspace>/.deep-code` — not just whichever one happens to run first.

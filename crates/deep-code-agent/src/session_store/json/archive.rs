@@ -1,6 +1,7 @@
 //! Immutable, authenticated transcript segments written before compaction.
 
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 use cap_fs_ext::DirExt;
 use tokio_util::sync::CancellationToken;
@@ -55,7 +56,7 @@ impl JsonSessionStore {
         &self,
         entries: &[Arc<SessionEntry>],
         cancel: &CancellationToken,
-        mut visit: impl FnMut(SessionRecord) -> Result<(), SessionStoreError>,
+        mut visit: impl FnMut(SessionRecord) -> Result<ControlFlow<()>, SessionStoreError>,
     ) -> Result<(), SessionStoreError> {
         let Some(mut next) = archive_id(entries)? else {
             return Ok(());
@@ -77,7 +78,9 @@ impl JsonSessionStore {
                 });
             }
             let parent = archive_id(&record.entries)?;
-            visit(record)?;
+            if visit(record)?.is_break() {
+                return Ok(());
+            }
             let Some(parent) = parent else {
                 return Ok(());
             };
@@ -95,7 +98,7 @@ impl JsonSessionStore {
         let mut segments = Vec::new();
         self.visit_archives(&record.entries, cancel, |archive| {
             segments.push(archive.entries);
-            Ok(())
+            Ok(ControlFlow::Continue(()))
         })?;
         // The first summary sits after the system prompt. Replace it at that
         // position, preserving the system prompt and retained tail.

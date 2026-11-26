@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
+use std::ops::ControlFlow;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -88,7 +89,8 @@ impl JsonSessionStore {
         self.visit_archives(&record.entries, &CancellationToken::new(), |mut archive| {
             exporter.entries(&mut archive.entries)?;
             archive.workspace.clone_from(&destination);
-            target.save_archive(&mut archive)
+            target.save_archive(&mut archive)?;
+            Ok(ControlFlow::Continue(()))
         })?;
         exporter.entries(&mut record.entries)?;
         record.workspace = destination;

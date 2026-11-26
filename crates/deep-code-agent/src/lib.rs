@@ -121,7 +121,7 @@ pub use session_entry::{
 };
 pub use session_store::{
     CheckpointRecord, ImageProjectionState, ImageRequestRecord, JsonSessionStore, PreparedSession,
-    SessionId, SessionRecord, SessionStore, SessionStoreError, TurnRecord,
+    RestorePoint, SessionId, SessionRecord, SessionStore, SessionStoreError, TurnRecord,
     format_sessions_storage_note, now_ms,
 };
 pub use shell_tools::JobStore;
