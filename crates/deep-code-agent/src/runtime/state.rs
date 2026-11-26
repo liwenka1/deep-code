@@ -246,6 +246,7 @@ pub(super) struct Persistence {
     /// [`PersistenceActorHandle`].
     pub(super) record: Arc<Mutex<SessionRecord>>,
     pub(super) actor: PersistenceActorHandle,
+    pub(super) store: Option<crate::session_store::JsonSessionStore>,
 }
 
 /// A turn's tool calls awaiting approval: the call currently pending plus the

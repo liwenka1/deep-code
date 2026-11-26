@@ -822,6 +822,7 @@ mod tests {
             summary: "known visual conclusion".into(),
             archived_count: 200,
             image_sources: sources.clone(),
+            has_archive: false,
         });
         let wire = entry_wire_messages(&entry);
         let text = wire[0].content.text();

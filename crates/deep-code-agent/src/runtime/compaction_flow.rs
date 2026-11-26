@@ -16,8 +16,17 @@ use crate::model_registry::DEEPSEEK_FLASH;
 use crate::reasoning::ReasoningEffortSetting;
 use crate::runtime::event::{RuntimeEvent, TurnId, emit};
 use crate::runtime::{AgentRuntime, CompactNowOutcome, CompactionReport};
-use crate::session_entry::SessionEntry;
+use crate::session_entry::{EntryKind, SessionEntry};
 use crate::text_util::truncate_chars;
+
+fn matches_prefix(entries: &[Arc<SessionEntry>], prefix: &[Arc<SessionEntry>]) -> bool {
+    entries.get(..prefix.len()).is_some_and(|current| {
+        current
+            .iter()
+            .zip(prefix)
+            .all(|(now, then)| Arc::ptr_eq(now, then))
+    })
+}
 
 /// Wall-clock bound on the handover request, retries included. Generous — the
 /// summarizer reads up to a few hundred thousand characters — but finite: a
@@ -235,8 +244,8 @@ impl AgentRuntime {
             }
         };
 
-        let result = {
-            let mut state = self.state.lock().await;
+        let (current, plan, summary) = {
+            let state = self.state.lock().await;
             // A cancel that landed while the summary was finishing — or while
             // this waited for the lock — still means "stop": nothing is folded
             // once it has fired, whatever came back. Checked under the lock,
@@ -254,13 +263,8 @@ impl AgentRuntime {
             // a swapped session — and the summary is about a range that no
             // longer exists as such.
             let kept_from = plan.tail_start();
-            let prefix_intact = current.len() >= kept_from
-                && current[..kept_from]
-                    .iter()
-                    .zip(&entries[..kept_from])
-                    .all(|(now, then)| Arc::ptr_eq(now, then));
-            let result = if prefix_intact {
-                apply_compaction(&current, &plan, summary)
+            if matches_prefix(&current, &entries[..kept_from]) {
+                (current, plan, summary)
             } else if matches!(trigger, Trigger::StoragePressure) {
                 let Some(plan) = plan_compaction(&current, state.current_turn_id.as_ref()) else {
                     return FoldOutcome::Nothing;
@@ -268,21 +272,72 @@ impl AgentRuntime {
                 fallback_reason =
                     Some("the transcript changed while the summary was being written".to_string());
                 let summary = mechanical_summary(&plan, &current);
-                apply_compaction(&current, &plan, summary)
+                (current, plan, summary)
             } else {
                 drop(state);
                 let reason = "the history changed while the summary was being written".to_string();
                 self.announce_skipped_fold(tx, &reason);
                 return FoldOutcome::Failed(reason);
-            };
-            state.session.replace_entries(result.entries.clone());
-            // No prefix reset here. Compaction replaces the history with a
-            // shorter, different one, so `telemetry::probe_prefix` reports
-            // `Changed` on its own — which is also the accurate label, where
-            // the reset used to make the turn after a compaction read
-            // `FirstTurn`.
-            result
+            }
         };
+        let mut result = apply_compaction(&current, &plan, summary);
+        let kept_from = plan.tail_start();
+        let archived = plan.archived(&current);
+        let archive = if let Some(store) = self.persistence.as_ref().and_then(|p| p.store.clone()) {
+            let summary_entry = Arc::make_mut(&mut result.entries[kept_from - archived.len()]);
+            let (worker_store, summary_id) = (store.clone(), summary_entry.id.clone());
+            let entries = archived
+                .iter()
+                .filter(|entry| entry.unsent.is_none())
+                .cloned()
+                .collect();
+            let saved = tokio::task::spawn_blocking(move || {
+                worker_store.save_compaction_archive(&summary_id, entries)
+            })
+            .await;
+            let error = match saved {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(error) = error {
+                let reason = format!("could not archive the original transcript: {error}");
+                self.announce_skipped_fold(tx, &reason);
+                return FoldOutcome::Failed(reason);
+            }
+            let EntryKind::Compaction { has_archive, .. } = &mut summary_entry.kind else {
+                unreachable!("new compaction entry");
+            };
+            *has_archive = true;
+            Some((store, summary_entry.id.clone()))
+        } else {
+            None
+        };
+        let aborted = {
+            let mut state = self.state.lock().await;
+            let updated = state.session.entries();
+            if cancel.is_cancelled() {
+                Some(FoldOutcome::Cancelled)
+            } else if !matches_prefix(updated, &current[..kept_from]) {
+                let reason = "the history changed before compaction could be applied".to_string();
+                self.announce_skipped_fold(tx, &reason);
+                Some(FoldOutcome::Failed(reason))
+            } else {
+                // Keep entries appended or updated while the archive was written.
+                result
+                    .entries
+                    .truncate(result.entries.len() - (current.len() - kept_from));
+                result.entries.extend_from_slice(&updated[kept_from..]);
+                state.session.replace_entries(result.entries.clone());
+                None
+            }
+        };
+        if let Some(outcome) = aborted {
+            if let Some((store, id)) = archive {
+                tokio::task::spawn_blocking(move || store.discard_compaction_archive(&id));
+            }
+            return outcome;
+        }
         let cut_short = cut_short && fallback_reason.is_none();
         // One save for the whole fold: the summary and the archived count
         // describe exactly the entry list written with them, and that save
@@ -291,8 +346,23 @@ impl AgentRuntime {
         // `/compact` followed by a quit lost it — and could put back an entry
         // list another front-end had appended to since the snapshot above.
         self.persist_with(|record| {
-            record.summary = Some(result.summary.clone());
-            record.compaction = Some(format!("archived={}", result.archived_count));
+            if let Some((summary, count)) =
+                record
+                    .entries
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match &entry.kind {
+                        EntryKind::Compaction {
+                            summary,
+                            archived_count,
+                            ..
+                        } => Some((summary, archived_count)),
+                        _ => None,
+                    })
+            {
+                record.summary = Some(summary.clone());
+                record.compaction = Some(format!("archived={count}"));
+            }
         })
         .await;
         if let Some(tx) = tx {

@@ -104,6 +104,7 @@ fn a_bundle_survives_workspace_cleanup_with_images_full_output_and_nested_growin
         .push(Arc::new(SessionEntry::new(EntryKind::Compaction {
             summary: "archived observation".into(),
             archived_count: 1,
+            has_archive: false,
             image_sources: vec![crate::CompactionImageSource {
                 image: asset,
                 role: crate::Role::Tool,

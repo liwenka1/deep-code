@@ -131,6 +131,7 @@ impl SessionEntry {
             summary: summary.into(),
             archived_count,
             image_sources: Vec::new(),
+            has_archive: false,
         })
     }
 }
@@ -157,6 +158,9 @@ pub enum EntryKind {
         archived_count: usize,
         /// Image identities survive a lossy text summary; pixels are not replayed.
         image_sources: Vec<CompactionImageSource>,
+        /// The original entries are stored under the compaction entry's id.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        has_archive: bool,
     },
 }
 

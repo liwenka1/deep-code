@@ -9,11 +9,12 @@ use std::sync::Arc;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use super::{JsonSessionStore, SessionId, SessionRecord, SessionStore, SessionStoreError};
 use crate::content::{Content, ContentBlock};
 use crate::image::ImageAsset;
-use crate::session_entry::EntryKind;
+use crate::session_entry::{EntryKind, SessionEntry};
 
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SOURCE_DEPTH: usize = 32;
@@ -84,9 +85,27 @@ impl JsonSessionStore {
             active: HashSet::new(),
             in_flight_bytes: 0,
         };
-        for entry in &mut record.entries {
+        self.visit_archives(&record.entries, &CancellationToken::new(), |mut archive| {
+            exporter.entries(&mut archive.entries)?;
+            archive.workspace.clone_from(&destination);
+            target.save_archive(&mut archive)
+        })?;
+        exporter.entries(&mut record.entries)?;
+        record.workspace = destination;
+        record.extra_roots.clear();
+        record.extra_roots_mac = None;
+        record.checkpoints.clear();
+        record.record_mac = None;
+        target.save(&mut record)?;
+        Ok(record)
+    }
+}
+
+impl Exporter {
+    fn entries(&mut self, entries: &mut [Arc<SessionEntry>]) -> Result<(), SessionStoreError> {
+        for entry in entries {
             match &mut Arc::make_mut(entry).kind {
-                EntryKind::User { content } => exporter.content(content, false)?,
+                EntryKind::User { content } => self.content(content, false)?,
                 EntryKind::Assistant { exchanges, .. } => {
                     for exchange in exchanges {
                         if let Some(result) = &mut exchange.result {
@@ -100,27 +119,21 @@ impl JsonSessionStore {
                                 })
                             });
                             if let Some(details) = &mut result.details {
-                                exporter.details(details)?;
+                                self.details(details)?;
                             }
-                            exporter.content(&mut result.content, rebase_notices)?;
+                            self.content(&mut result.content, rebase_notices)?;
                         }
                     }
                 }
                 EntryKind::Compaction { image_sources, .. } => {
                     for source in image_sources {
-                        exporter.image(&mut source.image)?;
+                        self.image(&mut source.image)?;
                     }
                 }
                 EntryKind::System { .. } => {}
             }
         }
-        record.workspace = destination.clone();
-        record.extra_roots.clear();
-        record.extra_roots_mac = None;
-        record.checkpoints.clear();
-        record.record_mac = None;
-        target.save(&mut record)?;
-        Ok(record)
+        Ok(())
     }
 }
 

@@ -11,16 +11,19 @@ use crate::runtime::event::{RuntimeEvent, RuntimeFailureKind, TurnId, emit};
 use crate::runtime::persistence_actor::PersistenceActorHandle;
 use crate::runtime::state::{Persistence, RuntimeState};
 use crate::session::Session;
+use crate::session_store::{JsonSessionStore, SessionId, SessionRecord};
 #[cfg(test)]
-use crate::session_store::SessionStoreError;
-use crate::session_store::{JsonSessionStore, SessionId, SessionRecord, SessionStore};
+use crate::session_store::{SessionStore, SessionStoreError};
 use crate::tool::ToolRegistry;
 
 fn build_persistence(store: JsonSessionStore, record: SessionRecord) -> Arc<Persistence> {
-    let store: Arc<dyn SessionStore + Send + Sync> = Arc::new(store);
     let record = Arc::new(Mutex::new(record));
-    let actor = PersistenceActorHandle::spawn(store, Arc::clone(&record));
-    Arc::new(Persistence { record, actor })
+    let actor = PersistenceActorHandle::spawn(Arc::new(store.clone()), Arc::clone(&record));
+    Arc::new(Persistence {
+        record,
+        actor,
+        store: Some(store),
+    })
 }
 
 /// In-process session state for a configuration change. Only a live runtime

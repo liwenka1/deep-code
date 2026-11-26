@@ -54,6 +54,7 @@ async fn the_final_session_update_reports_the_completed_save_failure() {
             record.clone(),
         ),
         record,
+        store: None,
     }));
     let mut rx = runtime.submit_user("hello").await;
     let events = drain(&mut rx).await;
@@ -6326,6 +6327,90 @@ fn ok_turn() -> Vec<AgentEvent> {
         },
         AgentEvent::Done { usage: None },
     ]
+}
+
+#[tokio::test]
+async fn compaction_archives_original_entries_across_multiple_folds_and_export() {
+    let source = tempfile::tempdir().unwrap();
+    let workspace = crate::canonicalize(source.path()).unwrap();
+    let image = crate::snapshot_bytes(&workspace, b"GIF89a-original-image").unwrap();
+    let (client, _) = HandoverClient::new(|_| Ok(ok_turn()));
+    let runtime = AgentRuntime::with_new_session(
+        client,
+        ToolRegistry::default(),
+        "system",
+        &workspace,
+        &AgentConfig::builtin(),
+    )
+    .unwrap();
+    let id = runtime.session_id().await.unwrap();
+    for index in 0..12 {
+        let prompt = format!("turn {index}");
+        let input = if index == 0 {
+            UserTurn::with_labeled_images(
+                prompt,
+                vec![(UserImage::Saved(image.clone()), String::new())],
+            )
+        } else {
+            prompt.into()
+        };
+        drain(&mut runtime.submit_user(input).await).await;
+        if index == 5 {
+            let blocking_file = workspace.join(".deep-code/sessions/archives");
+            let previous = runtime.session_messages().await;
+            std::fs::write(&blocking_file, "").unwrap();
+            assert!(matches!(
+                compact(&runtime, None).await,
+                CompactNowOutcome::Failed(reason) if reason.contains("archive the original transcript")
+            ));
+            assert_eq!(runtime.session_messages().await, previous);
+            std::fs::remove_file(blocking_file).unwrap();
+        }
+        if index == 5 || index == 11 {
+            folded(compact(&runtime, None).await);
+        }
+    }
+    assert!(runtime.flush_session().await.is_none());
+    assert!(
+        !runtime
+            .session_messages()
+            .await
+            .iter()
+            .any(|message| message.content.text() == "turn 0")
+    );
+
+    let source_store = crate::JsonSessionStore::for_pinned_workspace(&workspace).unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let original = source_store.load(&id).unwrap();
+    let exported = source_store.export_bundle(&id, destination.path()).unwrap();
+    let exported_store =
+        crate::JsonSessionStore::for_pinned_workspace(&exported.workspace).unwrap();
+    for (store, record) in [(source_store, original), (exported_store, exported)] {
+        let transcript = store
+            .transcript_entries(&record, &CancellationToken::new())
+            .unwrap();
+        let user_entries: Vec<_> = transcript
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                crate::EntryKind::User { content } => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_entries
+                .iter()
+                .map(|content| content.text())
+                .collect::<Vec<_>>(),
+            (0..12)
+                .map(|index| format!("turn {index}"))
+                .collect::<Vec<_>>()
+        );
+        let attachment = user_entries[0].images().next().unwrap();
+        assert!(attachment.path().starts_with(&record.workspace));
+        assert_eq!(attachment.read().unwrap(), b"GIF89a-original-image");
+        assert_eq!(transcript.len(), 25);
+    }
+    runtime.shutdown().await;
 }
 
 /// `/compact` asks the model for a handover of the archived range — a

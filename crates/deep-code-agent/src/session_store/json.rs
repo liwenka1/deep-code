@@ -12,6 +12,7 @@ use super::{
     sessions_dir_for_workspace, validate_session_id,
 };
 
+mod archive;
 mod chunks;
 mod lock;
 use lock::StoreLock;
