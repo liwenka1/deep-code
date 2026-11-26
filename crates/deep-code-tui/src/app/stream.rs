@@ -327,6 +327,13 @@ impl App {
         images: Vec<(deep_code_agent::UserImage, String)>,
         shown: Option<String>,
     ) {
+        if self
+            .session_switch
+            .as_ref()
+            .is_some_and(|switch| switch.restoring)
+        {
+            self.cancel_session_scan();
+        }
         self.error = None;
         // A turn that streamed content but never saw its terminal event (e.g.
         // the stream channel closed mid-approval) would be silently discarded

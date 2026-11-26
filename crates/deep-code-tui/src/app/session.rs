@@ -1,5 +1,7 @@
 use super::*;
-use deep_code_agent::{GlobalConfigUpdate, LoadedAgentConfig, write_global_config_update};
+use deep_code_agent::{
+    GlobalConfigUpdate, LoadedAgentConfig, RestorePoint, SessionId, write_global_config_update,
+};
 
 #[cfg(test)]
 mod switch_tests;
@@ -31,6 +33,7 @@ pub(super) struct PendingSessionScan {
 pub(super) struct PendingSessionSwitch {
     current: Arc<AgentRuntime>,
     task: crate::session_switch::SessionSwitch,
+    pub(super) restoring: bool,
 }
 
 impl PendingSessionSwitch {
@@ -187,6 +190,7 @@ impl App {
 
     async fn stop_current_runtime(&mut self) {
         self.session_scan = None;
+        self.restore_points_scan = None;
         self.session_switch = None;
         if let Some(stop) = self.subagent_shutdown.take() {
             stop();
@@ -629,8 +633,7 @@ impl App {
     fn begin_session_scan(&mut self, purpose: SessionScanPurpose) {
         // A newer request owns a new receiver; a cancelled worker can never
         // deliver a stale result into it.
-        self.session_scan = None;
-        self.session_switch = None;
+        self.cancel_session_scan();
         match JsonSessionStore::for_pinned_workspace(&self.workspace)
             .and_then(crate::session_scan::SessionScan::start)
         {
@@ -648,12 +651,102 @@ impl App {
     pub(crate) fn cancel_session_scan(&mut self) -> bool {
         let scan = self.session_scan.take();
         let switch = self.session_switch.take();
-        if scan.is_some() || switch.is_some() {
-            self.status = self.tr(TextId::StatusResumeCancelled).to_string();
+        let restore = self.restore_points_scan.take();
+        if scan.is_some() || switch.is_some() || restore.is_some() {
+            let restoring =
+                restore.is_some() || switch.as_ref().is_some_and(|switch| switch.restoring);
+            self.status = self
+                .tr(if restoring {
+                    TextId::StatusRestoreCancelled
+                } else {
+                    TextId::StatusResumeCancelled
+                })
+                .to_string();
             true
         } else {
             false
         }
+    }
+
+    pub(crate) fn restore_command(&mut self, selector: &str) {
+        if !selector.is_empty() && self.runtime_busy() {
+            self.status = self.busy_status(TextId::BusyRestore);
+            return;
+        }
+        self.cancel_session_scan();
+        let Some(id) = self
+            .session_id
+            .as_deref()
+            .and_then(|id| SessionId::parse(id).ok())
+        else {
+            self.status = self.tr(TextId::RestoreNeedsSession).to_string();
+            return;
+        };
+        let workspace = self.workspace.clone();
+        if selector.is_empty() {
+            let scan = crate::session_scan::SessionScan::spawn(move |cancel| {
+                JsonSessionStore::for_pinned_workspace(&workspace)?.restore_points(&id, &cancel)
+            });
+            match scan {
+                Ok(task) => {
+                    self.restore_points_scan = Some(task);
+                    self.status = self.tr(TextId::StatusReadingRestorePoints).to_string();
+                }
+                Err(error) => {
+                    self.status =
+                        self.tr_with(TextId::RestoreFailed, &[("error", &error.to_string())])
+                }
+            }
+            return;
+        }
+        let current = Arc::clone(&self.runtime);
+        match crate::session_switch::SessionSwitch::restore(
+            Arc::clone(&current),
+            workspace,
+            self.global_config_path.clone(),
+            id,
+            selector.to_owned(),
+        ) {
+            Ok(task) => {
+                self.session_switch = Some(PendingSessionSwitch {
+                    current,
+                    task,
+                    restoring: true,
+                });
+                self.status = self.tr(TextId::StatusPreparingRestore).to_string();
+            }
+            Err(error) => self.status = self.tr_with(TextId::RestoreFailed, &[("error", &error)]),
+        }
+    }
+
+    fn restore_point_label(&self, point: &RestorePoint) -> String {
+        self.tr_with(
+            if point.before_turn {
+                TextId::RestoreBeforeTurn
+            } else {
+                TextId::RestoreAfterTurn
+            },
+            &[("round", &point.round.to_string())],
+        )
+    }
+
+    fn show_restore_points(&mut self, points: Vec<RestorePoint>) {
+        if points.is_empty() {
+            self.status = self.tr(TextId::NoCheckpoints).to_string();
+            return;
+        }
+        let mut lines = vec![self.tr(TextId::CheckpointsHeader).to_string()];
+        lines.extend(
+            points
+                .iter()
+                .map(|point| format!("- {}  {}", self.restore_point_label(point), point.id.0)),
+        );
+        lines.push(self.tr(TextId::UsageRestore).to_string());
+        self.history.push(HistoryCell::system(lines.join("\n")));
+        self.status = self.tr_with(
+            TextId::CheckpointsCount,
+            &[("count", &points.len().to_string())],
+        );
     }
 
     /// Nonblocking: the terminal loop still drains keys and runtime events
@@ -661,6 +754,21 @@ impl App {
     pub(crate) fn poll_session_scan(&mut self) -> bool {
         let cleanup_changed = self.poll_session_cleanup();
         if self.poll_session_switch() {
+            return true;
+        }
+        if let Some(result) = self
+            .restore_points_scan
+            .as_mut()
+            .and_then(|task| task.try_result())
+        {
+            self.restore_points_scan = None;
+            match result {
+                Ok(points) => self.show_restore_points(points),
+                Err(error) => {
+                    self.status =
+                        self.tr_with(TextId::RestoreFailed, &[("error", &error.to_string())])
+                }
+            }
             return true;
         }
         let Some(result) = self
@@ -731,7 +839,11 @@ impl App {
         let prepared = match result {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.status = error;
+                self.status = if pending.restoring {
+                    self.tr_with(TextId::RestoreFailed, &[("error", &error)])
+                } else {
+                    error
+                };
                 return true;
             }
         };
@@ -742,20 +854,22 @@ impl App {
             self.status = self.busy_status(TextId::BusySwitchSession);
             return true;
         }
+        if pending.restoring && !self.input.trim().is_empty() {
+            self.status = self.tr(TextId::RestoreDraftChanged).to_string();
+            return true;
+        }
 
-        let (launched, config) = prepared.take();
         // Starting the cleanup worker can fail. Do this before retiring the
         // current runtime, and hold its commit permit until adoption succeeds.
         let mut cleanup =
             match crate::session_switch::SessionCleanup::prepare(Arc::clone(&self.runtime)) {
                 Ok(cleanup) => cleanup,
                 Err(error) => {
-                    (launched.stop_hook)();
-                    launched.job_store.shutdown();
                     self.status = error;
                     return true;
                 }
             };
+        let (launched, config, restore) = prepared.take();
         if let Some(stop) = self.subagent_shutdown.take() {
             stop();
         }
@@ -764,8 +878,37 @@ impl App {
         }
         // Everything below is an in-memory commit. No shutdown, save or
         // session-store lock may be awaited on the terminal thread.
+        let restored = restore.map(|restore| {
+            let position = self.restore_point_label(&restore.fork.point);
+            let record = restore.fork.commit();
+            let source = std::mem::replace(&mut self.workspace, record.workspace);
+            self.workspace_files = restore.workspace_files;
+            self.prompt_history_path = crate::prompt_history::history_path(&self.workspace);
+            self.prompt_history.clear();
+            self.clear_input();
+            self.history_search = None;
+            (position, source, !self.extra_roots.is_empty())
+        });
         let record = self.adopt_configured_runtime(launched, &config);
         self.finish_session_switch(record.as_ref());
+        if let Some((position, source, had_extra_roots)) = restored {
+            let path = self.workspace.display().to_string();
+            let message = self.tr_with(
+                TextId::RestoreForkCreated,
+                &[
+                    ("point", &position),
+                    ("path", &path),
+                    ("source", &source.display().to_string()),
+                ],
+            );
+            self.history.push(HistoryCell::system(message));
+            if had_extra_roots {
+                self.history.push(HistoryCell::system(
+                    self.tr(TextId::RestoreExtraRootsNotCovered).to_string(),
+                ));
+            }
+            self.status = self.tr_with(TextId::StatusForkCreated, &[("path", &path)]);
+        }
         // Enqueue now, before the UI can request another switch. The worker
         // only waits for this receipt; it cannot issue a stale save later.
         cleanup.commit(self.runtime.commit_prepared_session());
@@ -934,7 +1077,11 @@ impl App {
             self.global_config_path.clone(),
             record,
         )?;
-        self.session_switch = Some(PendingSessionSwitch { current, task });
+        self.session_switch = Some(PendingSessionSwitch {
+            current,
+            task,
+            restoring: false,
+        });
         self.status = self.tr(TextId::StatusSwitchingSession).to_string();
         Ok(())
     }
@@ -946,6 +1093,7 @@ impl App {
         self.clear_selection();
         self.scroll_offset = 0;
         self.last_telemetry = None;
+        self.last_checkpoint = None;
         self.error = None;
         // Conversation-scoped, like `history`: a queue must never survive into a
         // different session and auto-send there.

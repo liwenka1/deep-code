@@ -790,12 +790,12 @@ fn checkpoint_lines_include_restore_command() {
     assert!(
         cell.lines(Lang::Zh)
             .iter()
-            .any(|line| line == "恢复: /restore checkpoint_1")
+            .any(|line| line == "用 /restore checkpoint_1 创建对话副本")
     );
     assert!(
         cell.lines(Lang::En)
             .iter()
-            .any(|line| line == "Restore: /restore checkpoint_1")
+            .any(|line| line == "Create a copy with /restore checkpoint_1")
     );
 }
 

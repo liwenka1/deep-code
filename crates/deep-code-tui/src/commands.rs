@@ -1,7 +1,4 @@
-use deep_code_agent::{
-    CheckpointId, CheckpointStore, CostEstimate, Message, PrefixStatus, RuntimeEvent,
-    estimate_token_count, web_enabled,
-};
+use deep_code_agent::{CostEstimate, Message, PrefixStatus, estimate_token_count, web_enabled};
 
 use std::sync::Arc;
 
@@ -91,7 +88,7 @@ impl App {
                 true
             }
             "/checkpoints" => {
-                self.list_checkpoints();
+                self.restore_command("");
                 true
             }
             "/sessions" => {
@@ -137,12 +134,8 @@ impl App {
                 true
             }
             _ if prompt == "/restore" || prompt.starts_with("/restore ") => {
-                let id = prompt.strip_prefix("/restore").unwrap_or_default().trim();
-                if id.is_empty() {
-                    self.status = self.tr(TextId::UsageRestore).to_string();
-                } else {
-                    self.restore_checkpoint(id);
-                }
+                let selector = prompt.strip_prefix("/restore").unwrap_or_default().trim();
+                self.restore_command(selector);
                 true
             }
             _ if prompt == "/find" || prompt.starts_with("/find ") => {
@@ -862,95 +855,6 @@ impl App {
                     TextId::StatusReadySubagents,
                     &[("running", &running.to_string())],
                 );
-            }
-        }
-    }
-
-    fn list_checkpoints(&mut self) {
-        match CheckpointStore::new(&self.workspace) {
-            Ok(store) => match store.list() {
-                Ok(ids) if ids.is_empty() => {
-                    self.status = self.tr(TextId::NoCheckpoints).to_string();
-                }
-                Ok(ids) => {
-                    self.history.push(HistoryCell::system(format!(
-                        "{}\n{}",
-                        self.tr(TextId::CheckpointsHeader),
-                        ids.iter()
-                            .map(|id| format!("- {}", id.0))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    )));
-                    self.status = self.tr_with(
-                        TextId::CheckpointsCount,
-                        &[("count", &ids.len().to_string())],
-                    );
-                }
-                Err(error) => {
-                    self.status =
-                        self.tr_with(TextId::ListFailed, &[("error", &error.to_string())]);
-                }
-            },
-            Err(error) => {
-                self.status = self.tr_with(
-                    TextId::CheckpointsUnavailable,
-                    &[("error", &error.to_string())],
-                );
-            }
-        }
-    }
-
-    fn restore_checkpoint(&mut self, id: &str) {
-        // Same busy guard as the other state-changing commands: restoring while
-        // a turn streams (or is parked on approval) rewinds the workspace under
-        // the live turn, which keeps writing on top of it. The runtime refuses
-        // it too, but stopping here keeps the transcript honest (no "restored"
-        // cell above still-streaming output).
-        if self.runtime_busy() {
-            self.status = self.busy_status(TextId::BusyRestore);
-            return;
-        }
-        // Route through the runtime handle (the one place that owns the
-        // configured checkpoint store) instead of keeping a second
-        // CheckpointStore construction here.
-        let checkpoint_id = CheckpointId(id.to_string());
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            self.status = self.tr(TextId::RestoreOutsideRuntime).to_string();
-            return;
-        };
-        let runtime = std::sync::Arc::clone(&self.runtime);
-        let result = tokio::task::block_in_place(|| {
-            handle.block_on(runtime.restore_checkpoint(checkpoint_id.clone()))
-        });
-        match result {
-            Ok(kept) => {
-                self.last_checkpoint = Some(id.to_string());
-                self.apply_runtime_event(RuntimeEvent::WorkspaceRestored { id: checkpoint_id });
-                // Checkpoints snapshot the primary workspace only. Restoring
-                // while extra roots are granted must say so, or "restored"
-                // quietly overpromises about trees the snapshot never held.
-                if !self.extra_roots.is_empty() {
-                    self.history.push(HistoryCell::system(
-                        self.tr(TextId::RestoreExtraRootsNotCovered).to_string(),
-                    ));
-                }
-                // "Restored" was said flat out while `clear` could deliberately
-                // leave entries behind (a skipped directory, a link this
-                // platform cannot recreate, a FIFO/socket with no snapshot
-                // representation). Naming them is the difference between
-                // "restored" and "restored, except for these".
-                if !kept.is_empty() {
-                    self.history.push(HistoryCell::system(self.tr_with(
-                        TextId::SystemRestoreKept,
-                        &[
-                            ("count", &kept.len().to_string()),
-                            ("paths", &kept.join(", ")),
-                        ],
-                    )));
-                }
-            }
-            Err(error) => {
-                self.status = self.tr_with(TextId::RestoreFailed, &[("error", &error.to_string())]);
             }
         }
     }

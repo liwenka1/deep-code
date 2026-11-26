@@ -6,26 +6,52 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use deep_code_agent::{
-    AgentConfig, AgentRuntime, CancellationToken, LaunchedRuntime, SessionRecord, WorkspaceRoots,
+    AgentConfig, AgentRuntime, CancellationToken, JsonSessionStore, LaunchedRuntime,
+    PreparedRestore, SessionId, SessionRecord, WorkspaceRoots,
 };
 use tokio::sync::{oneshot, watch};
 
 /// An unused candidate has never run tools or queued a save. Retiring its
 /// supervisor and empty job store is sufficient; ordinary shutdown would
 /// incorrectly save a session the user cancelled.
-pub(crate) struct PreparedSessionSwitch(Option<(LaunchedRuntime, AgentConfig)>);
+pub(crate) struct PreparedSessionSwitch {
+    launch: Option<(LaunchedRuntime, AgentConfig)>,
+    restore: Option<RestoreSwitch>,
+}
+
+pub(crate) struct RestoreSwitch {
+    pub fork: PreparedRestore,
+    pub workspace_files: Vec<String>,
+}
+
+struct SwitchTarget {
+    roots: WorkspaceRoots,
+    record: SessionRecord,
+    restore: Option<RestoreSwitch>,
+}
 
 impl PreparedSessionSwitch {
-    pub fn take(mut self) -> (LaunchedRuntime, AgentConfig) {
-        self.0.take().expect("prepared switch is consumed once")
+    pub fn take(mut self) -> (LaunchedRuntime, AgentConfig, Option<RestoreSwitch>) {
+        let (runtime, config) = self
+            .launch
+            .take()
+            .expect("prepared switch is consumed once");
+        (runtime, config, self.restore.take())
     }
 }
 
 impl Drop for PreparedSessionSwitch {
     fn drop(&mut self) {
-        if let Some((launched, _)) = self.0.take() {
+        if let Some((launched, _)) = self.launch.take() {
             (launched.stop_hook)();
             launched.job_store.shutdown();
+        }
+        if let Some(restore) = self.restore.take() {
+            // A prepared restore may contain a large tree. Dropping Esc's
+            // abandoned result on the terminal thread must stay quick.
+            let _ = std::thread::Builder::new()
+                .name("discard-restore".into())
+                .spawn(move || drop(restore));
         }
     }
 }
@@ -41,6 +67,46 @@ impl SessionSwitch {
         roots: WorkspaceRoots,
         global_config_path: Option<PathBuf>,
         record: SessionRecord,
+    ) -> Result<Self, String> {
+        Self::start_with(current, global_config_path, move |_| {
+            Ok(SwitchTarget {
+                roots,
+                record,
+                restore: None,
+            })
+        })
+    }
+
+    pub fn restore(
+        current: Arc<AgentRuntime>,
+        workspace: PathBuf,
+        global_config_path: Option<PathBuf>,
+        session: SessionId,
+        selector: String,
+    ) -> Result<Self, String> {
+        Self::start_with(current, global_config_path, move |cancel| {
+            let store = JsonSessionStore::for_pinned_workspace(&workspace)
+                .map_err(|error| error.to_string())?;
+            let fork = store
+                .prepare_restore(&session, &selector, cancel)
+                .map_err(|error| error.to_string())?;
+            let record = fork.record().clone();
+            let workspace_files = deep_code_agent::list_workspace_files(&record.workspace, 2000);
+            Ok(SwitchTarget {
+                roots: WorkspaceRoots::new(record.workspace.clone(), Vec::new()),
+                record,
+                restore: Some(RestoreSwitch {
+                    fork,
+                    workspace_files,
+                }),
+            })
+        })
+    }
+
+    fn start_with(
+        current: Arc<AgentRuntime>,
+        global_config_path: Option<PathBuf>,
+        target: impl FnOnce(&CancellationToken) -> Result<SwitchTarget, String> + Send + 'static,
     ) -> Result<Self, String> {
         let executor = tokio::runtime::Handle::try_current().ok();
         Self::spawn(move |cancel| {
@@ -61,6 +127,11 @@ impl SessionSwitch {
                 }
             })??;
             check_cancelled(&cancel)?;
+            let SwitchTarget {
+                roots,
+                record,
+                restore,
+            } = target(&cancel)?;
             let config = AgentConfig::load_with(
                 global_config_path,
                 Some(roots.primary.join(".deep-code/config.toml")),
@@ -74,7 +145,10 @@ impl SessionSwitch {
             let _entered = executor.as_ref().map(tokio::runtime::Handle::enter);
             let launched = deep_code_agent::prepare_runtime_resume(&config, roots, record)
                 .map_err(|error| error.to_string())?;
-            let prepared = PreparedSessionSwitch(Some((launched, config)));
+            let prepared = PreparedSessionSwitch {
+                launch: Some((launched, config)),
+                restore,
+            };
             check_cancelled(&cancel)?;
             Ok(prepared)
         })

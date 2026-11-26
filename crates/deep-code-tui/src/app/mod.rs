@@ -292,6 +292,8 @@ pub struct App {
     /// and applied together when the second Enter is pressed.
     pub(crate) model_picker: Option<ModelPicker>,
     session_scan: Option<session::PendingSessionScan>,
+    restore_points_scan:
+        Option<crate::session_scan::SessionScan<Vec<deep_code_agent::RestorePoint>>>,
     session_switch: Option<session::PendingSessionSwitch>,
     session_cleanup: Vec<crate::session_switch::SessionCleanup>,
     /// UI language, resolved from config at launch; `/lang` switches it live.
@@ -977,6 +979,7 @@ impl App {
             resume_picker: None,
             model_picker: None,
             session_scan: None,
+            restore_points_scan: None,
             session_switch: None,
             session_cleanup: Vec::new(),
             lang,
@@ -1343,11 +1346,9 @@ impl App {
     }
 
     pub(crate) fn rollback_status_hint(&self) -> Option<String> {
-        self.last_checkpoint.as_deref().map(|id| {
-            self.tr_with(TextId::StatusRollbackHint, &[("id", id)])
-                .trim_start_matches(" | ")
-                .to_string()
-        })
+        self.last_checkpoint
+            .as_deref()
+            .map(|id| self.tr_with(TextId::StatusRollbackHint, &[("id", id)]))
     }
 
     /// Model, reasoning effort, context usage, and the transient note, in

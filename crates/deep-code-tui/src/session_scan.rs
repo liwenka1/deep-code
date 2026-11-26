@@ -13,12 +13,12 @@ pub(crate) struct SessionListing {
 /// Dropping a pending request cancels its worker. A dedicated thread also
 /// works before the TUI starts and in synchronous callers; it never holds up
 /// the terminal loop or Tokio's executor/shutdown waiting for a whole scan.
-pub(crate) struct SessionScan {
+pub(crate) struct SessionScan<T = SessionListing> {
     cancel: CancellationToken,
-    rx: oneshot::Receiver<Result<SessionListing, SessionStoreError>>,
+    rx: oneshot::Receiver<Result<T, SessionStoreError>>,
 }
 
-impl SessionScan {
+impl SessionScan<SessionListing> {
     pub fn load(store: JsonSessionStore, id: SessionId) -> Result<Self, SessionStoreError> {
         Self::spawn(move |cancel| {
             let record = store.load_cancellable(&id, &cancel)?;
@@ -38,11 +38,11 @@ impl SessionScan {
             })
         })
     }
+}
 
+impl<T: Send + 'static> SessionScan<T> {
     pub(crate) fn spawn(
-        scan: impl FnOnce(CancellationToken) -> Result<SessionListing, SessionStoreError>
-        + Send
-        + 'static,
+        scan: impl FnOnce(CancellationToken) -> Result<T, SessionStoreError> + Send + 'static,
     ) -> Result<Self, SessionStoreError> {
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
@@ -58,16 +58,12 @@ impl SessionScan {
         Ok(Self { cancel, rx })
     }
 
-    pub fn cancel(&self) {
-        self.cancel.cancel();
-    }
-
     #[cfg(test)]
     pub fn is_ready(&self) -> bool {
         !self.rx.is_empty()
     }
 
-    pub fn try_result(&mut self) -> Option<Result<SessionListing, SessionStoreError>> {
+    pub fn try_result(&mut self) -> Option<Result<T, SessionStoreError>> {
         match self.rx.try_recv() {
             Ok(result) => Some(result),
             Err(oneshot::error::TryRecvError::Empty) => None,
@@ -75,12 +71,18 @@ impl SessionScan {
         }
     }
 
-    pub async fn finish(&mut self) -> Result<SessionListing, SessionStoreError> {
+    pub async fn finish(&mut self) -> Result<T, SessionStoreError> {
         (&mut self.rx).await.map_err(|_| worker_stopped())?
     }
 }
 
-impl Drop for SessionScan {
+impl<T> SessionScan<T> {
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+}
+
+impl<T> Drop for SessionScan<T> {
     fn drop(&mut self) {
         self.cancel();
     }

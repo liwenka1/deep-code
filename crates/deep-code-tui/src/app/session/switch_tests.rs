@@ -3,6 +3,152 @@ use deep_code_agent::SessionStore;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+fn app_with_restore_point() -> (tempfile::TempDir, App, SessionRecord) {
+    use deep_code_agent::{CheckpointId, CheckpointRecord, SessionEntry, TurnRecord};
+
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("original");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = deep_code_agent::canonicalize(&workspace).unwrap();
+    let store = JsonSessionStore::for_pinned_workspace(&workspace).unwrap();
+    let mut record = SessionRecord::new(workspace.clone(), "system");
+    for (question, answer) in [
+        ("first question", "first answer"),
+        ("later question", "later answer"),
+    ] {
+        let turn = deep_code_agent::TurnId::new();
+        record.entries.push(Arc::new(
+            SessionEntry::user(question).with_turn_id(turn.clone()),
+        ));
+        record.entries.push(Arc::new(
+            SessionEntry::assistant(answer, None, Vec::new()).with_turn_id(turn.clone()),
+        ));
+        if record.turns.is_empty() {
+            record.checkpoints.push(CheckpointRecord::new(
+                CheckpointId("after_turn_1".into()),
+                turn.clone(),
+                "after_turn",
+            ));
+        }
+        record.turns.push(TurnRecord::new(turn));
+    }
+    store.save(&mut record).unwrap();
+    let snapshot = workspace.join(".deep-code/checkpoints/after_turn_1");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::write(snapshot.join("message.txt"), "first version").unwrap();
+    std::fs::write(workspace.join("message.txt"), "latest version").unwrap();
+    let mut app = App::launch(LaunchConfig {
+        workspace: Some(workspace),
+        resume: Some(record.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    app.lang = Lang::Zh;
+    app.global_config_path = Some(parent.path().join("unused-global-config.toml"));
+    app.prompt_history_path = None;
+    (parent, app, record)
+}
+
+async fn finish_restore_request(app: &mut App) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while app.restore_points_scan.is_some() || app.session_switch.is_some() {
+            app.poll_session_scan();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_lists_the_round_and_switches_to_an_independently_resumable_workspace() {
+    let (_parent, mut app, source) = app_with_restore_point();
+    assert!(app.handle_slash_command("/restore"));
+    finish_restore_request(&mut app).await;
+    assert!(
+        matches!(app.history.last(), Some(HistoryCell::System { text })
+        if text.contains("第 1 轮结束") && text.contains("after_turn_1"))
+    );
+    app.insert_str_at_cursor("/restore 1");
+    app.submit();
+    assert_eq!(app.workspace, source.workspace);
+    finish_restore_request(&mut app).await;
+    assert_ne!(app.workspace, source.workspace, "{}", app.status);
+    assert_ne!(app.session_id.as_deref(), Some(source.id.as_str()));
+    assert!(app.workspace_files.iter().any(|path| path == "message.txt"));
+    assert_eq!(
+        std::fs::read_to_string(app.workspace.join("message.txt")).unwrap(),
+        "first version"
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.workspace.join("message.txt")).unwrap(),
+        "latest version"
+    );
+    assert!(
+        app.history
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::User { text, .. }
+        if text == "first question"))
+    );
+    assert!(
+        !app.history
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::User { text, .. }
+        if text == "later question"))
+    );
+
+    let fork_id = deep_code_agent::SessionId::parse(app.session_id.as_deref().unwrap()).unwrap();
+    let fork_store = JsonSessionStore::for_pinned_workspace(&app.workspace).unwrap();
+    let fork = fork_store.load(&fork_id).unwrap();
+    let mut resumed = App::launch(LaunchConfig {
+        workspace: Some(app.workspace.clone()),
+        resume: Some(fork),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(resumed.session_id, app.session_id);
+    assert!(
+        resumed
+            .history
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::User { text, .. }
+        if text == "first question"))
+    );
+    assert_eq!(
+        JsonSessionStore::for_pinned_workspace(&source.workspace)
+            .unwrap()
+            .load(&source.id)
+            .unwrap()
+            .entries[1..],
+        source.entries[1..]
+    );
+    resumed.stop_current_runtime().await;
+    app.stop_current_runtime().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_or_failed_restore_keeps_the_original_window_and_workspace() {
+    let (parent, mut app, source) = app_with_restore_point();
+    let original = Arc::clone(&app.runtime);
+    assert!(app.handle_slash_command("/restore 999"));
+    finish_restore_request(&mut app).await;
+    assert!(app.status.contains("999"), "{}", app.status);
+
+    assert!(app.handle_slash_command("/restore 1"));
+    wait_for_ready(|| app.session_switch.as_ref().unwrap().task.is_ready()).await;
+    app.handle_escape();
+    assert_eq!(app.status, app.tr(TextId::StatusRestoreCancelled));
+    wait_for_ready(|| std::fs::read_dir(parent.path()).unwrap().count() == 1).await;
+    assert!(Arc::ptr_eq(&original, &app.runtime));
+    assert_eq!(app.session_id.as_deref(), Some(source.id.as_str()));
+    assert_eq!(app.workspace, source.workspace);
+    assert_eq!(
+        std::fs::read_to_string(app.workspace.join("message.txt")).unwrap(),
+        "latest version"
+    );
+    app.stop_current_runtime().await;
+}
+
 fn app_with_saved_target() -> (tempfile::TempDir, App, SessionRecord) {
     let workspace = tempfile::tempdir().unwrap();
     let mut app = App::launch(LaunchConfig {
