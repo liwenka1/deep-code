@@ -500,6 +500,7 @@ fn in_flight_sources_are_bounded_and_successful_siblings_release_their_budget() 
         copied_images: HashSet::new(),
         active: HashSet::new(),
         in_flight_bytes: super::super::MAX_SESSION_BODY_BYTES - 3,
+        cancel: &CancellationToken::new(),
     };
     let error = exporter
         .spill(path.to_str().unwrap(), SourceKind::Content, None)

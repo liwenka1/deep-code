@@ -120,9 +120,9 @@ pub use session_entry::{
     UnsentMessage,
 };
 pub use session_store::{
-    CheckpointRecord, ImageProjectionState, ImageRequestRecord, JsonSessionStore, PreparedSession,
-    RestorePoint, SessionId, SessionRecord, SessionStore, SessionStoreError, TurnRecord,
-    format_sessions_storage_note, now_ms,
+    CheckpointRecord, ImageProjectionState, ImageRequestRecord, JsonSessionStore, PreparedRestore,
+    PreparedSession, RestorePoint, SessionId, SessionRecord, SessionStore, SessionStoreError,
+    TurnRecord, format_sessions_storage_note, now_ms,
 };
 pub use shell_tools::JobStore;
 /// The token [`AgentRuntime::compact_now`] takes, re-exported so a front-end

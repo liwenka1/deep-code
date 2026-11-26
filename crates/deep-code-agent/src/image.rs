@@ -197,8 +197,15 @@ impl ImageAsset {
     }
 
     /// Copy the verified bytes to a destination that can be discarded on error.
-    pub(crate) fn copy_verified_to(&self, mut destination: impl Write) -> Result<(), ImageError> {
-        self.read_chunks(|chunk| destination.write_all(chunk))
+    pub(crate) fn copy_verified_to(
+        &self,
+        mut destination: impl Write,
+        cancel: &CancellationToken,
+    ) -> Result<(), ImageError> {
+        self.read_chunks(|chunk| {
+            check_cancelled(cancel)?;
+            destination.write_all(chunk)
+        })
     }
 
     /// Resolve only inside the recorded canonical store. Every component is

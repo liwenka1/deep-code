@@ -95,23 +95,61 @@ impl JsonSessionStore {
         record: &SessionRecord,
         cancel: &CancellationToken,
     ) -> Result<Vec<Arc<SessionEntry>>, SessionStoreError> {
+        Ok(self
+            .collect_transcript(record, cancel, |_| true)?
+            .expect("all transcript segments were accepted"))
+    }
+
+    pub(in crate::session_store) fn transcript_for_resume(
+        &self,
+        record: &SessionRecord,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Vec<Arc<SessionEntry>>>, SessionStoreError> {
+        let mut remaining_entries = MAX_SESSION_ENTRIES.saturating_sub(record.entries.len());
+        let mut remaining_bytes = MAX_SESSION_BODY_BYTES;
+        if !crate::session_store::charge_json(record, &mut remaining_bytes) {
+            return Ok(None);
+        }
+        self.collect_transcript(record, cancel, |entries| {
+            let Some(remaining) = remaining_entries.checked_sub(entries.len()) else {
+                return false;
+            };
+            remaining_entries = remaining;
+            crate::session_store::charge_json(&entries, &mut remaining_bytes)
+        })
+    }
+
+    fn collect_transcript(
+        &self,
+        record: &SessionRecord,
+        cancel: &CancellationToken,
+        mut keep: impl FnMut(&[Arc<SessionEntry>]) -> bool,
+    ) -> Result<Option<Vec<Arc<SessionEntry>>>, SessionStoreError> {
         let mut segments = Vec::new();
+        let mut fits = true;
         self.visit_archives(&record.entries, cancel, |archive| {
+            if !keep(&archive.entries) {
+                fits = false;
+                return Ok(ControlFlow::Break(()));
+            }
             segments.push(archive.entries);
             Ok(ControlFlow::Continue(()))
         })?;
+        if !fits {
+            return Ok(None);
+        }
         // The first summary sits after the system prompt. Replace it at that
         // position, preserving the system prompt and retained tail.
         let summary = record.entries.iter().position(has_archive);
         let Some(summary) = summary else {
-            return Ok(record.entries.clone());
+            return Ok(Some(record.entries.clone()));
         };
         let mut transcript = record.entries[..summary].to_vec();
         for segment in segments.into_iter().rev() {
             transcript.extend(segment.into_iter().filter(|entry| !has_archive(entry)));
         }
         transcript.extend_from_slice(&record.entries[summary + 1..]);
-        Ok(transcript)
+        Ok(Some(transcript))
     }
 }
 

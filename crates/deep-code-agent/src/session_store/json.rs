@@ -15,7 +15,7 @@ use super::{
 mod archive;
 mod chunks;
 mod lock;
-use lock::StoreLock;
+pub(crate) use lock::StoreLock;
 
 /// Bound diagnostics as well as retained records while scanning the directory.
 const MAX_SESSION_DIAGNOSTICS: usize = 32;

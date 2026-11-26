@@ -6330,6 +6330,161 @@ fn ok_turn() -> Vec<AgentEvent> {
 }
 
 #[tokio::test]
+async fn restoring_round_ten_keeps_its_files_attachments_and_context() {
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("original");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = crate::canonicalize(&workspace).unwrap();
+    let source_a = parent.path().join("ten.gif");
+    let source_b = parent.path().join("eleven.gif");
+    std::fs::write(&source_a, b"GIF89a-from-round-ten").unwrap();
+    std::fs::write(&source_b, b"GIF89a-from-round-eleven").unwrap();
+    let version = workspace.join("version.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&version, workspace.join("current.txt")).unwrap();
+    let tool_output = "unabridged round ten output\n".repeat(650);
+    let arguments = serde_json::json!({"message": &tool_output}).to_string();
+    let mut script = Vec::new();
+    for round in 1..=12 {
+        if round == 10 {
+            script.push(vec![
+                AgentEvent::ToolCallDelta {
+                    delta: tool_call_delta("read-ten", AutoEchoTool::NAME, &arguments),
+                },
+                AgentEvent::Done { usage: None },
+            ]);
+        }
+        script.push(ok_turn());
+    }
+    script.push(vec![AgentEvent::Error {
+        message: "image too large".into(),
+    }]);
+    script.push(ok_turn());
+    let mut tools = ToolRegistry::default();
+    tools.register(AutoEchoTool).unwrap();
+    let config = AgentConfig::builtin();
+    let runtime = AgentRuntime::with_new_session(
+        ScriptedClient::new(script),
+        tools,
+        "system",
+        &workspace,
+        &config,
+    )
+    .unwrap()
+    .with_checkpoints(&workspace, &mut Vec::new());
+    for round in 1..=12 {
+        std::fs::write(&version, round.to_string()).unwrap();
+        if round == 10 {
+            std::fs::write(workspace.join("ten.txt"), "exists at the checkpoint").unwrap();
+        }
+        if round == 11 {
+            std::fs::remove_file(workspace.join("ten.txt")).unwrap();
+            std::fs::write(workspace.join("later.txt"), "future").unwrap();
+        }
+        let prompt = format!("round {round}");
+        let turn = match round {
+            10 => UserTurn::with_images(prompt, vec![source_a.clone()]),
+            11 => UserTurn::with_images(prompt, vec![source_b.clone()]),
+            _ => prompt.into(),
+        };
+        let events = drain(&mut runtime.submit_user(turn).await).await;
+        assert!(matches!(
+            events.last(),
+            Some(RuntimeEvent::TurnFinished { .. })
+        ));
+    }
+    drain(
+        &mut runtime
+            .submit_user(UserTurn::with_images("rejected draft", vec![source_b]))
+            .await,
+    )
+    .await;
+    std::fs::remove_file(source_a).unwrap();
+    folded(compact(&runtime, None).await);
+    assert!(runtime.flush_session().await.is_none());
+
+    let source_id = runtime.session_id().await.unwrap();
+    let store = crate::JsonSessionStore::for_pinned_workspace(&workspace).unwrap();
+    let source_record = store.load(&source_id).unwrap();
+    let cancel = CancellationToken::new();
+    let pending = store.prepare_restore(&source_id, "10", &cancel).unwrap();
+    assert_eq!(pending.point.round, 10);
+    let fork = pending.commit();
+    assert_ne!(fork.id, source_id);
+    assert_eq!(fork.turns.len(), 10);
+    assert_eq!(
+        std::fs::read_to_string(fork.workspace.join("version.txt")).unwrap(),
+        "10"
+    );
+    assert!(fork.workspace.join("ten.txt").is_file());
+    assert!(!fork.workspace.join("later.txt").exists());
+    assert_eq!(std::fs::read_to_string(&version).unwrap(), "12");
+    assert_eq!(store.load(&source_id).unwrap(), source_record);
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::read_link(fork.workspace.join("current.txt")).unwrap(),
+        fork.workspace.join("version.txt")
+    );
+
+    let archived_image = fork
+        .entries
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            crate::EntryKind::User { content } => content.images().next(),
+            _ => None,
+        })
+        .unwrap();
+    assert!(archived_image.path().starts_with(&fork.workspace));
+    assert_eq!(archived_image.read().unwrap(), b"GIF89a-from-round-ten");
+    assert_eq!(
+        std::fs::read_dir(fork.workspace.join(".deep-code/images"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let saved_output = fork
+        .entries
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            crate::EntryKind::Assistant { exchanges, .. } => exchanges
+                .first()
+                .and_then(|exchange| exchange.result.as_ref())
+                .and_then(|result| result.details.as_ref())
+                .and_then(|details| details["content_storage"]["path"].as_str()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(fork.workspace.join(saved_output)).unwrap(),
+        format!("read_file: {tool_output}")
+    );
+
+    let fork_store = crate::JsonSessionStore::for_pinned_workspace(&fork.workspace).unwrap();
+    assert_eq!(fork_store.load(&fork.id).unwrap(), fork);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let branch = AgentRuntime::from_session_record(
+        CapturingClient {
+            scripts: Mutex::new(vec![ok_turn()]),
+            requests: Arc::clone(&requests),
+        },
+        ToolRegistry::default(),
+        fork,
+        fork_store,
+        config,
+    );
+    drain(&mut branch.submit_user("continue branch").await).await;
+    let request = requests.lock().unwrap()[0].to_string();
+    assert!(request.contains("round 10"));
+    assert!(request.contains("data:image/gif;base64,"));
+    for discarded in ["round 11", "round 12", "rejected draft"] {
+        assert!(!request.contains(discarded));
+    }
+    assert_eq!(runtime.unsent_messages().await.len(), 1);
+    branch.shutdown().await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn compaction_archives_original_entries_across_multiple_folds_and_export() {
     let source = tempfile::tempdir().unwrap();
     let workspace = crate::canonicalize(source.path()).unwrap();

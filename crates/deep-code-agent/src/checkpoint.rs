@@ -4,11 +4,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
+use crate::session_store::StoreLock;
 use crate::tool::ToolError;
+
+mod fork;
 
 const CHECKPOINT_DIR: &str = ".deep-code/checkpoints";
 /// `.deep-code` and `checkpoints` inside it — the levels deep-code owns.
@@ -276,7 +280,9 @@ impl CheckpointStore {
             let _ = fs::remove_dir_all(&staging);
             return Err(checkpoint_error("publish snapshot", error));
         }
-        let prune_warnings = self.prune_old_snapshots();
+        let prune_warnings = self
+            .prune_old_snapshots()
+            .unwrap_or_else(|error| vec![error.to_string()]);
         Ok(SnapshotOutcome::Created {
             id: CheckpointId(id),
             prune_warnings,
@@ -287,26 +293,26 @@ impl CheckpointStore {
     /// trailing millisecond timestamp in their names) beyond `max_snapshots`.
     /// Failures are returned as warnings, never propagated — a full disk must
     /// not fail the snapshot that just succeeded.
-    fn prune_old_snapshots(&self) -> Vec<String> {
+    fn prune_old_snapshots(&self) -> Result<Vec<String>, ToolError> {
         let mut warnings = Vec::new();
         if self.max_snapshots == 0 {
-            return warnings;
+            return Ok(warnings);
         }
-        let Ok(mut ids) = self.list() else {
-            return warnings;
-        };
+        let directory = self.open_storage()?;
+        let _lock = StoreLock::acquire(&directory, true, None)
+            .map_err(|error| ToolError::exec_failed("checkpoint", error.to_string()))?;
+        let mut ids = Self::list_in(&directory)?;
         if ids.len() <= self.max_snapshots {
-            return warnings;
+            return Ok(warnings);
         }
         ids.sort_by_key(|id| snapshot_timestamp(&id.0));
         let excess = ids.len() - self.max_snapshots;
         for id in ids.into_iter().take(excess) {
-            let path = self.storage_root.join(&id.0);
-            if let Err(error) = fs::remove_dir_all(&path) {
+            if let Err(error) = directory.remove_dir_all(&id.0) {
                 warnings.push(format!("checkpoint prune failed for {}: {error}", id.0));
             }
         }
-        warnings
+        Ok(warnings)
     }
 
     /// Restore, returning the workspace-relative paths `clear` deliberately
@@ -393,13 +399,17 @@ impl CheckpointStore {
     }
 
     pub fn list(&self) -> Result<Vec<CheckpointId>, ToolError> {
-        // Both the `/checkpoints` list and `prune_old_snapshots` (which
-        // `remove_dir_all`s what this returns) flow through here, so a symlinked
-        // storage root must be refused before `read_dir` follows it. Same reason
-        // as `snapshot`/`restore`.
-        self.ensure_owned_storage()?;
+        Self::list_in(&self.open_storage()?)
+    }
+
+    fn open_storage(&self) -> Result<Dir, ToolError> {
+        crate::pinned_dir::open_canonical(&self.storage_root)
+            .map_err(|error| checkpoint_error("open checkpoint storage", error))
+    }
+
+    fn list_in(directory: &Dir) -> Result<Vec<CheckpointId>, ToolError> {
         let mut ids = Vec::new();
-        let entries = fs::read_dir(&self.storage_root).map_err(|error| {
+        let entries = directory.entries().map_err(|error| {
             ToolError::exec_failed("checkpoint", format!("failed to list checkpoints: {error}"))
         })?;
         for entry in entries {

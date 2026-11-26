@@ -17,7 +17,72 @@ pub struct RestorePoint {
     pub before_turn: bool,
 }
 
+/// A saved branch whose private workspace is removed if the caller abandons it.
+pub struct PreparedRestore {
+    pub point: RestorePoint,
+    record: SessionRecord,
+    directory: tempfile::TempDir,
+}
+
+impl PreparedRestore {
+    #[must_use]
+    pub fn record(&self) -> &SessionRecord {
+        &self.record
+    }
+
+    /// Keep the independent workspace once the caller is ready to use it.
+    pub fn commit(self) -> SessionRecord {
+        let _ = self.directory.keep();
+        self.record
+    }
+}
+
 impl JsonSessionStore {
+    /// Prepare an independent workspace and a session starting at the
+    /// selected restore point. Call on a worker because it copies files.
+    pub fn prepare_restore(
+        &self,
+        session: &SessionId,
+        selector: &str,
+        cancel: &CancellationToken,
+    ) -> Result<PreparedRestore, SessionStoreError> {
+        let (point, mut record) = self.session_at_checkpoint(session, selector, cancel)?;
+        // Restore the original messages to the live context when they fit the
+        // session store. Longer branches keep the summary and linked originals.
+        if record.summary.is_some()
+            && let Some(originals) = self.transcript_for_resume(&record, cancel)?
+        {
+            require_original_history(&originals)?;
+            record.entries = originals;
+            record.summary = None;
+        }
+        let parent = self
+            .workspace_path()
+            .parent()
+            .ok_or_else(|| restore_error("the workspace has no parent directory for a copy"))?;
+        let directory = tempfile::Builder::new()
+            .prefix("deep-code-restore-")
+            .tempdir_in(parent)
+            .map_err(restore_error)?;
+        let destination = crate::paths::canonicalize(directory.path()).map_err(restore_error)?;
+        let store = CheckpointStore::new(self.workspace_path()).map_err(restore_error)?;
+        let copied = store.copy_for_fork(&point.id, &destination, cancel);
+        if cancel.is_cancelled() {
+            return Err(SessionStoreError::Cancelled);
+        }
+        copied.map_err(restore_error)?;
+        let copied = self.export_record(record, &destination, cancel, true);
+        if cancel.is_cancelled() {
+            return Err(SessionStoreError::Cancelled);
+        }
+        let record = copied?;
+        Ok(PreparedRestore {
+            point,
+            record,
+            directory,
+        })
+    }
+
     /// List the restore points still on disk for the requested session.
     pub fn restore_points(
         &self,

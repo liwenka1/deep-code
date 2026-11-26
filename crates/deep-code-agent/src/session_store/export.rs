@@ -62,7 +62,21 @@ impl JsonSessionStore {
         id: &SessionId,
         destination: &Path,
     ) -> Result<SessionRecord, SessionStoreError> {
-        let mut record = self.load(id)?;
+        self.export_record(
+            self.load(id)?,
+            destination,
+            &CancellationToken::new(),
+            false,
+        )
+    }
+
+    pub(super) fn export_record(
+        &self,
+        mut record: SessionRecord,
+        destination: &Path,
+        cancel: &CancellationToken,
+        complete_history: bool,
+    ) -> Result<SessionRecord, SessionStoreError> {
         if record.workspace != self.workspace_path() {
             return Err(export_error("session workspace differs from its store"));
         }
@@ -85,14 +99,19 @@ impl JsonSessionStore {
             copied_images: HashSet::new(),
             active: HashSet::new(),
             in_flight_bytes: 0,
+            cancel,
         };
-        self.visit_archives(&record.entries, &CancellationToken::new(), |mut archive| {
+        self.visit_archives(&record.entries, cancel, |mut archive| {
+            if complete_history {
+                super::restore::require_original_history(&archive.entries)?;
+            }
             exporter.entries(&mut archive.entries)?;
             archive.workspace.clone_from(&destination);
             target.save_archive(&mut archive)?;
             Ok(ControlFlow::Continue(()))
         })?;
         exporter.entries(&mut record.entries)?;
+        check_export_cancelled(cancel)?;
         record.workspace = destination;
         record.extra_roots.clear();
         record.extra_roots_mac = None;
@@ -103,9 +122,10 @@ impl JsonSessionStore {
     }
 }
 
-impl Exporter {
+impl Exporter<'_> {
     fn entries(&mut self, entries: &mut [Arc<SessionEntry>]) -> Result<(), SessionStoreError> {
         for entry in entries {
+            check_export_cancelled(self.cancel)?;
             match &mut Arc::make_mut(entry).kind {
                 EntryKind::User { content } => self.content(content, false)?,
                 EntryKind::Assistant { exchanges, .. } => {
@@ -139,7 +159,7 @@ impl Exporter {
     }
 }
 
-struct Exporter {
+struct Exporter<'a> {
     source: Dir,
     source_path: PathBuf,
     destination: Dir,
@@ -148,6 +168,7 @@ struct Exporter {
     copied_images: HashSet<ImageAsset>,
     active: HashSet<PathBuf>,
     in_flight_bytes: u64,
+    cancel: &'a CancellationToken,
 }
 
 struct CopiedSource {
@@ -163,7 +184,7 @@ enum SourceKind {
     Stream,
 }
 
-impl Exporter {
+impl Exporter<'_> {
     fn content(
         &mut self,
         content: &mut Content,
@@ -180,6 +201,7 @@ impl Exporter {
     }
 
     fn image(&mut self, image: &mut ImageAsset) -> Result<(), SessionStoreError> {
+        check_export_cancelled(self.cancel)?;
         if image.workspace != self.source_path {
             return Err(export_error(
                 "image workspace differs from the session store",
@@ -197,12 +219,12 @@ impl Exporter {
                 .map_err(|_| export_error("image is outside the source workspace"))?;
             publish_source(&self.destination, relative, |file| {
                 image
-                    .copy_verified_to(file)
+                    .copy_verified_to(file, self.cancel)
                     .map_err(|error| io::Error::other(error.note(&source)))
             })
             .map_err(io_error)?;
             exported
-                .verify()
+                .verify_cancellable(self.cancel)
                 .map_err(|error| export_error(error.note(&exported.path())))?;
             self.copied_images.insert(image.clone());
         }
@@ -514,6 +536,14 @@ fn io_error(error: io::Error) -> SessionStoreError {
 fn export_error(message: impl Into<String>) -> SessionStoreError {
     SessionStoreError::Io {
         message: format!("transcript export failed: {}", message.into()),
+    }
+}
+
+fn check_export_cancelled(cancel: &CancellationToken) -> Result<(), SessionStoreError> {
+    if cancel.is_cancelled() {
+        Err(SessionStoreError::Cancelled)
+    } else {
+        Ok(())
     }
 }
 

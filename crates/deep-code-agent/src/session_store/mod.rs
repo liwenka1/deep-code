@@ -15,7 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub use json::JsonSessionStore;
-pub use restore::RestorePoint;
+pub(crate) use json::StoreLock;
+pub use restore::{PreparedRestore, RestorePoint};
 
 /// Make sure `<state_dir>/.gitignore` excludes everything, for every writer of
 /// `<workspace>/.deep-code` — not just whichever one happens to run first.

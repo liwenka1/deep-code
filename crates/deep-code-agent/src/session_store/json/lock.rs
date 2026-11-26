@@ -5,10 +5,10 @@ use super::*;
 
 const LOCK_FILE: &str = ".store.lock";
 
-pub(super) struct StoreLock(std::fs::File);
+pub(crate) struct StoreLock(std::fs::File);
 
 impl StoreLock {
-    pub(super) fn acquire(
+    pub(crate) fn acquire(
         directory: &Dir,
         exclusive: bool,
         cancel: Option<&tokio_util::sync::CancellationToken>,

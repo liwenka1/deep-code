@@ -143,3 +143,46 @@ fn pruned_and_legacy_summary_only_restore_points_are_reported() {
             .contains("unavailable")
     );
 }
+
+#[test]
+fn preparing_or_abandoning_a_restore_never_publishes_a_partial_session() {
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("original");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = crate::canonicalize(&workspace).unwrap();
+    let store = JsonSessionStore::for_pinned_workspace(&workspace).unwrap();
+    let mut record = SessionRecord::new(workspace.clone(), "system");
+    let turn = TurnId::new();
+    let bytes = b"GIF89a-saved-attachment";
+    let image = crate::snapshot_bytes(&workspace, bytes).unwrap();
+    record.turns.push(TurnRecord::new(turn.clone()));
+    record.entries.push(Arc::new(
+        SessionEntry::user_with_images("question", vec![image.clone()]).with_turn_id(turn.clone()),
+    ));
+    record.entries.push(Arc::new(
+        SessionEntry::assistant("done", None, Vec::new()).with_turn_id(turn.clone()),
+    ));
+    save_point(&mut record, &turn, "after_turn", 1);
+    store.save(&mut record).unwrap();
+    let cancel = CancellationToken::new();
+
+    let prepared = store.prepare_restore(&record.id, "1", &cancel).unwrap();
+    let fork = prepared.record().workspace.clone();
+    assert!(fork.is_dir());
+    drop(prepared);
+    assert!(!fork.exists());
+
+    std::fs::remove_file(image.path()).unwrap();
+    let error = store
+        .prepare_restore(&record.id, "1", &cancel)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains(".deep-code/images"));
+    cancel.cancel();
+    assert!(matches!(
+        store.prepare_restore(&record.id, "1", &cancel),
+        Err(SessionStoreError::Cancelled)
+    ));
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+    assert_eq!(store.load(&record.id).unwrap(), record);
+}
