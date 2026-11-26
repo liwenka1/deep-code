@@ -248,6 +248,14 @@ impl JsonSessionStore {
         cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<(SessionRecord, usize), SessionStoreError> {
         let _guard = StoreLock::acquire(&self.directory, false, cancel)?;
+        self.read_while_locked(path, cancel)
+    }
+
+    fn read_while_locked(
+        &self,
+        path: &Path,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(SessionRecord, usize), SessionStoreError> {
         let filename = path.file_name().ok_or_else(|| SessionStoreError::Io {
             message: "invalid session filename".into(),
         })?;
@@ -468,6 +476,10 @@ impl SessionStore for JsonSessionStore {
                 id: id.as_str().to_string(),
             });
         }
+        let removed = self
+            .read_while_locked(&path, None)
+            .ok()
+            .map(|(record, _)| record);
         self.directory
             .remove_file(path.file_name().expect("validated filename"))
             .map_err(|error| SessionStoreError::Io {
@@ -478,6 +490,11 @@ impl SessionStore for JsonSessionStore {
             .open(".")
             .and_then(|file| file.sync_all())
             .map_err(store_io)?;
+        if let Some(record) = removed
+            && let Err(error) = self.reclaim_deleted_archive(&record)
+        {
+            self.diagnose(format!("transcript archive cleanup skipped: {error}"));
+        }
         self.reclaim_chunks();
         Ok(())
     }

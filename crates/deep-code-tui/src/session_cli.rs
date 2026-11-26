@@ -66,6 +66,9 @@ pub fn list() -> anyhow::Result<()> {
 pub fn delete(id: String) -> anyhow::Result<()> {
     let store = open_session_store();
     store.delete(&SessionId::parse(&id)?)?;
+    for diagnostic in store.take_diagnostics() {
+        eprintln!("{}", deep_code_agent::neutralize_display_text(&diagnostic));
+    }
     println!("Deleted session {id}.");
     Ok(())
 }

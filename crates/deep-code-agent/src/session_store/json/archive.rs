@@ -24,8 +24,8 @@ impl JsonSessionStore {
     }
 
     pub(crate) fn discard_compaction_archive(&self, summary_id: &str) {
-        if let (Ok(store), Ok(id)) = (self.archive_store(false), SessionId::parse(summary_id)) {
-            let _ = store.delete(&id);
+        if let Ok(id) = SessionId::parse(summary_id) {
+            let _ = self.remove_archives([id]);
         }
     }
 
@@ -48,6 +48,71 @@ impl JsonSessionStore {
             directory: Arc::new(directory),
             ..self.clone()
         })
+    }
+
+    /// The caller holds the primary store's exclusive lock. Consider only
+    /// segments reachable from the deleted record. A compaction may already
+    /// have written a segment whose new summary is still waiting to save.
+    pub(super) fn reclaim_deleted_archive(
+        &self,
+        deleted: &SessionRecord,
+    ) -> Result<(), SessionStoreError> {
+        let cancel = CancellationToken::new();
+        let mut unused = HashSet::new();
+        self.visit_archives(&deleted.entries, &cancel, |archive| {
+            unused.insert(archive.id);
+            Ok(ControlFlow::Continue(()))
+        })?;
+        if unused.is_empty() {
+            return Ok(());
+        }
+        for entry in self.directory.entries().map_err(store_io)? {
+            let name = PathBuf::from(entry.map_err(store_io)?.file_name());
+            let Some(id) = name.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if name.extension().is_none_or(|extension| extension != "json")
+                || validate_session_id(id).is_err()
+            {
+                continue;
+            }
+            let (record, _) = self.read_while_locked(&self.root.join(name), None)?;
+            self.visit_archives(&record.entries, &cancel, |archive| {
+                unused.remove(&archive.id);
+                Ok(if unused.is_empty() {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                })
+            })?;
+            if unused.is_empty() {
+                return Ok(());
+            }
+        }
+        self.remove_archives(unused)
+    }
+
+    fn remove_archives(
+        &self,
+        archives: impl IntoIterator<Item = SessionId>,
+    ) -> Result<(), SessionStoreError> {
+        let store = self.archive_store(false)?;
+        let _guard = StoreLock::acquire(&store.directory, true, None)?;
+        for id in archives {
+            match store.directory.remove_file(format!("{}.json", id.as_str())) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(store_io(error)),
+            }
+        }
+        #[cfg(unix)]
+        store
+            .directory
+            .open(".")
+            .and_then(|file| file.sync_all())
+            .map_err(store_io)?;
+        store.reclaim_chunks();
+        Ok(())
     }
 
     /// Walk newest to oldest. A segment can carry the summary of its
@@ -169,4 +234,59 @@ fn has_archive(entry: &Arc<SessionEntry>) -> bool {
             ..
         }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn archive(store: &JsonSessionStore, entries: Vec<Arc<SessionEntry>>) -> Arc<SessionEntry> {
+        let mut summary = SessionEntry::compaction("summary", entries.len());
+        let EntryKind::Compaction { has_archive, .. } = &mut summary.kind else {
+            panic!("expected compaction");
+        };
+        *has_archive = true;
+        store.save_compaction_archive(&summary.id, entries).unwrap();
+        Arc::new(summary)
+    }
+
+    #[test]
+    fn deleting_sessions_reclaims_their_archives_after_the_last_reference() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = crate::canonicalize(workspace.path()).unwrap();
+        let store = JsonSessionStore::for_pinned_workspace(&root).unwrap();
+        let old = archive(&store, vec![Arc::new(SessionEntry::user("shared history"))]);
+        let recent = archive(
+            &store,
+            vec![old.clone(), Arc::new(SessionEntry::user("newer history"))],
+        );
+        let pending = archive(&store, vec![Arc::new(SessionEntry::user("unpublished"))]);
+        let archive_store = store.archive_store(false).unwrap();
+        let present = |entry: &SessionEntry| {
+            archive_store
+                .load(&SessionId::parse(&entry.id).unwrap())
+                .is_ok()
+        };
+        let mut original = SessionRecord::new(root.clone(), "system");
+        original.entries.push(recent.clone());
+        store.save(&mut original).unwrap();
+        let mut sibling = SessionRecord::new(root, "system");
+        sibling.entries.push(old.clone());
+        store.save(&mut sibling).unwrap();
+
+        store.delete(&original.id).unwrap();
+        assert!(present(&old));
+        assert!(!present(&recent));
+        assert!(present(&pending));
+        let entries = store
+            .transcript_entries(&store.load(&sibling.id).unwrap(), &CancellationToken::new())
+            .unwrap();
+        assert!(
+            matches!(&entries[1].kind, EntryKind::User { content } if content.text() == "shared history")
+        );
+        store.delete(&sibling.id).unwrap();
+        assert!(!present(&old));
+        assert!(present(&pending));
+        assert!(store.take_diagnostics().is_empty());
+    }
 }
