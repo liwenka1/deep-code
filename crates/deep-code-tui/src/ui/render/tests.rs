@@ -4364,7 +4364,7 @@ fn an_open_history_search_is_always_on_the_status_row() {
         app.lang = Lang::En;
         app.prompt_history.push(crate::app::HistoryPrompt {
             text: "fix the parser".to_string(),
-            images: Vec::new(),
+            ..Default::default()
         });
         if state == "streaming" {
             app.is_streaming = true;
@@ -4389,7 +4389,7 @@ fn history_search_places_the_native_caret_after_the_query() {
     let recalled = "earlier 你好 prompt";
     app.prompt_history.push(crate::app::HistoryPrompt {
         text: recalled.to_string(),
-        images: Vec::new(),
+        ..Default::default()
     });
     let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
 

@@ -5,12 +5,34 @@
 //! concern.
 
 use super::*;
+use tokio::sync::oneshot::error::TryRecvError;
+
+pub(super) struct PendingRetry {
+    input: String,
+    result: images::ImageWorker<Option<VerifiedDraft>>,
+}
+
+struct VerifiedDraft {
+    entry: Arc<deep_code_agent::SessionEntry>,
+    available: Vec<bool>,
+}
 
 impl App {
+    pub(super) fn typed_slash_command(&self, expanded: &str) -> bool {
+        !self.literal_prompt
+            && self.input.split_whitespace().next().is_some_and(|typed| {
+                typed.starts_with('/') && Some(typed) == expanded.split_whitespace().next()
+            })
+    }
+
     pub fn submit(&mut self) {
         // An approval is a modal decision — it must be answered, not typed
         // over — so the composer stays inert until it resolves.
         if self.pending_approval.is_some() {
+            return;
+        }
+        if !self.clipboard_snapshots.is_empty() {
+            self.status = self.tr(TextId::ImageSaving).to_owned();
             return;
         }
         self.close_completion();
@@ -26,7 +48,11 @@ impl App {
             self.status = self.tr(TextId::StatusEmptyPrompt).to_string();
             return;
         }
-        let sent = self.expand_pasted(&display);
+        let sent = self.expand_pasted(if self.literal_prompt {
+            &self.input
+        } else {
+            &display
+        });
         // `/apikey` stops here: it never enters the recallable prompt history,
         // and never reaches the model. Recognised on the text as sent, chips
         // expanded, rather than on the composer's: a key pasted together with
@@ -35,20 +61,21 @@ impl App {
         // like any prompt, into the session transcript with it.
         let as_sent = sent.trim();
         if as_sent.starts_with("/apikey") {
+            if self.literal_prompt {
+                self.status = self.tr(TextId::RetryApiKey).to_owned();
+                return;
+            }
             self.handle_slash_command(as_sent);
             self.clear_input();
             return;
         }
-        // Collected before anything clears the composer: this is what the turn
-        // will actually carry.
-        let images = self.attached_image_paths();
-        // Remembered *before* the vision refusal below, so a prompt that was never
-        // sent still lands in `↑`. That is deliberate and follows the rule the
-        // tests pin (`/help` is remembered too): the history is what the user
-        // typed, not what went out. It also keeps the recovery path available —
-        // the refusal leaves the draft in place, so the common fix is `/model
-        // flash` and Enter, but a user who cleared the draft first gets their
-        // images back with one `↑` instead of retyping.
+        let typed_command = self.typed_slash_command(as_sent);
+        if typed_command && (display == "/retry" || display.starts_with("/retry ")) {
+            self.edit_unsent(as_sent.strip_prefix("/retry").unwrap_or_default().trim());
+            return;
+        }
+        let images = self.attached_image_inputs();
+        // Remember what was typed, with its attachments, before clearing it.
         self.remember_prompt(&sent);
 
         // `/image` edits the *draft*, not the session, so it cannot go through
@@ -56,7 +83,7 @@ impl App {
         // runs, which would wipe the very chip this command just inserted. The
         // typed line is cleared first so what is left is only the chip (bare
         // `/image` inserts nothing, and clears the line the same way).
-        if display == "/image" || display.starts_with("/image ") {
+        if typed_command && (display == "/image" || display.starts_with("/image ")) {
             let arg = as_sent
                 .strip_prefix("/image")
                 .unwrap_or_default()
@@ -78,32 +105,8 @@ impl App {
         // with the composer. The command word itself has to be the typed one —
         // a `/` followed by a pasted `clear` is text, not a command a paste
         // assembled.
-        let command_word = |text: &str| text.split_whitespace().next().map(str::to_string);
-        if display.starts_with('/')
-            && command_word(&display) == command_word(as_sent)
-            && self.handle_slash_command(as_sent)
-        {
+        if typed_command && self.handle_slash_command(as_sent) {
             self.clear_input();
-            return;
-        }
-
-        // Keep the draft when the chosen model cannot take images.
-        //
-        // After the slash branch on purpose: `/image` is how you inspect and fix
-        // what is attached, and it has to run whatever model is configured.
-        //
-        // Stricter than the runtime, and deliberately so. The runtime *degrades*
-        // an image the model cannot take into a sentence, because it has no draft
-        // to keep and refusing there would wedge the session (see
-        // `image::not_accepted_note`). Here the picture is still in front of the
-        // user, so the honest thing is to stop and let them choose: switch the
-        // model, or take the image out. Both are one keystroke, and neither
-        // silently drops what they attached.
-        if !images.is_empty() && supports_vision_for_model(&self.configured_model) == Some(false) {
-            self.status = self.tr_with(
-                TextId::TurnImagesUnsupportedModel,
-                &[("model", &self.configured_model)],
-            );
             return;
         }
 
@@ -122,14 +125,9 @@ impl App {
         // user cell pushed now would render ABOVE it. The cell is added when
         // the queue flushes, after the current turn's cells land.
         if self.is_streaming {
-            // An image cannot ride the live turn. The model for a turn is chosen
-            // before it starts, and there is no way to hand a picture to one
-            // picked without knowing about it — so a steered image would go to
-            // whatever this turn is running on, up to and including Pro, which
-            // answers 400. It cannot simply be queued either: the steering queue
-            // pairs each entry with the runtime's copy by FIFO position, and an
-            // entry that is never injected breaks that pairing for every entry
-            // behind it. So: refuse, and keep the draft.
+            // The steering queue carries text and pairs entries with the
+            // runtime's queue by FIFO position. Keep an image prompt in the
+            // composer for the next turn.
             if !images.is_empty() {
                 self.status = self.tr(TextId::ImageWhileStreaming).to_string();
                 return;
@@ -170,6 +168,154 @@ impl App {
         self.start_user_turn(sent, images, None);
     }
 
+    fn edit_unsent(&mut self, arg: &str) {
+        let index = if arg.is_empty() {
+            Some(0)
+        } else {
+            arg.parse::<usize>()
+                .ok()
+                .and_then(|number| number.checked_sub(1))
+        };
+        self.error = None;
+        let (Some(index), Ok(handle)) = (index, tokio::runtime::Handle::try_current()) else {
+            self.status = self.tr(TextId::RetryMissing).to_owned();
+            return;
+        };
+        if self
+            .pending_retry
+            .as_ref()
+            .is_some_and(|pending| pending.input == self.input)
+        {
+            return;
+        }
+        let runtime = Arc::clone(&self.runtime);
+        match images::spawn_image_worker("retry-draft", move |cancel| {
+            let entry = handle
+                .block_on(runtime.unsent_messages())
+                .into_iter()
+                .nth(index)?;
+            let deep_code_agent::EntryKind::User { content } = &entry.kind else {
+                return None;
+            };
+            let available = content
+                .images()
+                .map(|image| image.verify_cancellable(cancel).is_ok())
+                .collect();
+            Some(VerifiedDraft { entry, available })
+        }) {
+            Ok(result) => {
+                self.pending_retry = Some(PendingRetry {
+                    input: self.input.clone(),
+                    result,
+                });
+                self.status = self.tr(TextId::RetryChecking).to_owned();
+            }
+            Err(error) => {
+                self.status =
+                    self.tr_with(TextId::RetryCheckFailed, &[("reason", &error.to_string())]);
+            }
+        }
+    }
+
+    pub(super) fn poll_retry(&mut self) -> bool {
+        let Some(pending) = &mut self.pending_retry else {
+            return false;
+        };
+        let result = pending.result.try_recv();
+        if matches!(result, Err(TryRecvError::Empty)) {
+            return false;
+        }
+        let input_matches = pending.input == self.input;
+        self.pending_retry = None;
+        if !input_matches {
+            self.status = self.tr(TextId::RetryInputChanged).to_owned();
+            return true;
+        }
+        match result {
+            Ok(Some(draft)) => self.restore_retry(draft),
+            Ok(None) => self.status = self.tr(TextId::RetryMissing).to_owned(),
+            Err(_) => {
+                self.status = self.tr_with(
+                    TextId::RetryCheckFailed,
+                    &[("reason", self.tr(TextId::ImageWorkerStopped))],
+                )
+            }
+        }
+        true
+    }
+
+    fn restore_retry(&mut self, VerifiedDraft { entry, available }: VerifiedDraft) {
+        let deep_code_agent::EntryKind::User { content } = &entry.kind else {
+            return;
+        };
+        let Some(unsent) = &entry.unsent else { return };
+
+        let parked = std::mem::take(&mut self.history_draft);
+        self.clear_input();
+        self.input = content.text();
+        let mut missing = unsent.missing_image_labels.clone();
+        for chip in &missing {
+            self.input = self.input.replace(chip, "");
+        }
+        for (index, (image, available)) in content.images().zip(available).enumerate() {
+            let chip = unsent
+                .image_labels
+                .get(index)
+                .filter(|chip| self.input.contains(chip.as_str()));
+            if !available {
+                if let Some(chip) = chip.filter(|chip| !chip.is_empty()) {
+                    self.input = self.input.replace(chip, "");
+                    missing.push(chip.clone());
+                } else {
+                    missing.push(image.to_string());
+                }
+                continue;
+            }
+            let id = chip
+                .and_then(|chip| chip.split_once('#'))
+                .and_then(|(_, rest)| rest.split_once(' '))
+                .and_then(|(id, _)| id.parse::<usize>().ok());
+            let (id, chip) = match (id, chip) {
+                (Some(id), Some(chip)) => (id, chip.clone()),
+                _ => {
+                    let id = self.next_image_id + 1;
+                    let chip = self.tr_with(
+                        TextId::ImageChip,
+                        &[("id", &id.to_string()), ("format", image.format.label())],
+                    );
+                    self.input.push(' ');
+                    self.input.push_str(&chip);
+                    (id, chip)
+                }
+            };
+            self.next_image_id = self.next_image_id.max(id);
+            self.attached_images.push(images::AttachedImage {
+                id,
+                chip,
+                source: deep_code_agent::UserImage::Saved(image.clone()),
+                format: image.format,
+                bytes: image.bytes,
+            });
+        }
+        self.literal_prompt = !self.input.trim().is_empty();
+        self.cursor_to_end();
+        if !parked.text.is_empty() {
+            self.remember_prompt(&self.input.clone());
+            self.history_cursor = Some(self.prompt_history.len() - 1);
+            self.history_draft = parked;
+        }
+        self.status = if missing.is_empty() {
+            self.tr(TextId::RetryReady).to_owned()
+        } else {
+            let warning = self.tr_with(
+                TextId::RetryMissingImages,
+                &[("images", &missing.join(", "))],
+            );
+            self.history.push(HistoryCell::system(warning.clone()));
+            warning
+        };
+    }
+
     /// Start a turn from `text` (plus `images`) right now — the tail of
     /// [`Self::submit`] once the composer and the slash commands are out of the
     /// way, shared with `/init`, which sends a canned brief. `shown` is what
@@ -178,7 +324,7 @@ impl App {
     pub(crate) fn start_user_turn(
         &mut self,
         text: String,
-        images: Vec<std::path::PathBuf>,
+        images: Vec<(deep_code_agent::UserImage, String)>,
         shown: Option<String>,
     ) {
         self.error = None;
@@ -197,7 +343,9 @@ impl App {
         self.history
             .push(HistoryCell::user(shown.unwrap_or_else(|| text.clone())));
 
-        self.start_stream(StreamRequest::User(UserTurn::with_images(text, images)));
+        self.start_stream(StreamRequest::User(UserTurn::with_labeled_images(
+            text, images,
+        )));
     }
 
     /// Send any prompts queued (steered) while the just-finished turn was
@@ -236,9 +384,8 @@ impl App {
         self.status = self.tr(TextId::StatusCancelling).to_string();
         // Cancel means "changed my mind", so drop the queue here and now rather
         // than waiting for `TurnCancelled` to do it: if the turn had already
-        // finished and its `TurnFinished` is still sitting unread in the channel,
-        // `cancel_turn` is a no-op on the idle runtime, no `TurnCancelled` ever
-        // arrives, and the queue would be auto-sent despite the cancel.
+        // finished and its `TurnFinished` is still unread, no `TurnCancelled`
+        // arrives and the queue would be auto-sent despite the cancel.
         //
         // Unless a cancel is already in flight: everything queued since the
         // first Esc was typed *after* the change of mind — it is the replacement
@@ -250,13 +397,8 @@ impl App {
             self.pending_steering_flush = false;
         }
         self.cancel_requested = true;
-        let runtime = Arc::clone(&self.runtime);
-        // Streaming and approval cancellation both finish on the original
-        // TurnHandle stream, so the bridge remains responsible for the tail.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let _ = runtime.cancel_turn().await;
-            });
+        if let Some(cancel) = &self.stream_cancel {
+            cancel.cancel();
         }
     }
 
@@ -339,9 +481,23 @@ impl App {
         let (tx, rx) = mpsc::unbounded_channel();
         self.ui_rx = Some(rx);
         self.ui_tx = Some(tx.downgrade());
+        let cancel = CancellationToken::new();
+        self.stream_cancel = Some(cancel.clone());
         tokio::spawn(async move {
-            let mut turn = runtime.start_turn(prompt).await;
-            while let Some(event) = turn.recv().await {
+            let mut turn = runtime.start_turn_cancellable(prompt, &cancel).await;
+            let mut cancelling = false;
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    () = cancel.cancelled(), if !cancelling => {
+                        cancelling = true;
+                        // Approval pauses have no running model loop to observe cancellation.
+                        turn.cancel().await;
+                        continue;
+                    }
+                    event = turn.recv() => event,
+                };
+                let Some(event) = event else { break };
                 if tx.send(UiUpdate::Event(Box::new(event))).is_err() {
                     return;
                 }
@@ -413,7 +569,7 @@ impl App {
                     self.pending_steering_flush = false;
                 }
                 self.is_streaming = false;
-                self.ui_rx = None;
+                self.clear_stream_receiver();
             }
         }
     }
@@ -422,6 +578,9 @@ impl App {
         // Keep any streamed partial content visible: flush the active turn
         // into history before appending the error cell, otherwise the next
         // TurnStarted would silently discard it.
+        if let Some(active) = &mut self.active_turn {
+            active.abandon_unanswered_approvals();
+        }
         self.flush_active_turn();
         self.error = Some(message.clone());
         self.status = self.tr(TextId::StatusAgentError).to_string();
@@ -431,15 +590,18 @@ impl App {
         )));
         self.is_streaming = false;
         self.cancel_requested = false;
+        self.pending_approval = None;
         // A failed turn is not a clean hand-off: don't auto-fire queued
         // prompts into a broken state (an API-key error would just re-error
         // each). They stay in the transcript / prompt history to resend.
         self.steering_queue.clear();
+        self.pending_steering_flush = false;
         self.clear_stream_receiver();
     }
 
     pub(crate) fn clear_stream_receiver(&mut self) {
         self.ui_rx = None;
         self.ui_tx = None;
+        self.stream_cancel = None;
     }
 }

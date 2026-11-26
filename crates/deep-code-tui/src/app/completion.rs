@@ -23,6 +23,9 @@ impl App {
         // `clear_input`); `accept_completion` has just taken the menu, and the
         // text it rewrites — a `/command`, an `@` token — holds no chip.
         self.sync_images();
+        if self.input.trim().is_empty() {
+            self.literal_prompt = false;
+        }
         self.completion = self.compute_completion();
     }
 
@@ -30,7 +33,8 @@ impl App {
         // `/skill <partial>`: the skill names, until the name is followed by
         // whitespace (the user is typing arguments by then). Rides the slash
         // menu — accepting one replaces the whole draft with `/skill name `.
-        if let Some(partial) = self.input.strip_prefix("/skill ")
+        if !self.literal_prompt
+            && let Some(partial) = self.input.strip_prefix("/skill ")
             && !partial.contains(char::is_whitespace)
         {
             let filter = partial.to_lowercase();
@@ -48,7 +52,9 @@ impl App {
                 selected: 0,
             });
         }
-        if let Some(rest) = self.input.strip_prefix('/') {
+        if !self.literal_prompt
+            && let Some(rest) = self.input.strip_prefix('/')
+        {
             if self.input.contains(char::is_whitespace) {
                 return None;
             }

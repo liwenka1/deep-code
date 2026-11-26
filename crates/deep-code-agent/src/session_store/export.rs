@@ -80,6 +80,7 @@ impl JsonSessionStore {
             destination: directory,
             destination_path: destination.clone(),
             copied: HashMap::new(),
+            copied_images: HashSet::new(),
             active: HashSet::new(),
             in_flight_bytes: 0,
         };
@@ -129,6 +130,7 @@ struct Exporter {
     destination: Dir,
     destination_path: PathBuf,
     copied: HashMap<PathBuf, CopiedSource>,
+    copied_images: HashSet<ImageAsset>,
     active: HashSet<PathBuf>,
     in_flight_bytes: u64,
 }
@@ -168,26 +170,28 @@ impl Exporter {
                 "image workspace differs from the session store",
             ));
         }
-        let relative = image
-            .path()
-            .strip_prefix(&self.source_path)
-            .map_err(|_| export_error("image is outside the source workspace"))?
-            .to_path_buf();
-        if !self.copied.contains_key(&relative) {
-            let bytes = image
-                .read()
-                .map_err(|error| export_error(error.note(&image.path())))?;
-            write_source(&self.destination, &relative, &bytes).map_err(io_error)?;
-            self.copied.insert(
-                relative,
-                CopiedSource {
-                    original_bytes: bytes.len(),
-                    exported_bytes: bytes.len(),
-                    structured: false,
-                },
-            );
+        let mut exported = image.clone();
+        exported.workspace.clone_from(&self.destination_path);
+        if !self.copied_images.contains(image) {
+            let source = image.path();
+            image
+                .validate_identity()
+                .map_err(|error| export_error(error.note(&source)))?;
+            let relative = source
+                .strip_prefix(&self.source_path)
+                .map_err(|_| export_error("image is outside the source workspace"))?;
+            publish_source(&self.destination, relative, |file| {
+                image
+                    .copy_verified_to(file)
+                    .map_err(|error| io::Error::other(error.note(&source)))
+            })
+            .map_err(io_error)?;
+            exported
+                .verify()
+                .map_err(|error| export_error(error.note(&exported.path())))?;
+            self.copied_images.insert(image.clone());
         }
-        image.workspace = self.destination_path.clone();
+        *image = exported;
         Ok(())
     }
 
@@ -417,6 +421,20 @@ fn read_source(root: &Dir, relative: &Path, max_bytes: u64) -> io::Result<Vec<u8
 }
 
 fn write_source(root: &Dir, relative: &Path, bytes: &[u8]) -> io::Result<()> {
+    publish_source(root, relative, |file| file.write_all(bytes))?;
+    if read_source(root, relative, MAX_SOURCE_BYTES)? != bytes {
+        return Err(io::Error::other(
+            "export destination source already has different contents",
+        ));
+    }
+    Ok(())
+}
+
+fn publish_source(
+    root: &Dir,
+    relative: &Path,
+    write: impl FnOnce(&mut cap_std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     let mut parent = root.try_clone()?;
     let names: Vec<_> = relative.components().collect();
     for component in &names[..names.len() - 1] {
@@ -438,7 +456,7 @@ fn write_source(root: &Dir, relative: &Path, bytes: &[u8]) -> io::Result<()> {
             options.mode(0o600);
         }
         let mut file = parent.open_with(&temporary, &options)?;
-        file.write_all(bytes)?;
+        write(&mut file)?;
         file.sync_all()?;
         drop(file);
         match parent.hard_link(&temporary, &parent, names.last().unwrap().as_os_str()) {
@@ -451,13 +469,7 @@ fn write_source(root: &Dir, relative: &Path, bytes: &[u8]) -> io::Result<()> {
         Ok(())
     })();
     let _ = parent.remove_file(&temporary);
-    result?;
-    if read_source(root, relative, MAX_SOURCE_BYTES)? != bytes {
-        return Err(io::Error::other(
-            "export destination source already has different contents",
-        ));
-    }
-    Ok(())
+    result
 }
 
 fn export_destination(path: &Path) -> io::Result<(PathBuf, Dir)> {

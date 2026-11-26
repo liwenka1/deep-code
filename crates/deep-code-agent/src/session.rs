@@ -6,7 +6,10 @@ use crate::image::{ImageAsset, ImageRef};
 use crate::message::Message;
 use crate::model::ToolCallPayload;
 use crate::runtime::TurnId;
-use crate::session_entry::{Ask, EntryKind, ExchangeResult, SessionEntry, ToolExchange};
+use crate::session_entry::{
+    Ask, EntryKind, ExchangeResult, SessionEntry, ToolExchange, UnsentMessage,
+};
+use crate::session_store::{DRAFT_STORAGE_BUDGET_BYTES, MAX_RETAINED_DRAFTS, charge_json};
 use crate::tool::ToolResultStatus;
 use crate::tool::details::{PreparedPreview, PreviewRetention};
 
@@ -35,6 +38,14 @@ pub(crate) const COMPACTION_SUMMARY_PREFIX: &str = "[会话摘要 / session summ
 pub struct Session {
     entries: Vec<Arc<SessionEntry>>,
     previews: PreviewRetention,
+}
+
+pub(crate) struct RequestMessages {
+    pub messages: Vec<Message>,
+    pub image_occurrences: HashMap<(usize, usize), String>,
+    /// User messages for the active turn, protected during image preparation.
+    pub submissions: Vec<usize>,
+    pub has_pending: bool,
 }
 
 impl PartialEq for Session {
@@ -77,6 +88,90 @@ impl Session {
 
     pub fn push_user(&mut self, turn_id: TurnId, content: impl Into<Content>) {
         self.push_entry(SessionEntry::user(content).with_turn_id(turn_id));
+    }
+
+    pub(crate) fn push_pending_user(
+        &mut self,
+        turn_id: TurnId,
+        content: Content,
+        unsent: UnsentMessage,
+    ) {
+        let mut entry = SessionEntry::user(content).with_turn_id(turn_id);
+        entry.unsent = Some(unsent);
+        self.push_entry(entry);
+    }
+
+    pub(crate) fn update_pending_user(
+        &mut self,
+        turn_id: &TurnId,
+        content: Content,
+        unsent: UnsentMessage,
+    ) -> bool {
+        let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
+            entry.pending_for(Some(turn_id)) && matches!(entry.kind, EntryKind::User { .. })
+        }) else {
+            return false;
+        };
+        let entry = Arc::make_mut(entry);
+        entry.kind = EntryKind::User { content };
+        entry.unsent = Some(unsent);
+        true
+    }
+
+    pub(crate) fn settle_submissions(&mut self, turn_id: &TurnId, error: Option<&str>) -> bool {
+        let mut settled = false;
+        for entry in &mut self.entries {
+            if entry.turn_id.as_ref() != Some(turn_id) {
+                continue;
+            }
+            let Some(draft) = entry.unsent.as_ref() else {
+                continue;
+            };
+            if draft.error.is_some() {
+                settled |= error.is_some();
+                continue;
+            }
+            let entry = Arc::make_mut(entry);
+            if let Some(error) = error {
+                entry.unsent.as_mut().expect("pending submission").error = Some(error.to_owned());
+            } else {
+                entry.unsent = None;
+            }
+            settled = true;
+        }
+        settled
+    }
+
+    /// Keep the newest drafts that fit. Call while closing a turn or loading
+    /// an idle session, so pending input is never evicted before submission.
+    /// Return discarded turn IDs that no remaining entries reference.
+    pub(crate) fn limit_retained_drafts(&mut self) -> HashSet<TurnId> {
+        let mut remaining = DRAFT_STORAGE_BUDGET_BYTES;
+        let mut slots = MAX_RETAINED_DRAFTS;
+        let mut removed_turns = HashSet::new();
+        let previous_len = self.entries.len();
+        self.entries.reverse();
+        self.entries.retain(|entry| {
+            if entry.unsent.is_none() {
+                return true;
+            }
+            if slots > 0 && charge_json(entry, &mut remaining) {
+                slots -= 1;
+                return true;
+            }
+            removed_turns.extend(entry.turn_id.iter().cloned());
+            false
+        });
+        self.entries.reverse();
+        if self.entries.len() != previous_len {
+            for entry in &self.entries {
+                if let Some(turn_id) = &entry.turn_id {
+                    removed_turns.remove(turn_id);
+                }
+            }
+            self.previews = PreviewRetention::from_entries(&mut self.entries);
+        }
+        removed_turns
     }
 
     /// Append a user turn that carries images.
@@ -122,11 +217,7 @@ impl Session {
         content: String,
         reasoning: String,
     ) -> bool {
-        let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| Arc::ptr_eq(entry, anchor))
-        else {
+        let Some(index) = self.entries.iter().position(|entry| entry.id == anchor.id) else {
             return false;
         };
         let reply =
@@ -207,9 +298,13 @@ impl Session {
     /// construction.
     #[must_use]
     pub fn wire_messages(&self) -> Vec<Message> {
+        self.wire_messages_for(None)
+    }
+
+    pub(crate) fn wire_messages_for(&self, turn_id: Option<&TurnId>) -> Vec<Message> {
         self.entries
             .iter()
-            .flat_map(|entry| entry_wire_messages(entry))
+            .flat_map(|entry| wire_entry(entry, entry.pending_for(turn_id)))
             .collect()
     }
 
@@ -217,15 +312,23 @@ impl Session {
     /// Only the positions change when compaction moves retained entries.
     pub(crate) fn wire_messages_with_image_occurrences(
         &self,
-    ) -> (Vec<Message>, HashMap<(usize, usize), String>) {
+        turn_id: Option<&TurnId>,
+    ) -> RequestMessages {
         let mut messages = Vec::new();
-        let mut occurrences = HashMap::new();
+        let mut image_occurrences = HashMap::new();
+        let mut submissions = Vec::new();
+        let mut has_pending = false;
         for entry in &self.entries {
-            for (entry_message, message) in entry_wire_messages(entry).into_iter().enumerate() {
+            let pending = entry.pending_for(turn_id);
+            if pending && matches!(entry.kind, EntryKind::User { .. }) {
+                submissions.push(messages.len());
+            }
+            has_pending |= pending;
+            for (entry_message, message) in wire_entry(entry, pending).into_iter().enumerate() {
                 let message_index = messages.len();
                 for (block_index, block) in message.content.blocks.iter().enumerate() {
                     if matches!(block, crate::content::ContentBlock::Image { .. }) {
-                        occurrences.insert(
+                        image_occurrences.insert(
                             (message_index, block_index),
                             format!("{}:{entry_message}:{block_index}", entry.id),
                         );
@@ -234,7 +337,12 @@ impl Session {
                 messages.push(message);
             }
         }
-        (messages, occurrences)
+        RequestMessages {
+            messages,
+            image_occurrences,
+            submissions,
+            has_pending,
+        }
     }
 
     /// Enumerate active provenance without cloning model-facing message text.
@@ -299,6 +407,13 @@ fn compaction_image_source_text(sources: &[crate::session_entry::CompactionImage
 /// Wire messages for one entry. Shared with compaction's archived-entry
 /// summarizer so summaries stay byte-equivalent with the message-based path.
 pub(crate) fn entry_wire_messages(entry: &SessionEntry) -> Vec<Message> {
+    wire_entry(entry, false)
+}
+
+fn wire_entry(entry: &SessionEntry, include_pending: bool) -> Vec<Message> {
+    if entry.unsent.is_some() && !include_pending {
+        return Vec::new();
+    }
     match &entry.kind {
         EntryKind::System { content } => vec![Message::system(content.clone())],
         EntryKind::User { content } => vec![Message::user_content(
@@ -351,6 +466,86 @@ mod tests {
     use crate::model::{ToolCallFunctionPayload, ToolCallPayload};
 
     #[test]
+    fn compaction_counts_visible_entries_and_the_active_pending_user() {
+        let mut session = Session::new();
+        session.push_system("system");
+        let accepted = TurnId::new();
+        session.push_user(accepted.clone(), "accepted");
+        session.push_assistant(accepted, "answer", "", Vec::new());
+        for _ in 0..5 {
+            session.push_pending_user(
+                TurnId::new(),
+                Content::from("rejected"),
+                UnsentMessage::default(),
+            );
+        }
+        assert!(crate::compaction::plan_compaction(session.entries(), None).is_none());
+        for _ in 0..3 {
+            session.push_system("received context");
+        }
+        let pending = TurnId::new();
+        session.push_pending_user(
+            pending.clone(),
+            Content::from("sending now"),
+            UnsentMessage::default(),
+        );
+        assert!(crate::compaction::plan_compaction(session.entries(), None).is_none());
+        let plan = crate::compaction::plan_compaction(session.entries(), Some(&pending)).unwrap();
+        assert_eq!(plan.tail_start(), 2);
+    }
+
+    #[test]
+    fn draft_budget_counts_serialized_text_and_diagnostics_together() {
+        let mut session = Session::new();
+        let discarded = TurnId::new();
+        let retained = TurnId::new();
+        let draft = "x".repeat((DRAFT_STORAGE_BUDGET_BYTES / 4) as usize);
+        for turn_id in [&discarded, &retained] {
+            session.push_pending_user(
+                turn_id.clone(),
+                Content::from(draft.clone()),
+                UnsentMessage {
+                    error: Some(draft.clone()),
+                    ..UnsentMessage::default()
+                },
+            );
+        }
+        assert_eq!(session.limit_retained_drafts(), HashSet::from([discarded]));
+        assert_eq!(session.entries().len(), 1);
+        assert_eq!(session.entries()[0].turn_id.as_ref(), Some(&retained));
+    }
+
+    #[test]
+    fn compaction_preserves_failed_drafts_outside_model_context() {
+        let mut session = Session::new();
+        session.push_system("system");
+        session.push_pending_user(
+            TurnId::new(),
+            Content::from("rejected draft"),
+            UnsentMessage {
+                error: Some("refused".into()),
+                ..UnsentMessage::default()
+            },
+        );
+        for _ in 0..6 {
+            let turn_id = TurnId::new();
+            session.push_user(turn_id.clone(), "submitted");
+            session.push_assistant(turn_id, "answer", "", Vec::new());
+        }
+        let compacted = crate::compaction::compact_entries(session.entries());
+        assert!(compacted.archived_count > 0);
+        assert!(!compacted.summary.contains("rejected draft"));
+        session.replace_entries(compacted.entries);
+        assert!(session.entries().iter().any(|entry| entry.unsent.is_some()));
+        assert!(
+            session
+                .wire_messages()
+                .iter()
+                .all(|message| !message.content.text().contains("rejected draft"))
+        );
+    }
+
+    #[test]
     fn image_occurrences_keep_source_identity_through_compaction_and_reload() {
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().canonicalize().unwrap();
@@ -362,7 +557,11 @@ mod tests {
             session.push_user_with_images(turn.clone(), "observe", vec![image.clone()]);
             session.push_assistant(turn, "observed", "", Vec::new());
         }
-        let (messages, before) = session.wire_messages_with_image_occurrences();
+        let RequestMessages {
+            messages,
+            image_occurrences: before,
+            ..
+        } = session.wire_messages_with_image_occurrences(None);
         assert_eq!(
             session.image_observation_ids(),
             before.values().cloned().collect()
@@ -375,7 +574,11 @@ mod tests {
         let compacted = crate::compaction::compact_entries(session.entries());
         assert!(compacted.archived_count > 0);
         session.replace_entries(compacted.entries);
-        let (messages, after) = session.wire_messages_with_image_occurrences();
+        let RequestMessages {
+            messages,
+            image_occurrences: after,
+            ..
+        } = session.wire_messages_with_image_occurrences(None);
         let new_position = messages
             .iter()
             .rposition(|message| message.content.has_images())
@@ -385,14 +588,15 @@ mod tests {
         let encoded = serde_json::to_vec(session.entries()).unwrap();
         let decoded = serde_json::from_slice(&encoded).unwrap();
         let restored = Session::from_entries(decoded);
-        assert_eq!(
-            restored.wire_messages_with_image_occurrences(),
-            (messages, after)
-        );
+        let restored_projection = restored.wire_messages_with_image_occurrences(None);
+        assert_eq!(restored_projection.messages, messages);
+        assert_eq!(restored_projection.image_occurrences, after);
         let mut restored = restored;
         let same_turn = restored.entries().last().unwrap().turn_id.clone().unwrap();
         restored.push_user_with_images(same_turn, "observe again", vec![image]);
-        let (_, occurrences) = restored.wire_messages_with_image_occurrences();
+        let occurrences = restored
+            .wire_messages_with_image_occurrences(None)
+            .image_occurrences;
         assert_eq!(
             occurrences.values().filter(|id| **id == identity).count(),
             1

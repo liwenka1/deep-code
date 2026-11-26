@@ -8,7 +8,7 @@
 //! drives [`GuardedStream::next`].
 //!
 //! Opening retries transient API and transport errors with backoff.
-//! Mid-stream errors re-open the same request until the first content arrives.
+//! Transient errors can re-open the same request before the first content arrives.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,7 +111,7 @@ impl GuardedStream {
                     return Some(Ok(event));
                 }
                 Ok(Some(Err(error))) => {
-                    if self.any_content {
+                    if self.any_content || !open_error_retriable(&error) {
                         self.finished = true;
                         return Some(Err(error));
                     }
@@ -145,6 +145,7 @@ impl GuardedStream {
                     self.inner = stream;
                     return Ok(());
                 }
+                Err(error) if !open_error_retriable(&error) => return Err(error),
                 Err(error) => last_error = error,
             }
         }
@@ -157,16 +158,36 @@ impl AgentRuntime {
     pub(super) async fn open_turn_stream(
         &self,
         request: ChatRequest,
+        submissions: &[usize],
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> AgentResult<GuardedStream> {
-        let prepared = self.prepare_model_request(request);
+        if !request
+            .messages
+            .iter()
+            .any(|message| message.content.has_images())
+        {
+            return self.open_stream(request).await;
+        }
+        let accepted = supports_vision_for_model(&request.model).unwrap_or(true);
+        let detail = self.config.vision_detail;
+        let submissions = submissions.to_vec();
+        let worker_cancel = cancel.child_token();
+        let _cancel_on_drop = worker_cancel.clone().drop_guard();
+        let prepared = tokio::task::spawn_blocking(move || {
+            crate::image::prepare_request_images_cancellable(
+                request,
+                Some(detail),
+                accepted,
+                &submissions,
+                &worker_cancel,
+            )
+        })
+        .await
+        .map_err(|error| AgentError::Attachment(error.to_string()))?
+        .map_err(AgentError::Attachment)?;
         let mut stream = self.open_stream(prepared.request).await?;
         stream.images = prepared.images;
         Ok(stream)
-    }
-
-    fn prepare_model_request(&self, request: ChatRequest) -> crate::image::PreparedImageRequest {
-        let accepted = supports_vision_for_model(&request.model).unwrap_or(true);
-        crate::image::prepare_request_images(request, Some(self.config.vision_detail), accepted)
     }
 
     /// Open a prepared turn or handover request, carrying the remaining retry

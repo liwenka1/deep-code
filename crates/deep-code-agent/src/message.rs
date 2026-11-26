@@ -5,7 +5,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::content::{Content, ContentBlock};
-use crate::image::{ImageDetail, ImageRef};
+use crate::image::{ImageDetail, ImageRef, PreparedImage};
 use crate::model::ToolCallPayload;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,9 +132,16 @@ enum WirePart<'a> {
 
 #[derive(Serialize)]
 struct WireImage<'a> {
-    url: &'a str,
+    url: WireImageUrl<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum WireImageUrl<'a> {
+    Inline(&'a str),
+    Asset(&'a PreparedImage),
 }
 
 impl Serialize for Message {
@@ -153,7 +160,15 @@ impl Serialize for Message {
                         image: ImageRef::Url { url, detail },
                     } => parts.push(WirePart::Image {
                         image_url: WireImage {
-                            url,
+                            url: WireImageUrl::Inline(url),
+                            detail: detail.map(ImageDetail::as_str),
+                        },
+                    }),
+                    ContentBlock::Image {
+                        image: ImageRef::Prepared { source, detail },
+                    } => parts.push(WirePart::Image {
+                        image_url: WireImage {
+                            url: WireImageUrl::Asset(source),
                             detail: detail.map(ImageDetail::as_str),
                         },
                     }),

@@ -1669,7 +1669,7 @@ mod tests {
         let mut app = en_app("draft");
         app.prompt_history.push(crate::app::HistoryPrompt {
             text: "earlier prompt".to_string(),
-            images: Vec::new(),
+            ..Default::default()
         });
         handle_key(
             &mut app,
@@ -1701,7 +1701,7 @@ mod tests {
         let recalled = format!("earlier prompt {commit}");
         app.prompt_history.push(crate::app::HistoryPrompt {
             text: recalled.clone(),
-            images: Vec::new(),
+            ..Default::default()
         });
         app.history_search_start();
 

@@ -7,6 +7,7 @@
 //! 2. render [`RuntimeEvent`]s as they arrive,
 //! 3. forward approval decisions via [`AgentRuntime::submit_approval`].
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use std::path::PathBuf;
@@ -14,9 +15,9 @@ use std::path::PathBuf;
 #[cfg(test)]
 use deep_code_agent::SessionStore;
 use deep_code_agent::{
-    AgentConfig, AgentRuntime, ApprovalDecision, ApprovalRequest, CostCurrency, JobStore,
-    JsonSessionStore, LaunchedRuntime, RuntimeEvent, SessionRecord, SharedSubAgentManager,
-    TurnTelemetry, UserTurn, default_config_path, launch_runtime, supports_vision_for_model,
+    AgentConfig, AgentRuntime, ApprovalDecision, ApprovalRequest, CancellationToken, CostCurrency,
+    JobStore, JsonSessionStore, LaunchedRuntime, RuntimeEvent, SessionRecord,
+    SharedSubAgentManager, TurnTelemetry, UserTurn, default_config_path, launch_runtime,
 };
 use tokio::sync::mpsc;
 
@@ -194,6 +195,7 @@ pub struct App {
     job_store: Option<JobStore>,
     ui_rx: Option<UiUpdateReceiver>,
     ui_tx: Option<mpsc::WeakUnboundedSender<UiUpdate>>,
+    stream_cancel: Option<CancellationToken>,
     pub(crate) cost_currency: CostCurrency,
     pub(crate) configured_model: String,
     pub(crate) configured_reasoning: String,
@@ -255,12 +257,16 @@ pub struct App {
     /// show a compact `[粘贴 #N …]` chip in the composer; the real content is
     /// expanded back in on submit. Reset once a turn is sent or input cleared.
     pub(crate) pasted_blocks: Vec<(String, String)>,
+    /// This composer holds model input. Its leading slash and edge whitespace are literal.
+    literal_prompt: bool,
     /// Images attached to the draft, in the order they were attached.
     ///
     /// The chips live in `input` as ordinary text and this is the list they
     /// address — see [`images`] for why the split is worth it. Cleared with the
     /// input, pruned by [`App::sync_images`] whenever the draft loses a chip.
     pub(crate) attached_images: Vec<images::AttachedImage>,
+    clipboard_snapshots: VecDeque<images::ClipboardSnapshot>,
+    pending_retry: Option<stream::PendingRetry>,
     /// Monotonic source of chip numbers. Never reused, so recalling an old
     /// prompt cannot make its `#3` mean a different picture than it did.
     pub(crate) next_image_id: usize,
@@ -621,13 +627,28 @@ pub(crate) const PROMPT_HISTORY_CAP: usize = 100;
 /// so a recall restores the same `[图片 #2 PNG]` the text refers to — a
 /// re-attach would number them afresh and leave the recalled text pointing at
 /// pictures that no longer exist under those names.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HistoryPrompt {
     pub(crate) text: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) literal_prompt: bool,
+    #[serde(skip)]
     pub(crate) images: Vec<images::AttachedImage>,
+    #[serde(skip)]
+    pub(crate) pasted_blocks: Vec<(String, String)>,
 }
 
 impl HistoryPrompt {
+    fn take_draft(app: &mut App) -> Self {
+        app.cancel_image_work();
+        Self {
+            text: std::mem::take(&mut app.input),
+            images: std::mem::take(&mut app.attached_images),
+            pasted_blocks: std::mem::take(&mut app.pasted_blocks),
+            literal_prompt: std::mem::take(&mut app.literal_prompt),
+        }
+    }
+
     /// What `↑` puts back into the composer.
     ///
     /// The completion menu closes with the text it was completing. Left open
@@ -639,9 +660,12 @@ impl HistoryPrompt {
     /// would reopen the menu, and the menu takes `↑`, so the next `↑` would
     /// stop walking the history. The draft `history_next` walks back to is the
     /// one exception, and it recomputes the menu there itself.
-    fn restore(&self, app: &mut App) {
-        app.input = self.text.clone();
-        app.attached_images = self.images.clone();
+    fn restore(self, app: &mut App) {
+        app.cancel_image_work();
+        app.input = self.text;
+        app.attached_images = self.images;
+        app.pasted_blocks = self.pasted_blocks;
+        app.literal_prompt = self.literal_prompt;
         app.cursor_to_end();
         app.close_completion();
     }
@@ -777,13 +801,7 @@ impl App {
         let prompt_history: Vec<HistoryPrompt> = prompt_history_path
             .as_deref()
             .map(|path| crate::prompt_history::load(path, PROMPT_HISTORY_CAP))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|text| HistoryPrompt {
-                text,
-                images: Vec::new(),
-            })
-            .collect();
+            .unwrap_or_default();
         let workspace_display = home_relative(&workspace);
         // Exhaustive destructuring, not field-by-field moves: the previous
         // shape read nine fields and silently ignored `warnings`, and nothing
@@ -922,6 +940,7 @@ impl App {
             job_store,
             ui_rx: None,
             ui_tx: None,
+            stream_cancel: None,
             cost_currency,
             configured_model,
             configured_reasoning,
@@ -945,7 +964,10 @@ impl App {
             streaming_since: None,
             pending_launch_warnings: Vec::new(),
             pasted_blocks: Vec::new(),
+            literal_prompt: false,
             attached_images: Vec::new(),
+            clipboard_snapshots: VecDeque::new(),
+            pending_retry: None,
             next_image_id: 0,
             transcript: None,
             selection: None,
@@ -1150,13 +1172,12 @@ impl App {
 
     /// Clear the composer and any pending collapsed-paste blocks.
     fn clear_input(&mut self) {
+        self.discard_image_work();
         self.input.clear();
+        self.literal_prompt = false;
         self.input_cursor = 0;
         self.pasted_blocks.clear();
-        // The chips went with the text, so the attachments have to go too —
-        // `sync_images` would drop them on the next edit anyway, but a cleared
-        // composer that still holds images would count against the per-message
-        // cap for no visible reason.
+        // The attachments belong to the chips that were just removed.
         self.attached_images.clear();
         // Ordinary completion goes with the text it was completing: Ctrl+C
         // clears the composer without closing it, and Enter then applied it to
@@ -1214,6 +1235,8 @@ impl App {
             self.cancel_streaming_turn();
         } else if self.compacting() {
             self.cancel_compaction();
+        } else if self.cancel_image_work() {
+            self.clear_quit_guard();
         } else if !self.input.is_empty() {
             self.clear_input();
             // Not armed, and any earlier arm dropped: clearing the line is the
@@ -1283,6 +1306,8 @@ impl App {
         } else if self.compacting() {
             self.clear_quit_guard();
             self.cancel_compaction();
+        } else if self.cancel_image_work() {
+            self.clear_quit_guard();
         } else if !self.input.is_empty() {
             self.clear_input();
             self.clear_quit_guard();

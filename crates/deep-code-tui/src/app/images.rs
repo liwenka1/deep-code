@@ -27,7 +27,44 @@
 
 use super::*;
 
-use deep_code_agent::{ImageError, ImageFormat, MAX_IMAGES_PER_MESSAGE, MAX_TOTAL_BYTES, inspect};
+use deep_code_agent::{CancellationToken, ImageAsset, ImageError, ImageFormat, UserImage, inspect};
+use tokio::sync::oneshot::{self, error::TryRecvError};
+
+pub(super) type ClipboardSnapshot = ImageWorker<Result<ImageAsset, String>>;
+
+pub(super) struct ImageWorker<T> {
+    result: oneshot::Receiver<T>,
+    cancel: CancellationToken,
+}
+
+impl<T> ImageWorker<T> {
+    pub(super) fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        self.result.try_recv()
+    }
+}
+
+impl<T> Drop for ImageWorker<T> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+pub(super) fn spawn_image_worker<T: Send + 'static>(
+    name: &str,
+    work: impl FnOnce(&CancellationToken) -> T + Send + 'static,
+) -> std::io::Result<ImageWorker<T>> {
+    let (sender, result) = oneshot::channel();
+    let cancel = CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            if !sender.is_closed() {
+                let _ = sender.send(work(&worker_cancel));
+            }
+        })?;
+    Ok(ImageWorker { result, cancel })
+}
 
 /// One image attached to the draft, plus the chip standing in for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +76,7 @@ pub(crate) struct AttachedImage {
     /// recalled prompt restores its chips *and* their numbers, and so a
     /// deletion can be matched back to the attachment it removes.
     pub(crate) chip: String,
-    pub(crate) path: PathBuf,
+    pub(crate) source: UserImage,
     pub(crate) format: ImageFormat,
     pub(crate) bytes: u64,
 }
@@ -51,8 +88,7 @@ impl AttachedImage {
     }
 }
 
-/// A byte count as a short label. Powers of 1024, matching how the caps in
-/// `image.rs` are written (32 MiB, 64 MiB).
+/// A byte count as a short label.
 pub(crate) fn format_size(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
@@ -106,9 +142,6 @@ impl App {
     /// is the whole point of checking here rather than letting the turn fail
     /// later: the user keeps their text and their images and can just try again.
     pub(crate) fn attach_image(&mut self, path: PathBuf) -> bool {
-        if self.at_image_capacity() {
-            return false;
-        }
         let attachment = match inspect(&path) {
             Ok(attachment) => attachment,
             Err(error) => {
@@ -121,34 +154,24 @@ impl App {
                 return false;
             }
         };
-        // The request-wide budget, checked against the draft's own total. The
-        // per-image cap times the per-message cap is twice what one request may
-        // carry, so images that each pass on their own can still be a request
-        // that cannot hold them — and the request-time fallback only tells the
-        // *model*. Here the picture is still in the user's hand.
-        if !self.has_room_for(attachment.bytes) {
-            self.status = self.tr_with(
-                TextId::ImageDraftTooLarge,
-                &[("limit", &format_size(MAX_TOTAL_BYTES))],
-            );
-            return false;
-        }
+        self.insert_image(UserImage::File(path), attachment.format, attachment.bytes);
+        true
+    }
+
+    fn insert_image(&mut self, source: UserImage, format: ImageFormat, bytes: u64) {
         self.next_image_id += 1;
         let id = self.next_image_id;
         let chip = self.tr_with(
             TextId::ImageChip,
-            &[
-                ("id", &id.to_string()),
-                ("format", attachment.format.label()),
-            ],
+            &[("id", &id.to_string()), ("format", format.label())],
         );
         self.insert_str_at_cursor(&chip);
         self.attached_images.push(AttachedImage {
             id,
             chip,
-            path,
-            format: attachment.format,
-            bytes: attachment.bytes,
+            source,
+            format,
+            bytes,
         });
         let attached = self.attached_images.last().expect("just pushed");
         self.status = self.tr_with(
@@ -159,7 +182,6 @@ impl App {
                 ("size", &attached.size_label()),
             ],
         );
-        true
     }
 
     /// `/image` — list what is attached, or attach a path.
@@ -185,7 +207,7 @@ impl App {
                             ("id", &image.id.to_string()),
                             ("format", image.format.label()),
                             ("size", &image.size_label()),
-                            ("path", &image.path.display().to_string()),
+                            ("path", &image.source.path().display().to_string()),
                         ],
                     )
                 })
@@ -203,8 +225,7 @@ impl App {
 
     /// A user-facing reason for a failed attachment.
     ///
-    /// Deliberately not [`ImageError::note`]: that one is written for the model
-    /// and lands in the context window, this one is a status line.
+    /// The status line has its own localized wording.
     pub(crate) fn image_error_reason(&self, error: &ImageError) -> String {
         match error {
             ImageError::Missing => self.tr(TextId::ImageErrorMissing).to_string(),
@@ -212,10 +233,6 @@ impl App {
             ImageError::Unreadable(reason) => {
                 self.tr_with(TextId::ImageErrorUnreadable, &[("reason", reason)])
             }
-            ImageError::TooLarge { bytes } => self.tr_with(
-                TextId::ImageErrorTooLarge,
-                &[("size", &format_size(*bytes))],
-            ),
             ImageError::UnsupportedFormat => self.tr(TextId::ImageErrorUnsupported).to_string(),
         }
     }
@@ -247,7 +264,7 @@ impl App {
     /// `unwrap_or(usize::MAX)` that silently *kept* such an attachment and sent
     /// it, making this function the one place the documented invariant was not
     /// enforced.
-    pub(crate) fn attached_image_paths(&self) -> Vec<PathBuf> {
+    pub(crate) fn attached_image_inputs(&self) -> Vec<(UserImage, String)> {
         let mut located: Vec<(usize, &AttachedImage)> = self
             .attached_images
             .iter()
@@ -260,7 +277,15 @@ impl App {
         located.sort_by_key(|(position, _)| *position);
         located
             .into_iter()
-            .map(|(_, image)| image.path.clone())
+            .map(|(_, image)| (image.source.clone(), image.chip.clone()))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attached_image_paths(&self) -> Vec<PathBuf> {
+        self.attached_image_inputs()
+            .into_iter()
+            .map(|(source, _)| source.path())
             .collect()
     }
 
@@ -301,8 +326,7 @@ impl App {
         match self.classify_paste(text) {
             PastedContent::Images(paths) => {
                 for path in paths {
-                    // One refusal is enough — the cap or a bad file will refuse
-                    // the rest too, and the status line already says why.
+                    // Report a file that became unusable after classification.
                     if !self.attach_image(path) {
                         break;
                     }
@@ -398,70 +422,82 @@ impl App {
             self.status = self.tr(TextId::ImageClipboardEmpty).to_string();
             return;
         };
-        let bytes = match read {
-            Ok(bytes) => bytes,
+        let image = match read {
+            Ok(image) => image,
             Err(reason) => {
                 self.status = self.tr_with(TextId::ImageAttachFailed, &[("reason", &reason)]);
                 return;
             }
         };
-        // Refused *before* it is stored. `attach_image` checks the same cap, but
-        // by then the bytes would already be a file under
-        // `<workspace>/.deep-code/images/` — and nothing sweeps that directory,
-        // so a rejected paste would be permanent litter.
-        if self.at_image_capacity() {
-            return;
-        }
-        self.attach_stored_image(&bytes);
+        self.attach_clipboard_content(image);
     }
 
-    /// The clipboard's image bytes, when there are any to be had.
-    ///
-    /// A blunter question than [`crate::clipboard::read_image`] answers, because
-    /// the callers below have no interest in *why* there was nothing: they are
-    /// second chances, not requests the user made.
-    fn clipboard_image_bytes() -> Option<Vec<u8>> {
-        crate::clipboard::read_image()?.ok()
-    }
-
-    /// Whether one more image of `bytes` fits the request budget the draft has
-    /// left.
-    ///
-    /// The per-image cap times the per-message cap is twice what one request may
-    /// carry, so images that each pass on their own can still be a request that
-    /// cannot hold them — and the request-time fallback only tells the *model*.
-    /// `attach_image` asks this for every path-shaped entry point; the clipboard
-    /// paths ask it too, before writing, because they store first and attach
-    /// second.
-    fn has_room_for(&self, bytes: u64) -> bool {
-        let attached: u64 = self.attached_images.iter().map(|image| image.bytes).sum();
-        attached.saturating_add(bytes) <= MAX_TOTAL_BYTES
-    }
-
-    /// Store image bytes under the workspace and attach them.
-    ///
-    /// The budget is asked *before* the write, not only inside `attach_image`:
-    /// nothing sweeps `.deep-code/images/`, so a paste refused after it was
-    /// stored would be permanent litter — the same thing the count check above
-    /// exists to avoid. A storage failure, or a refusal here, is reported by
-    /// either caller: it means the image was found and could not be kept, which
-    /// is worth saying wherever it happens.
-    fn attach_stored_image(&mut self, bytes: &[u8]) -> bool {
-        if !self.has_room_for(bytes.len() as u64) {
-            self.status = self.tr_with(
-                TextId::ImageDraftTooLarge,
-                &[("limit", &format_size(MAX_TOTAL_BYTES))],
-            );
-            return false;
-        }
-        match deep_code_agent::store_in_pinned_workspace(&self.workspace, bytes) {
-            Ok(path) => self.attach_image(path),
+    /// Snapshot the clipboard attachment before its source can change.
+    pub(super) fn attach_clipboard_content(
+        &mut self,
+        image: crate::clipboard::ClipboardImage,
+    ) -> bool {
+        let workspace = self.workspace.clone();
+        let snapshot = spawn_image_worker("clipboard-snapshot", move |cancel| match image {
+            crate::clipboard::ClipboardImage::File(path) => {
+                deep_code_agent::snapshot_path_cancellable(&workspace, &path, cancel)
+            }
+            crate::clipboard::ClipboardImage::Encoded(bytes) => {
+                deep_code_agent::snapshot_bytes_cancellable(&workspace, &bytes, cancel)
+                    .map_err(|error| error.to_string())
+            }
+        });
+        match snapshot {
+            Ok(snapshot) => {
+                self.pending_retry = None;
+                self.clipboard_snapshots.push_back(snapshot);
+                self.error = None;
+                self.status = self.tr(TextId::ImageSaving).to_owned();
+                true
+            }
             Err(error) => {
                 self.status =
                     self.tr_with(TextId::ImageAttachFailed, &[("reason", &error.to_string())]);
                 false
             }
         }
+    }
+
+    pub(crate) fn poll_image_work(&mut self) -> bool {
+        let mut changed = self.poll_retry();
+        while let Some(snapshot) = self.clipboard_snapshots.front_mut() {
+            let result = match snapshot.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Closed) => Err(self.tr(TextId::ImageWorkerStopped).to_owned()),
+            };
+            self.clipboard_snapshots.pop_front();
+            match result {
+                Ok(asset) => {
+                    let (format, bytes) = (asset.format, asset.bytes);
+                    self.insert_image(UserImage::Saved(asset), format, bytes);
+                }
+                Err(error) => {
+                    self.status = self.tr_with(TextId::ImageAttachFailed, &[("reason", &error)]);
+                }
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    pub(super) fn discard_image_work(&mut self) {
+        self.clipboard_snapshots.clear();
+        self.pending_retry = None;
+    }
+
+    pub(super) fn cancel_image_work(&mut self) -> bool {
+        if self.clipboard_snapshots.is_empty() && self.pending_retry.is_none() {
+            return false;
+        }
+        self.discard_image_work();
+        self.status = self.tr(TextId::ImageWorkCancelled).to_owned();
+        true
     }
 
     /// Attach the clipboard's image, saying nothing when there is none.
@@ -485,13 +521,10 @@ impl App {
     /// Returns whether anything was attached; a caller that gets `false` falls
     /// through and lets the paste be whatever it was.
     pub(crate) fn attach_clipboard_image_quietly(&mut self) -> bool {
-        let Some(bytes) = Self::clipboard_image_bytes() else {
+        let Some(Ok(image)) = crate::clipboard::read_image() else {
             return false;
         };
-        if self.at_image_capacity() {
-            return false;
-        }
-        self.attach_stored_image(&bytes)
+        self.attach_clipboard_content(image)
     }
 
     /// Attach the image an `@`-reference names, in place of the reference.
@@ -534,23 +567,6 @@ impl App {
         } else {
             self.workspace.join(path)
         }
-    }
-
-    /// Refuse — and explain — when the draft already holds the per-message cap.
-    ///
-    /// Returns whether the cap was hit, so a caller about to do something
-    /// expensive (store a pasted image, which is otherwise permanent litter in a
-    /// directory nothing sweeps) can stop before doing it. The status is set in
-    /// one place so the two entry points cannot explain it differently.
-    fn at_image_capacity(&mut self) -> bool {
-        if self.attached_images.len() < MAX_IMAGES_PER_MESSAGE {
-            return false;
-        }
-        self.status = self.tr_with(
-            TextId::ImageTooMany,
-            &[("limit", &MAX_IMAGES_PER_MESSAGE.to_string())],
-        );
-        true
     }
 }
 
@@ -685,7 +701,7 @@ mod tests {
 
     /// A line that names nothing and a line that names a file we *refuse* are
     /// different answers. Collapsing them into one `None` was why a dragged file
-    /// too large to attach landed in the prompt as an unexplained path.
+    /// that could not be attached landed in the prompt as an unexplained path.
     #[test]
     fn a_refused_file_is_not_the_same_as_a_name_that_is_nowhere() {
         let app = App::new();
@@ -703,14 +719,12 @@ mod tests {
             "a directory is not a path to an image"
         );
 
-        let oversized = dir.path().join("huge.png");
-        let file = std::fs::File::create(&oversized).unwrap();
-        file.set_len(deep_code_agent::MAX_IMAGE_BYTES + 1).unwrap();
-        drop(file);
-        let refusal = app.classify_paste(&oversized.to_string_lossy());
+        let invalid = dir.path().join("invalid.png");
+        std::fs::write(&invalid, b"not an image").unwrap();
+        let refusal = app.classify_paste(&invalid.to_string_lossy());
         assert!(
             matches!(refusal, PastedContent::Unusable { .. }),
-            "a file that exists and is too large is a refusal, not text"
+            "an unusable image is reported"
         );
     }
 
@@ -743,11 +757,9 @@ mod tests {
     fn a_refused_paste_explains_itself_and_still_inserts_the_text() {
         let mut app = App::new();
         let dir = tempfile::tempdir().unwrap();
-        let oversized = dir.path().join("huge.png");
-        let file = std::fs::File::create(&oversized).unwrap();
-        file.set_len(deep_code_agent::MAX_IMAGE_BYTES + 1).unwrap();
-        drop(file);
-        let text = oversized.to_string_lossy().into_owned();
+        let invalid = dir.path().join("invalid.png");
+        std::fs::write(&invalid, b"not an image").unwrap();
+        let text = invalid.to_string_lossy().into_owned();
 
         assert!(!app.attach_pasted_images(&text), "the paste is still text");
 
@@ -759,55 +771,21 @@ mod tests {
         );
     }
 
-    /// Two images that each pass on their own can still be a request that cannot
-    /// hold them: the per-image cap times the per-message cap is twice the request
-    /// budget. At request time the only thing told is the *model* — the user's
-    /// chip, the `/image` listing and the status all still say the image is
-    /// attached — so the check belongs where the picture is still in their hand.
-    /// The boundary the sum check turns on: two images at the per-image cap are
-    /// exactly the request budget, so they must both be allowed and only the
-    /// third refused. Pinned because `<` instead of `<=` would silently halve
-    /// what a user can attach.
     #[test]
-    fn the_draft_budget_boundary_is_inclusive() {
-        let app = App::new();
-
-        assert!(app.has_room_for(0));
-        assert!(app.has_room_for(deep_code_agent::MAX_IMAGE_BYTES));
-        assert!(app.has_room_for(deep_code_agent::MAX_TOTAL_BYTES));
-        assert!(!app.has_room_for(deep_code_agent::MAX_TOTAL_BYTES + 1));
-    }
-
-    #[test]
-    fn images_that_together_exceed_the_request_budget_are_refused_while_attaching() {
+    fn large_images_can_be_attached_without_reading_their_pixels() {
         let mut app = App::new();
         let dir = tempfile::tempdir().unwrap();
-        let mut attached = 0;
-        for index in 0..deep_code_agent::MAX_IMAGES_PER_MESSAGE {
-            let path = dir.path().join(format!("big-{index}.png"));
-            std::fs::write(&path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
-            // Sparse on purpose: `inspect` reads a header and the *metadata*, and
-            // the size is what the budget is about, so this costs no 32 MiB.
+        for index in 0..6 {
+            let path = png_path(dir.path(), &format!("big-{index}.png"));
             let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-            file.set_len(deep_code_agent::MAX_IMAGE_BYTES).unwrap();
-            drop(file);
-            if !app.attach_image(path) {
-                break;
-            }
-            attached += 1;
+            file.set_len(33 * 1024 * 1024).unwrap();
+            assert!(app.attach_image(path));
         }
-
-        assert_eq!(attached, 2, "two 32 MiB images exhaust a 64 MiB request");
-        assert_eq!(app.attached_images.len(), 2);
-        assert!(
-            app.status.contains("64.0 MiB"),
-            "the refusal names the budget: {}",
-            app.status
-        );
+        assert_eq!(app.attached_images.len(), 6);
     }
 
     #[test]
-    fn sizes_read_as_the_caps_are_written() {
+    fn size_labels_use_binary_units() {
         assert_eq!(format_size(512), "512 B");
         assert_eq!(format_size(2048), "2 KiB");
         assert_eq!(format_size(32 * 1024 * 1024), "32.0 MiB");

@@ -522,10 +522,7 @@ impl App {
             None => {
                 // Park the in-progress draft, images and all, so `↓` puts back
                 // what the user was actually writing.
-                self.history_draft = HistoryPrompt {
-                    text: std::mem::take(&mut self.input),
-                    images: std::mem::take(&mut self.attached_images),
-                };
+                self.history_draft = HistoryPrompt::take_draft(self);
                 self.prompt_history.len() - 1
             }
             Some(0) => 0,
@@ -557,28 +554,38 @@ impl App {
     }
 
     pub(crate) fn remember_prompt(&mut self, prompt: &str) {
-        if self.prompt_history.last().map(|entry| entry.text.as_str()) != Some(prompt) {
+        if prompt.trim_start().starts_with("/apikey") {
+            return;
+        }
+        let literal_prompt = self.literal_prompt
+            || (!self.pasted_blocks.is_empty()
+                && prompt != self.input.trim()
+                && !self.typed_slash_command(prompt));
+        if self.prompt_history.last().is_none_or(|entry| {
+            entry.text != prompt
+                || entry.images != self.attached_images
+                || entry.literal_prompt != literal_prompt
+        }) {
             // The attachments ride along, so recalling this prompt restores its
             // pictures rather than text that talks about a `[图片 #1 PNG]` the
             // composer no longer has.
-            self.prompt_history.push(HistoryPrompt {
+            let entry = HistoryPrompt {
                 text: prompt.to_string(),
                 images: self.attached_images.clone(),
-            });
+                literal_prompt,
+                ..Default::default()
+            };
+            if let Some(path) = &self.prompt_history_path {
+                crate::prompt_history::append(path, &entry);
+            }
+            self.prompt_history.push(entry);
             if self.prompt_history.len() > PROMPT_HISTORY_CAP {
                 self.prompt_history.remove(0);
             }
-            // Text only, and never a key: `/apikey` is intercepted before this
-            // is reached, but a second line of defence costs one comparison.
-            if let Some(path) = &self.prompt_history_path
-                && !prompt.trim_start().starts_with("/apikey")
-            {
-                crate::prompt_history::append(path, prompt);
-            }
         }
         // Remembering is not where a walk through the history ends. The send
-        // can still be refused — an image mid-stream, a model that takes none,
-        // a full queue — and then the composer keeps the recalled prompt, and
+        // can still be refused — an image mid-stream or a full queue — and
+        // then the composer keeps the recalled prompt, and
         // the draft parked behind it has to stay one `↓` away; ending the walk
         // here dropped that draft on every refusal. So the walk goes on from
         // the newest entry, the prompt just remembered, and ends where the

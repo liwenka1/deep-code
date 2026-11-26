@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::message::{Message, Role};
 use crate::model_registry::{compaction_threshold_for_model, context_window_for_model};
+use crate::runtime::TurnId;
 use crate::session::entry_wire_messages;
 use crate::session_entry::{EntryKind, SessionEntry};
 use crate::text_util::truncate_chars;
@@ -132,7 +133,7 @@ pub struct CompactionPlan {
 
 impl CompactionPlan {
     /// Index of the first entry the plan keeps after the archived range:
-    /// everything before it is either the leading system entry or archived.
+    /// the prefix contains the leading system entry and the range to archive.
     #[must_use]
     pub fn tail_start(&self) -> usize {
         self.tail_start
@@ -168,19 +169,26 @@ impl CompactionPlan {
 /// extended back to the last user entry instead, so the active turn stays
 /// intact and only history before it is archived.
 #[must_use]
-pub fn plan_compaction(entries: &[Arc<SessionEntry>]) -> Option<CompactionPlan> {
-    if entries.len() <= RECENT_TAIL_ENTRIES + 1 {
-        return None;
-    }
+pub(crate) fn plan_compaction(
+    entries: &[Arc<SessionEntry>],
+    active_turn: Option<&TurnId>,
+) -> Option<CompactionPlan> {
+    let mut visible = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.unsent.is_none() || entry.pending_for(active_turn))
+        .rev();
+    let mut earlier = visible.clone();
+    let (mut tail_start, _) = earlier.nth(RECENT_TAIL_ENTRIES - 1)?;
+    // Keep the minimum history size expressed in visible entries.
+    earlier.nth(1)?;
     let head = usize::from(
         entries
             .first()
             .is_some_and(|entry| matches!(entry.kind, EntryKind::System { .. })),
     );
-    let mut tail_start = entries.len().saturating_sub(RECENT_TAIL_ENTRIES);
-    if let Some(last_user) = entries
-        .iter()
-        .rposition(|entry| matches!(entry.kind, EntryKind::User { .. }))
+    if let Some((last_user, _)) =
+        visible.find(|(_, entry)| matches!(entry.kind, EntryKind::User { .. }))
     {
         tail_start = tail_start.min(last_user);
     }
@@ -197,8 +205,9 @@ pub fn plan_compaction(entries: &[Arc<SessionEntry>]) -> Option<CompactionPlan> 
     // at a lowered `context.compaction_threshold`), that fires every model
     // round while the context never actually shrinks. (A range that also holds
     // fresh entries — `[C, user, …]` — is real progress and falls through.)
-    if let [only] = archived
-        && matches!(only.kind, EntryKind::Compaction { .. })
+    if archived
+        .iter()
+        .all(|entry| entry.unsent.is_some() || matches!(entry.kind, EntryKind::Compaction { .. }))
     {
         return None;
     }
@@ -253,7 +262,11 @@ pub fn apply_compaction(
     plan: &CompactionPlan,
     summary: String,
 ) -> CompactionResult {
-    let folded = plan.fresh(entries).len();
+    let folded = plan
+        .fresh(entries)
+        .iter()
+        .filter(|entry| entry.unsent.is_none())
+        .count();
     let image_sources = archived_image_sources(plan.archived(entries));
     let mut compacted = SessionEntry::compaction(summary.clone(), folded);
     if let EntryKind::Compaction {
@@ -266,6 +279,13 @@ pub fn apply_compaction(
     let mut out = Vec::with_capacity(plan.head + 1 + entries.len() - plan.tail_start);
     out.extend_from_slice(&entries[..plan.head]);
     out.push(Arc::new(compacted));
+    // Drafts survive compaction for editing. Their content never enters a summary.
+    out.extend(
+        plan.archived(entries)
+            .iter()
+            .filter(|entry| entry.unsent.is_some())
+            .cloned(),
+    );
     out.extend_from_slice(&entries[plan.tail_start..]);
     CompactionResult {
         archived_count: folded,
@@ -286,6 +306,9 @@ fn archived_image_sources(
         }
     };
     for entry in entries {
+        if entry.unsent.is_some() {
+            continue;
+        }
         match &entry.kind {
             EntryKind::User { content } => {
                 for image in content.images() {
@@ -331,7 +354,7 @@ fn archived_image_sources(
 #[cfg(test)]
 #[must_use]
 pub fn compact_entries(entries: &[Arc<SessionEntry>]) -> CompactionResult {
-    match plan_compaction(entries) {
+    match plan_compaction(entries, None) {
         Some(plan) => {
             let summary = mechanical_summary(&plan, entries);
             apply_compaction(entries, &plan, summary)
@@ -467,6 +490,9 @@ fn observation_excerpt<I: std::fmt::Display>(
 fn flatten_entries(entries: &[Arc<SessionEntry>]) -> String {
     let mut out = String::new();
     for entry in entries {
+        if entry.unsent.is_some() {
+            continue;
+        }
         match &entry.kind {
             EntryKind::User { content } => {
                 out.push_str("### 用户 / User\n");
@@ -783,7 +809,7 @@ mod tests {
             )));
         }
 
-        let plan = plan_compaction(&entries).expect("history to fold");
+        let plan = plan_compaction(&entries, None).expect("history to fold");
         let archived = plan.archived(&entries).len();
         let fresh = plan.fresh(&entries).len();
         assert_eq!(fresh + 1, archived, "the range carries the prior summary");
@@ -959,7 +985,7 @@ mod tests {
                 Vec::new(),
             )));
         }
-        let plan = plan_compaction(&entries).expect("something to fold");
+        let plan = plan_compaction(&entries, None).expect("something to fold");
         let summary = mechanical_summary(&plan, &entries);
         assert!(summary.starts_with(&handover), "carried whole");
         assert!(summary.contains("never touch the vendored parser"));
@@ -1161,7 +1187,7 @@ mod tests {
         }
         let first = apply_compaction(
             &entries,
-            &plan_compaction(&entries).unwrap(),
+            &plan_compaction(&entries, None).unwrap(),
             "The observed button is red.".into(),
         );
         let expected = CompactionImageSource {
@@ -1180,7 +1206,7 @@ mod tests {
         }
         let second = apply_compaction(
             &entries,
-            &plan_compaction(&entries).unwrap(),
+            &plan_compaction(&entries, None).unwrap(),
             "The observed button remains red.".into(),
         );
         assert!(

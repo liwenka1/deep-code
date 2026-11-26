@@ -28,6 +28,10 @@ pub const DEEPSEEK_API_HOST: &str = "api.deepseek.com";
 pub const DEEPSEEK_TOOLS_API_BASE: &str = "https://api.deepseek.com/v1/tools";
 pub const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 
+pub(crate) fn normalized_api_key(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|key| !key.is_empty())
+}
+
 /// Provider/runtime secrets that live in the parent process environment (the
 /// LLM client reads the API key at startup; the HTTP server reads the auth
 /// token on bind) but that NO spawned subprocess — shell, job, or LSP —
@@ -214,10 +218,7 @@ impl AgentConfig {
     }
 
     pub fn require_api_key(&self) -> AgentResult<&str> {
-        self.api_key
-            .as_deref()
-            .filter(|key| !key.trim().is_empty())
-            .ok_or(AgentError::MissingApiKey)
+        normalized_api_key(self.api_key.as_deref()).ok_or(AgentError::MissingApiKey)
     }
 
     /// Resolve the configured model to a canonical ID in the built-in catalog.

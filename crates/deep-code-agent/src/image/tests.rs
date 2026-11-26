@@ -108,25 +108,23 @@ fn draft_inspection_is_bounded_and_reports_actual_format() {
         Err(ImageError::Missing)
     );
     assert_eq!(inspect(dir.path()), Err(ImageError::NotAFile));
-    let large = std::fs::File::create(dir.path().join("huge.png")).unwrap();
-    large.set_len(MAX_IMAGE_BYTES + 1).unwrap();
-    assert_eq!(
-        inspect(&dir.path().join("huge.png")),
-        Err(ImageError::TooLarge {
-            bytes: MAX_IMAGE_BYTES + 1
-        })
-    );
+    let large = write(dir.path(), "huge.png", PNG);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&large)
+        .unwrap();
+    let bytes = MAX_TOOL_IMAGE_BYTES + 1;
+    file.set_len(bytes).unwrap();
+    assert_eq!(inspect(&large).unwrap().bytes, bytes);
 }
 
 #[test]
 fn directories_are_rejected_consistently_by_inspection_and_admission() {
     let dir = tempdir().unwrap();
     assert_eq!(inspect(dir.path()), Err(ImageError::NotAFile));
-    assert_eq!(read_user_image(dir.path()), Err(ImageError::NotAFile));
-    let (assets, notes) = snapshot_paths(&workspace(&dir), &[dir.path().to_path_buf()]);
-    assert!(assets.is_empty());
-    assert_eq!(notes.len(), 1);
-    assert!(notes[0].contains("not a file"), "{}", notes[0]);
+    assert_eq!(read_image_file(dir.path()), Err(ImageError::NotAFile));
+    let error = snapshot_path(&workspace(&dir), dir.path()).unwrap_err();
+    assert!(error.contains("not a file"), "{error}");
     assert!(!dir.path().join(IMAGES_DIR).exists());
 }
 
@@ -159,18 +157,11 @@ fn same_bytes_have_one_stable_asset_and_round_trip_through_json() {
 }
 
 #[test]
-fn admission_rejects_size_and_format_before_creating_storage() {
+fn admission_rejects_unknown_format_before_creating_storage() {
     let dir = tempdir().unwrap();
     assert!(matches!(
         snapshot_bytes(&workspace(&dir), b"{}"),
         Err(StoreError::UnsupportedFormat)
-    ));
-    assert!(!workspace(&dir).join(IMAGES_DIR).exists());
-    let mut bytes = vec![0; MAX_IMAGE_BYTES as usize + 1];
-    bytes[..8].copy_from_slice(&PNG[..8]);
-    assert!(matches!(
-        snapshot_bytes(&workspace(&dir), &bytes),
-        Err(StoreError::TooLarge { .. })
     ));
     assert!(!workspace(&dir).join(IMAGES_DIR).exists());
 }
@@ -179,11 +170,45 @@ fn admission_rejects_size_and_format_before_creating_storage() {
 fn source_changes_do_not_rewrite_an_observation() {
     let dir = tempdir().unwrap();
     let source = write(dir.path(), "source.png", PNG);
-    let (assets, notes) = snapshot_paths(&workspace(&dir), std::slice::from_ref(&source));
-    assert!(notes.is_empty());
+    let asset = snapshot_path(&workspace(&dir), &source).unwrap();
     std::fs::write(&source, b"replaced source").unwrap();
     std::fs::remove_file(source).unwrap();
-    assert_eq!(assets[0].read().unwrap(), PNG);
+    assert_eq!(asset.read().unwrap(), PNG);
+}
+
+#[test]
+fn cancelling_mid_copy_removes_the_unpublished_image() {
+    struct CancelOnSecondRead<'a> {
+        source: std::io::Cursor<Vec<u8>>,
+        cancel: &'a CancellationToken,
+    }
+    impl Read for CancelOnSecondRead<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if self.source.position() > 0 {
+                self.cancel.cancel();
+            }
+            self.source.read(bytes)
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let mut bytes = b"GIF89a".to_vec();
+    bytes.resize(IMAGE_CHUNK_BYTES * 3, 0);
+    let length = bytes.len() as u64;
+    let input = CancelOnSecondRead {
+        source: std::io::Cursor::new(bytes),
+        cancel: &cancel,
+    };
+    let error =
+        snapshot_reader(&workspace(&dir), input, ImageFormat::Gif, length, &cancel).unwrap_err();
+    assert!(error.to_string().contains("image preparation cancelled"));
+    assert_eq!(
+        std::fs::read_dir(workspace(&dir).join(IMAGES_DIR))
+            .unwrap()
+            .count(),
+        0
+    );
 }
 
 #[test]
@@ -194,6 +219,11 @@ fn asset_replay_checks_digest_even_when_length_and_header_match() {
     *bytes.last_mut().unwrap() ^= 1;
     std::fs::write(image.path(), &bytes).unwrap();
     assert!(matches!(image.read(), Err(ImageError::Unreadable(_))));
+    let upload = PreparedImage {
+        asset: image.clone(),
+        replay: None,
+    };
+    assert!(serde_json::to_writer(std::io::sink(), &upload).is_err());
     assert!(snapshot_bytes(&workspace(&dir), PNG).is_err());
     assert_eq!(std::fs::read(image.path()).unwrap(), bytes);
 }
@@ -272,28 +302,14 @@ fn concurrent_admission_publishes_complete_identical_objects() {
 }
 
 #[test]
-fn explicit_user_admission_keeps_good_images_and_names_failures() {
+fn explicit_user_admission_names_unusable_files() {
     let dir = tempdir().unwrap();
-    let good = write(dir.path(), "image.png", PNG);
     let invalid = write(dir.path(), "bad.png", b"not an image");
     let missing = dir.path().join("gone.png");
-    let (images, notes) = snapshot_paths(&workspace(&dir), &[good, invalid, missing]);
-    assert_eq!(images.len(), 1);
-    assert_eq!(images[0].read().unwrap(), PNG);
-    assert_eq!(notes.len(), 2);
-    assert!(notes[0].contains("bad.png") && notes[0].contains("unsupported image format"));
-    assert!(notes[1].contains("gone.png") && notes[1].contains("image unavailable"));
-}
-
-#[test]
-fn admission_count_is_a_product_limit_and_reports_omission() {
-    let dir = tempdir().unwrap();
-    let source = write(dir.path(), "same.png", PNG);
-    let (images, notes) =
-        snapshot_paths(&workspace(&dir), &vec![source; MAX_IMAGES_PER_MESSAGE + 1]);
-    assert_eq!(images.len(), MAX_IMAGES_PER_MESSAGE);
-    assert_eq!(notes.len(), 1);
-    assert!(notes[0].contains("image omitted"));
+    let invalid = snapshot_path(&workspace(&dir), &invalid).unwrap_err();
+    let missing = snapshot_path(&workspace(&dir), &missing).unwrap_err();
+    assert!(invalid.contains("bad.png") && invalid.contains("unsupported image format"));
+    assert!(missing.contains("gone.png") && missing.contains("image unavailable"));
 }
 
 #[test]
@@ -313,7 +329,11 @@ fn request_projection_preserves_text_image_interleaving_and_tool_identity() {
         ChatRequest::streaming("deepseek-flash", vec![tool]),
         Some(ImageDetail::Low),
         true,
-    );
+        &[],
+    )
+    .unwrap();
+    // The store can change between preparation and the first serialization.
+    std::fs::remove_file(image.path()).unwrap();
     let body = serde_json::to_value(&prepared.request).unwrap();
     assert_eq!(body["messages"][0]["role"], "tool");
     assert_eq!(body["messages"][0]["tool_call_id"], "call-7");
@@ -337,7 +357,7 @@ fn plain_text_requests_do_not_change_during_image_preparation() {
         vec![Message::system("system"), Message::user("hello")],
     );
     let expected = serde_json::to_vec(&request).unwrap();
-    let prepared = prepare_request_images(request, None, true);
+    let prepared = prepare_request_images(request, None, true, &[]).unwrap();
     assert_eq!(serde_json::to_vec(&prepared.request).unwrap(), expected);
     assert!(prepared.images.is_empty());
 }
@@ -355,7 +375,9 @@ fn system_images_are_supported_and_assistant_images_are_reported_as_unsupported(
         ChatRequest::streaming("deepseek-flash", vec![system, assistant]),
         None,
         true,
-    );
+        &[],
+    )
+    .unwrap();
     let body = serde_json::to_value(&prepared.request).unwrap();
     assert_eq!(body["messages"][0]["content"][1]["type"], "image_url");
     assert!(prepared.images[0].included);
@@ -386,7 +408,9 @@ fn unavailable_observation_is_replaced_in_place_and_reported() {
         ChatRequest::streaming("deepseek-flash", vec![message]),
         None,
         true,
-    );
+        &[],
+    )
+    .unwrap();
     assert!(!prepared.request.messages[0].content.has_images());
     assert!(
         matches!(&prepared.request.messages[0].content.blocks[1], ContentBlock::Text { text } if text.contains("image unavailable"))
@@ -406,7 +430,9 @@ fn fixed_nonvisual_route_reports_observation_not_included() {
         ChatRequest::streaming("deepseek-v4-pro", vec![message]),
         None,
         false,
-    );
+        &[],
+    )
+    .unwrap();
     assert!(!prepared.request.messages[0].content.has_images());
     assert!(
         prepared.images[0]
@@ -430,9 +456,12 @@ fn newest_images_receive_the_request_budget_first() {
         ChatRequest::streaming("deepseek-flash", messages),
         None,
         true,
+        &[],
         image.bytes,
         MAX_REQUEST_BYTES,
-    );
+        &CancellationToken::new(),
+    )
+    .unwrap();
     assert!(!prepared.request.messages[0].content.has_images());
     assert!(prepared.request.messages[1].content.has_images());
     assert_eq!(
@@ -446,37 +475,43 @@ fn newest_images_receive_the_request_budget_first() {
 }
 
 #[test]
-fn message_limit_keeps_newest_images_without_reordering_blocks() {
+fn new_submission_is_kept_together_when_replay_budget_is_exhausted() {
     let dir = tempdir().unwrap();
     let image = asset(&dir);
-    let mut message = Message::user("many");
-    for _ in 0..MAX_IMAGES_PER_MESSAGE + 1 {
-        message.content.push_image(ImageRef::Asset(image.clone()));
+    let history = with_image(Message::user("older"), ImageRef::Asset(image.clone()));
+    let mut current = Message::user("many");
+    for _ in 0..6 {
+        current.content.push_image(ImageRef::Asset(image.clone()));
     }
-    let prepared = prepare_request_images(
-        ChatRequest::streaming("deepseek-flash", vec![message]),
+    let prepared = prepare_request_images_with_limits(
+        ChatRequest::streaming("deepseek-v4-pro", vec![history, current]),
         None,
-        true,
-    );
-    assert_eq!(
-        prepared.request.messages[0].content.image_count(),
-        MAX_IMAGES_PER_MESSAGE
-    );
-    assert!(!prepared.images[0].included);
-    assert!(prepared.images.iter().skip(1).all(|image| image.included));
+        false,
+        &[1],
+        1,
+        1,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(prepared.request.messages[0].content.image_count(), 0);
+    assert_eq!(prepared.request.messages[1].content.image_count(), 6);
+    assert!(prepared.images[1..].iter().all(|image| image.included));
 }
 
 #[test]
 fn raw_inline_images_are_charged_against_the_same_budget() {
-    let url = encode_data_url(ImageFormat::Png, PNG);
+    let url = encode_data_url(ImageFormat::Png, PNG).unwrap();
     let message = with_image(Message::user("look"), ImageRef::Url { url, detail: None });
     let prepared = prepare_request_images_with_limits(
         ChatRequest::streaming("deepseek-flash", vec![message]),
         None,
         true,
+        &[],
         1,
         MAX_REQUEST_BYTES,
-    );
+        &CancellationToken::new(),
+    )
+    .unwrap();
     assert!(!prepared.images[0].included);
     assert!(!prepared.request.messages[0].content.has_images());
 }
@@ -493,7 +528,16 @@ fn complete_request_budget_retains_original_asset_identity_in_omission() {
     request.messages[0].content.blocks.push(ContentBlock::Text {
         text: "x".repeat(2000),
     });
-    let prepared = prepare_request_images_with_limits(request, None, true, MAX_TOTAL_BYTES, 2100);
+    let prepared = prepare_request_images_with_limits(
+        request,
+        None,
+        true,
+        &[],
+        MAX_TOTAL_BYTES,
+        2100,
+        &CancellationToken::new(),
+    )
+    .unwrap();
     assert!(!prepared.images[0].included);
     assert!(
         prepared.images[0]
@@ -521,16 +565,13 @@ fn low_changes_the_provider_parameter_without_claiming_local_resizing() {
         ChatRequest::streaming("deepseek-flash", vec![message]),
         Some(ImageDetail::Low),
         true,
-    );
-    let ImageRef::Url { url, detail } = prepared.request.messages[0]
-        .content
-        .images()
-        .next()
-        .unwrap()
-    else {
-        panic!("resolved image expected");
-    };
-    assert_eq!(*detail, Some(ImageDetail::Low));
+        &[],
+    )
+    .unwrap();
+    let json = serde_json::to_value(&prepared.request.messages[0]).unwrap();
+    let image = &json["content"][1]["image_url"];
+    assert_eq!(image["detail"], "low");
+    let url = image["url"].as_str().unwrap();
     let encoded = url.split_once(";base64,").unwrap().1;
     assert_eq!(
         base64::engine::general_purpose::STANDARD

@@ -350,10 +350,7 @@ impl App {
         self.close_completion();
         self.history_search = Some(HistorySearch {
             query: String::new(),
-            draft: HistoryPrompt {
-                text: std::mem::take(&mut self.input),
-                images: std::mem::take(&mut self.attached_images),
-            },
+            draft: HistoryPrompt::take_draft(self),
             walk: self.history_cursor.take(),
             shown: None,
             in_composer: None,

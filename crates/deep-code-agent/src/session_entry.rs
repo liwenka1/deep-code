@@ -26,16 +26,42 @@ pub struct SessionEntry {
     /// compaction summaries do not belong to an individual turn.
     #[serde(default)]
     pub turn_id: Option<TurnId>,
+    /// User input waiting for confirmation or retained for an explicit retry.
+    /// Older entries without this field are already part of the conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsent: Option<UnsentMessage>,
     #[serde(flatten)]
     pub kind: EntryKind,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsentMessage {
+    /// Labels in the draft, in the same order as the saved images.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_labels: Vec<String>,
+    /// Composer labels for files that could not be snapshotted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_image_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 impl SessionEntry {
+    pub(crate) fn pending_for(&self, turn_id: Option<&TurnId>) -> bool {
+        turn_id.is_some()
+            && self.turn_id.as_ref() == turn_id
+            && self
+                .unsent
+                .as_ref()
+                .is_some_and(|draft| draft.error.is_none())
+    }
+
     #[must_use]
     pub fn new(kind: EntryKind) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             turn_id: None,
+            unsent: None,
             kind,
         }
     }
@@ -51,6 +77,9 @@ impl SessionEntry {
     /// the derived wire representation stays stable.
     #[must_use]
     pub fn wire_message_count(&self) -> usize {
+        if self.unsent.is_some() {
+            return 0;
+        }
         match &self.kind {
             EntryKind::Assistant { exchanges, .. } => 1 + exchanges.len(),
             _ => 1,

@@ -688,13 +688,22 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
         {
             cells.append(&mut current_turn);
             if let Some(previous) = open_turn {
-                append_turn_checkpoints(&mut cells, record, previous);
+                append_turn_annotations(&mut cells, record, previous);
             }
             open_turn = Some(turn_id);
         }
         match &entry.kind {
             EntryKind::User { content, .. } => {
                 current_turn.push(HistoryCell::user(content.summary_text()));
+                if let Some(unsent) = &entry.unsent {
+                    let message = match &unsent.error {
+                        Some(error) => format!("发送失败 / Send failed\n{error}"),
+                        None => "发送未确认 / Send not confirmed".into(),
+                    };
+                    current_turn.push(HistoryCell::system(format!(
+                        "{message}\n/retry 编辑原稿 / Edit the draft"
+                    )));
+                }
             }
             EntryKind::System { .. } => {}
             EntryKind::Assistant {
@@ -804,14 +813,19 @@ pub(crate) fn hydrate_history(record: &SessionRecord) -> Vec<HistoryCell> {
     }
     cells.append(&mut current_turn);
     if let Some(turn_id) = open_turn {
-        append_turn_checkpoints(&mut cells, record, turn_id);
+        append_turn_annotations(&mut cells, record, turn_id);
     }
 
     cells
 }
 
-fn append_turn_checkpoints(cells: &mut Vec<HistoryCell>, record: &SessionRecord, turn_id: &TurnId) {
+fn append_turn_annotations(cells: &mut Vec<HistoryCell>, record: &SessionRecord, turn_id: &TurnId) {
     if let Some(turn) = record.turns.iter().find(|turn| &turn.id == turn_id) {
+        if let Some(error) = &turn.error {
+            cells.push(HistoryCell::system(format!(
+                "回合中断 / Turn interrupted\n{error}"
+            )));
+        }
         for request in &turn.image_requests {
             let reasons = request
                 .images

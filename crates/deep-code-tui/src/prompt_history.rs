@@ -1,10 +1,10 @@
 //! Prompt history that survives a restart.
 //!
 //! One file per workspace under `~/.deep-code/prompt-history/`, one JSON
-//! object per line (`{"text": …}`), newest last. The user's own directory
-//! rather than `<workspace>/.deep-code`: the workspace copy would be
-//! model-writable, and what `↑` puts back into the composer should not be
-//! something a tool call could have planted. The macOS sandbox denies
+//! object per line, newest last. Each holds the text and can mark it as
+//! literal model input so recalling it cannot execute a slash command.
+//! Keeping this file in the user's directory prevents workspace tools from
+//! planting a command that `↑` puts back into the composer. The macOS sandbox denies
 //! sandboxed commands any read of `~/.deep-code` as well, so a prompt typed
 //! here never reaches a shell command through this file either.
 //!
@@ -16,6 +16,7 @@
 //! Every failure here is swallowed: history is a convenience, and a read-only
 //! home directory or a full disk must never stop a prompt from being sent.
 
+use crate::app::HistoryPrompt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -57,11 +58,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
-#[derive(serde::Deserialize)]
-struct Entry {
-    text: String,
-}
-
 /// The last `cap` prompts in `path`, oldest first.
 ///
 /// Read from the end, parsing only until `cap` are found. A line that is not a
@@ -69,7 +65,7 @@ struct Entry {
 /// full disk mid-write leaves a broken line, and one bad byte used to empty
 /// the whole history for good. A file past twice the cap is rewritten to the
 /// last `cap` entries on the way out, so it does not grow without bound.
-pub(crate) fn load(path: &Path, cap: usize) -> Vec<String> {
+pub(crate) fn load(path: &Path, cap: usize) -> Vec<HistoryPrompt> {
     let Ok(raw) = fs::read(path) else {
         return Vec::new();
     };
@@ -92,13 +88,12 @@ pub(crate) fn load(path: &Path, cap: usize) -> Vec<String> {
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
         .collect();
-    let mut prompts: Vec<String> = lines
+    let mut prompts: Vec<HistoryPrompt> = lines
         .iter()
         .rev()
         .filter_map(|line| std::str::from_utf8(line).ok())
-        .filter_map(|line| serde_json::from_str::<Entry>(line).ok())
-        .map(|entry| entry.text)
-        .filter(|text| !text.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<HistoryPrompt>(line).ok())
+        .filter(|entry| !entry.text.trim().is_empty())
         .take(cap)
         .collect();
     prompts.reverse();
@@ -145,7 +140,7 @@ fn drop_torn_tail(path: &Path, keep: usize) {
 
 /// Replace the file with `prompts`, through a sibling temp file and a rename,
 /// so a crash leaves the old file or the new one, never half of either.
-fn rewrite(path: &Path, prompts: &[String]) {
+fn rewrite(path: &Path, prompts: &[HistoryPrompt]) {
     let Some(name) = path.file_name() else {
         return;
     };
@@ -162,7 +157,7 @@ fn rewrite(path: &Path, prompts: &[String]) {
     };
     let mut body = String::new();
     for prompt in prompts {
-        body.push_str(&serde_json::json!({ "text": prompt }).to_string());
+        body.push_str(&serde_json::to_string(prompt).expect("history text serializes"));
         body.push('\n');
     }
     let written = file.write_all(body.as_bytes()).is_ok();
@@ -228,8 +223,8 @@ fn replace_file_windows(temporary: &Path, destination: &Path) -> std::io::Result
 /// apart. (A launch that trims the file can still drop a line another
 /// instance appends between the trim's read and its rename: history is a
 /// convenience, and the trim is rare.)
-pub(crate) fn append(path: &Path, text: &str) {
-    if text.len() > MAX_PERSISTED_PROMPT_BYTES {
+pub(crate) fn append(path: &Path, prompt: &HistoryPrompt) {
+    if prompt.text.len() > MAX_PERSISTED_PROMPT_BYTES {
         return;
     }
     let Some(dir) = path.parent() else {
@@ -255,7 +250,7 @@ pub(crate) fn append(path: &Path, text: &str) {
     // whole only because POSIX promises a single `O_APPEND` write lands whole.
     // Anything that has to inspect the file first belongs in `load`, which
     // runs at launch, before this process appends (see `torn_tail_start`).
-    let mut line = serde_json::json!({ "text": text }).to_string();
+    let mut line = serde_json::to_string(prompt).expect("history text serializes");
     line.push('\n');
     let _ = file.write_all(line.as_bytes());
 }
@@ -263,6 +258,23 @@ pub(crate) fn append(path: &Path, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn append(path: &Path, text: &str) {
+        super::append(
+            path,
+            &HistoryPrompt {
+                text: text.to_owned(),
+                ..Default::default()
+            },
+        );
+    }
+
+    fn load(path: &Path, cap: usize) -> Vec<String> {
+        super::load(path, cap)
+            .into_iter()
+            .map(|entry| entry.text)
+            .collect()
+    }
 
     #[test]
     fn appends_and_reloads_the_newest_prompts_in_order() {
@@ -403,7 +415,7 @@ mod tests {
         assert_eq!(raw.lines().count(), 1600);
         assert!(
             raw.lines()
-                .all(|line| serde_json::from_str::<Entry>(line).is_ok()),
+                .all(|line| serde_json::from_str::<HistoryPrompt>(line).is_ok()),
             "a torn line"
         );
     }

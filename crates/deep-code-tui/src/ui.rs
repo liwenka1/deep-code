@@ -404,6 +404,9 @@ fn run_loop(
         if app.poll_session_scan() {
             needs_redraw = true;
         }
+        if app.poll_image_work() {
+            needs_redraw = true;
+        }
 
         // A turn that just ended may have spawned child processes (shell, git,
         // LSP) that, on Windows, reset the console input mode and silently drop

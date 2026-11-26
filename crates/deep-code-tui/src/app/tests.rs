@@ -756,11 +756,15 @@ fn a_refused_send_keeps_the_walk_through_the_history() {
         deep_code_agent::DEEPSEEK_V4_PRO,
     );
     assert_eq!(
-        supports_vision_for_model(takes_images),
+        deep_code_agent::supports_vision_for_model(takes_images),
         Some(true),
         "sanity"
     );
-    assert_eq!(supports_vision_for_model(takes_none), Some(false), "sanity");
+    assert_eq!(
+        deep_code_agent::supports_vision_for_model(takes_none),
+        Some(false),
+        "sanity"
+    );
     // Sets up what will refuse the next send, and writes the prompt it refuses
     // into the empty composer.
     let refused = |app: &mut App, refusal: &str| {
@@ -2772,6 +2776,47 @@ fn escape_during_streaming_requests_cancel_without_quitting() {
     assert!(app.status.contains("取消"));
 }
 
+#[tokio::test]
+async fn escape_before_the_stream_starts_cancels_the_image_submission() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().canonicalize().unwrap();
+    let mut app = App::new();
+    app.runtime = Arc::new(
+        AgentRuntime::new(StallingSummaryClient, deep_code_agent::ToolRegistry::new())
+            .with_image_workspace(&workspace),
+    );
+    app.insert_str_at_cursor("review this ");
+    assert!(app.attach_image(write_test_png(&workspace, "shot.png")));
+    app.submit();
+    app.handle_escape();
+
+    // Let the stream finish before the first repaint can dispatch TurnStarted.
+    let mut updates = app.ui_rx.take().unwrap();
+    let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut received = Vec::new();
+        while let Some(update) = updates.recv().await {
+            received.push(update);
+        }
+        received
+    })
+    .await
+    .unwrap();
+    for update in received {
+        app.apply_ui_update(update);
+    }
+
+    assert_eq!(app.status, app.tr(TextId::StatusCancelled));
+    assert!(!workspace.join(".deep-code/images").exists());
+    assert_eq!(app.runtime.unsent_messages().await.len(), 1);
+    app.insert_str_at_cursor("continue");
+    app.submit();
+    wait_for_retry_test_turn(&mut app).await;
+    assert!(app.error.is_none());
+    assert!(app.runtime.session_messages().await.iter().any(|message| {
+        message.role == deep_code_agent::Role::Assistant && message.content.text() == "ok"
+    }));
+}
+
 #[test]
 fn error_event_flushes_partial_assistant_before_error_cell() {
     let mut app = App::new();
@@ -4113,37 +4158,336 @@ fn image_command_does_not_send_the_typed_line() {
     assert!(app.attached_image_paths() == vec![path]);
 }
 
-/// The refusal has to leave the draft intact — that is the entire reason the
-/// check lives at submit rather than being left to the API's 400.
-#[test]
-fn a_model_that_cannot_take_images_refuses_and_keeps_the_draft() {
+struct RefusingClient {
+    expects_images: bool,
+}
+
+#[async_trait::async_trait]
+impl deep_code_agent::LlmClient for RefusingClient {
+    fn provider_name(&self) -> &'static str {
+        "mock"
+    }
+    fn model(&self) -> &str {
+        "mock"
+    }
+    async fn stream_chat(
+        &self,
+        request: deep_code_agent::ChatRequest,
+    ) -> deep_code_agent::AgentResult<deep_code_agent::AgentEventStream> {
+        assert_eq!(
+            request.messages.last().unwrap().content.has_images(),
+            self.expects_images
+        );
+        Ok(Box::pin(async_stream::try_stream! {
+            yield deep_code_agent::AgentEvent::Error {
+                message: "provider rejected the prompt".into(),
+            };
+        }))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_loads_an_editable_draft_with_the_saved_image() {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_test_png(dir.path(), "shot.png");
+    let workspace = dir.path().canonicalize().unwrap();
+    let path = write_test_png(&workspace, "shot.png");
     let mut app = App::new();
-    // Type first, then attach — the order a user does it in, and the order that
-    // leaves the chip and the attachment agreeing. Assigning to `input` *after*
-    // attaching would strip the chip while keeping the attachment, which is the
-    // state `sync_images` exists to prevent; a test that builds it by hand only
-    // passes while `attached_image_paths` is willing to send a chip-less image.
-    app.input = "look at this ".to_string();
-    app.cursor_to_end();
-    assert!(app.attach_image(path));
-    app.configured_model = deep_code_agent::DEEPSEEK_V4_PRO.to_string();
+    app.runtime = Arc::new(
+        AgentRuntime::new(
+            RefusingClient {
+                expects_images: true,
+            },
+            deep_code_agent::ToolRegistry::new(),
+        )
+        .with_image_workspace(workspace),
+    );
+    app.configured_model = deep_code_agent::DEEPSEEK_V4_PRO.into();
+    let pasted = "/image compare these\n";
+    app.paste_str(pasted.into());
+    assert!(app.attach_image(path.clone()));
+    let draft = app.expand_pasted(&app.input);
 
     app.submit();
+    app.insert_str_at_cursor("a new draft");
+    wait_for_retry_test_turn(&mut app).await;
 
-    assert!(!app.is_streaming, "the turn must not have started");
+    assert_eq!(app.input, "a new draft");
     assert!(
-        app.input.contains("look at this"),
-        "the draft is kept: {:?}",
-        app.input
+        app.error
+            .as_deref()
+            .unwrap()
+            .contains("provider rejected the prompt")
     );
-    assert_eq!(app.attached_image_paths().len(), 1, "the image is kept");
+    std::fs::remove_file(path).unwrap();
+
+    app.input = "/retry".into();
+    app.submit();
+    assert_eq!(app.input, "/retry");
+    app.input = "typing while images are checked".into();
+    wait_for_image_work(&mut app).await;
+    assert_eq!(app.input, "typing while images are checked");
+
+    app.input = "/retry".into();
+    app.submit();
+    wait_for_image_work(&mut app).await;
+    assert!(!app.is_streaming);
+    assert_eq!(app.input, draft);
     assert!(
-        app.status.contains(deep_code_agent::DEEPSEEK_V4_PRO),
-        "the refusal names the model to switch away from: {}",
-        app.status
+        matches!(&app.attached_images[0].source, deep_code_agent::UserImage::Saved(image)
+        if image.path().is_file())
     );
+    app.submit();
+    wait_for_retry_test_turn(&mut app).await;
+    assert_eq!(app.runtime.unsent_messages().await.len(), 2);
+    app.history_prev();
+    assert_eq!(app.input, draft);
+    assert!(
+        matches!(&app.attached_images[0].source, deep_code_agent::UserImage::Saved(image)
+        if image.path().is_file())
+    );
+    app.backspace();
+    assert!(app.attached_images.is_empty());
+    assert_eq!(app.input, pasted);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_and_history_resend_collapsed_slash_text_as_model_input() {
+    for command in ["/clear", "/retry"] {
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join("history").join("prompts.jsonl");
+        let mut app = App::new();
+        app.prompt_history_path = Some(history.clone());
+        app.runtime = Arc::new(AgentRuntime::new(
+            RefusingClient {
+                expects_images: false,
+            },
+            deep_code_agent::ToolRegistry::new(),
+        ));
+        let original = format!(" {command}\n");
+        app.paste_str(original.clone());
+        assert_eq!(app.pasted_blocks.len(), 1);
+        app.submit();
+        wait_for_retry_test_turn(&mut app).await;
+
+        app.insert_str_at_cursor("/retry");
+        app.submit();
+        wait_for_image_work(&mut app).await;
+        assert_eq!(app.input, original);
+        app.submit();
+        wait_for_retry_test_turn(&mut app).await;
+        assert_eq!(app.runtime.unsent_messages().await.len(), 2);
+
+        app.prompt_history = crate::prompt_history::load(&history, PROMPT_HISTORY_CAP);
+        app.history_prev();
+        assert_eq!(app.input, original);
+        app.submit();
+        wait_for_retry_test_turn(&mut app).await;
+        let drafts = app.runtime.unsent_messages().await;
+        assert_eq!(drafts.len(), 3);
+        assert!(drafts.iter().all(|entry| matches!(&entry.kind,
+            deep_code_agent::EntryKind::User { content } if content.text() == original)));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovered_apikey_text_stays_editable_and_out_of_the_model_and_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    app.global_config_path = Some(dir.path().join("config.toml"));
+    app.runtime = Arc::new(AgentRuntime::new(
+        RefusingClient {
+            expects_images: false,
+        },
+        deep_code_agent::ToolRegistry::new(),
+    ));
+    let original = "/apikey local-test-placeholder";
+    let mut events = app.runtime.submit_user(original).await;
+    while events.recv().await.is_some() {}
+    app.insert_str_at_cursor("/retry");
+    app.submit();
+    wait_for_image_work(&mut app).await;
+    assert_eq!(app.input, original);
+
+    app.submit();
+    assert_eq!(app.status, app.tr(TextId::RetryApiKey));
+    assert_eq!(app.input, original);
+    assert!(!app.is_streaming);
+    assert!(!app.global_config().exists());
+    assert!(app.prompt_history.is_empty());
+    assert_eq!(app.runtime.unsent_messages().await.len(), 1);
+}
+
+async fn wait_for_retry_test_turn(app: &mut App) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while app.is_streaming {
+            app.drain_stream_updates();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn wait_for_image_work(app: &mut App) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while app.pending_retry.is_some() || !app.clipboard_snapshots.is_empty() {
+            app.poll_image_work();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_removes_missing_and_digest_mismatched_attachments() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let missing = write_test_png(&workspace, "missing.png");
+    let good = write_test_png(&workspace, "good.png");
+    let lost = workspace.join("lost.gif");
+    std::fs::write(&lost, b"GIF89a-lost").unwrap();
+    let mut app = App::new();
+    app.runtime = Arc::new(
+        AgentRuntime::new(StallingSummaryClient, deep_code_agent::ToolRegistry::new())
+            .with_image_workspace(workspace),
+    );
+    app.insert_str_at_cursor("compare these ");
+    assert!(app.attach_image(good));
+    assert!(app.attach_image(lost));
+    assert!(app.attach_image(missing.clone()));
+    let good_label = app.attached_images[0].chip.clone();
+    let lost_label = app.attached_images[1].chip.clone();
+    let missing_label = app.attached_images[2].chip.clone();
+    std::fs::remove_file(missing).unwrap();
+    app.submit();
+    wait_for_retry_test_turn(&mut app).await;
+
+    let drafts = app.runtime.unsent_messages().await;
+    let deep_code_agent::EntryKind::User { content } = &drafts[0].kind else {
+        panic!("expected user draft");
+    };
+    let saved = content.images().nth(1).unwrap();
+    let corrupt = b"GIF89a-bad!";
+    assert_eq!(saved.bytes, corrupt.len() as u64);
+    std::fs::write(saved.path(), corrupt).unwrap();
+    app.input = "/retry".into();
+    app.submit();
+    wait_for_image_work(&mut app).await;
+    assert_eq!(app.attached_images.len(), 1);
+    assert!(app.input.contains(&good_label));
+    assert!(!app.input.contains(&lost_label));
+    assert!(!app.input.contains(&missing_label));
+    assert!(app.status.contains(&lost_label));
+    assert!(app.status.contains(&missing_label));
+}
+
+#[tokio::test]
+async fn clipboard_snapshot_completes_while_the_composer_can_be_edited() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new();
+    app.workspace = dir.path().canonicalize().unwrap();
+    let path = app.workspace.join("clipboard.gif");
+    std::fs::write(&path, b"GIF89a-clipboard").unwrap();
+    let size = 40 * 1024 * 1024;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(size)
+        .unwrap();
+    app.insert_str_at_cursor("clipboard ");
+    assert!(app.attach_clipboard_content(crate::clipboard::ClipboardImage::File(path)));
+    assert!(app.attached_images.is_empty());
+    assert!(!app.clipboard_snapshots.is_empty());
+    app.insert_str_at_cursor("context ");
+    app.submit();
+    assert!(!app.is_streaming);
+    assert_eq!(app.input, "clipboard context ");
+    wait_for_image_work(&mut app).await;
+    assert!(app.input.starts_with("clipboard context "));
+    assert!(
+        matches!(&app.attached_images[0].source, deep_code_agent::UserImage::Saved(asset)
+        if asset.bytes == size && asset.path().is_file())
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_clipboard_attachment_stops_the_running_worker() {
+    let mut app = App::new();
+    app.input = "keep this draft".into();
+    let (started, start) = tokio::sync::oneshot::channel();
+    let (cancelled, cancellation) = tokio::sync::oneshot::channel();
+    let handle = tokio::runtime::Handle::current();
+    let worker = images::spawn_image_worker("clipboard-cancel-test", move |cancel| {
+        started.send(()).unwrap();
+        handle.block_on(cancel.cancelled());
+        cancelled.send(()).unwrap();
+        Err("cancelled".into())
+    })
+    .unwrap();
+    app.clipboard_snapshots.push_back(worker);
+    start.await.unwrap();
+    app.handle_escape();
+    tokio::time::timeout(std::time::Duration::from_secs(5), cancellation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(app.input, "keep this draft");
+    assert!(app.clipboard_snapshots.is_empty());
+    assert!(!app.poll_image_work());
+}
+
+#[tokio::test]
+async fn a_pending_clipboard_image_cannot_move_to_a_recalled_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let pasted_image = deep_code_agent::snapshot_bytes(&workspace, b"GIF89a-pasted").unwrap();
+    for search in [false, true] {
+        let mut app = App::new();
+        app.remember_prompt("previous prompt");
+        app.paste_str("unsent\nnotes".into());
+        let existing = write_test_png(&workspace, "attached.png");
+        assert!(app.attach_image(existing.clone()));
+        let original = app.input.clone();
+        let expanded = app.expand_pasted(&original);
+
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (finished, finish) = tokio::sync::oneshot::channel();
+        let handle = tokio::runtime::Handle::current();
+        let image = pasted_image.clone();
+        let worker = images::spawn_image_worker("clipboard-history-test", move |cancel| {
+            started.send(()).unwrap();
+            handle.block_on(cancel.cancelled());
+            let _ = finished.send(());
+            Ok(image)
+        })
+        .unwrap();
+        app.clipboard_snapshots.push_back(worker);
+        start.await.unwrap();
+        if search {
+            app.history_search_start();
+        } else {
+            app.history_prev();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), finish)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!app.poll_image_work());
+        assert_eq!(app.input, "previous prompt");
+        assert!(app.attached_images.is_empty());
+
+        if search {
+            app.history_search_cancel();
+        } else {
+            app.history_next();
+        }
+        assert_eq!(app.input, original);
+        assert_eq!(app.expand_pasted(&app.input), expanded);
+        assert_eq!(app.attached_image_paths(), vec![existing]);
+        assert!(app.clipboard_snapshots.is_empty());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4553,28 +4897,6 @@ fn a_pasted_image_path_attaches_and_plain_text_does_not() {
     app.paste_str("just some words".to_string());
     assert_eq!(app.attached_images.len(), 1, "text is text");
     assert!(app.input.contains("just some words"));
-}
-
-#[test]
-fn the_per_message_cap_refuses_before_the_draft_is_committed() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut app = App::new();
-    for index in 0..deep_code_agent::MAX_IMAGES_PER_MESSAGE {
-        let path = write_test_png(dir.path(), &format!("shot-{index}.png"));
-        assert!(app.attach_image(path), "image {index} should attach");
-    }
-    let extra = write_test_png(dir.path(), "one-too-many.png");
-
-    assert!(!app.attach_image(extra));
-
-    assert_eq!(
-        app.attached_images.len(),
-        deep_code_agent::MAX_IMAGES_PER_MESSAGE
-    );
-    assert!(
-        app.status
-            .contains(&deep_code_agent::MAX_IMAGES_PER_MESSAGE.to_string())
-    );
 }
 
 /// The `@` menu hands back a *workspace-relative* path, and the token before it
@@ -5292,7 +5614,10 @@ fn remembered_prompts_persist_to_the_history_file() {
     app.remember_prompt("second");
     app.remember_prompt("second");
     assert_eq!(
-        crate::prompt_history::load(&path, PROMPT_HISTORY_CAP),
+        crate::prompt_history::load(&path, PROMPT_HISTORY_CAP)
+            .into_iter()
+            .map(|entry| entry.text)
+            .collect::<Vec<_>>(),
         vec!["first", "second"]
     );
 }
@@ -5307,7 +5632,7 @@ fn ctrl_r_searches_the_history_backwards_and_restores_the_draft_on_escape() {
     for text in ["fix the parser", "run tests", "fix the lexer"] {
         app.prompt_history.push(HistoryPrompt {
             text: text.to_string(),
-            images: Vec::new(),
+            ..Default::default()
         });
     }
     app.insert_str_at_cursor("my draft");
@@ -5406,7 +5731,7 @@ fn a_search_keeps_the_draft_one_down_arrow_away() {
         for text in ["alpha", "beta", "gamma"] {
             app.prompt_history.push(HistoryPrompt {
                 text: text.to_string(),
-                images: Vec::new(),
+                ..Default::default()
             });
         }
     };

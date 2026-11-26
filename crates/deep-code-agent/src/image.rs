@@ -5,13 +5,17 @@
 //! obtain bytes through their own filesystem authorization before admission.
 //! Request preparation resolves references and reports every omitted image.
 
+use std::cell::Cell;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::hash::{Hash, Hasher};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use cap_fs_ext::DirExt;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::content::ContentBlock;
 use crate::message::Message;
@@ -19,13 +23,15 @@ use crate::message::Role;
 use crate::model::ChatRequest;
 
 const IMAGES_DIR: &str = ".deep-code/images";
+// Each full chunk encodes to base64 without padding.
+const IMAGE_CHUNK_BYTES: usize = 24 * 1024;
 
-pub const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
-pub const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
-pub const MAX_REQUEST_BYTES: u64 = 48 * 1024 * 1024;
+/// Bound automatic reads by tools. User-selected files use the submission path.
+pub(crate) const MAX_TOOL_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+// These budgets apply only when replaying historical images.
+const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_REQUEST_BYTES: u64 = 48 * 1024 * 1024;
 pub const MAX_TOKENS_PER_IMAGE: u32 = 1024;
-/// Product admission limit, independent of the provider's larger ceiling.
-pub const MAX_IMAGES_PER_MESSAGE: usize = 4;
 
 /// Provider-side processing detail. This does not resize the uploaded bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -138,9 +144,7 @@ impl ImageAsset {
         format!("{}.{}", self.digest, self.format.extension())
     }
 
-    /// Resolve only inside the recorded canonical store. Every component is
-    /// opened without following links, then bytes, format and digest are checked.
-    pub fn read(&self) -> Result<Vec<u8>, ImageError> {
+    pub(crate) fn validate_identity(&self) -> Result<(), ImageError> {
         if self.digest.len() != 64
             || !self
                 .digest
@@ -151,9 +155,11 @@ impl ImageAsset {
                 "invalid image asset identity".into(),
             ));
         }
-        if self.bytes > MAX_IMAGE_BYTES {
-            return Err(ImageError::TooLarge { bytes: self.bytes });
-        }
+        Ok(())
+    }
+
+    fn open(&self) -> Result<cap_std::fs::File, ImageError> {
+        self.validate_identity()?;
         let root = crate::pinned_dir::open_canonical(&self.workspace).map_err(image_io_error)?;
         let directory = root
             .open_dir_nofollow(".deep-code")
@@ -167,22 +173,57 @@ impl ImageAsset {
         if metadata.len() != self.bytes {
             return Err(ImageError::Unreadable("image asset size changed".into()));
         }
-        let mut bytes = Vec::new();
-        file.take(self.bytes.saturating_add(1))
-            .read_to_end(&mut bytes)
+        Ok(file)
+    }
+
+    fn read_chunks(&self, consume: impl FnMut(&[u8]) -> io::Result<()>) -> Result<(), ImageError> {
+        let digest = read_image_chunks(self.open()?, self.bytes, self.format, consume)
             .map_err(image_io_error)?;
-        if bytes.len() as u64 != self.bytes
-            || digest_of(&bytes) != self.digest
-            || ImageFormat::sniff(&bytes) != Some(self.format)
-        {
+        if digest != self.digest {
             return Err(ImageError::Unreadable("image asset content changed".into()));
         }
+        Ok(())
+    }
+
+    /// Check the stored size, format and content digest using bounded memory.
+    pub fn verify(&self) -> Result<(), ImageError> {
+        self.read_chunks(|_| Ok(()))
+    }
+
+    /// Verify while the caller still owns the work.
+    pub fn verify_cancellable(&self, cancel: &CancellationToken) -> Result<(), ImageError> {
+        check_cancelled(cancel).map_err(image_io_error)?;
+        self.read_chunks(|_| check_cancelled(cancel))
+    }
+
+    /// Copy the verified bytes to a destination that can be discarded on error.
+    pub(crate) fn copy_verified_to(&self, mut destination: impl Write) -> Result<(), ImageError> {
+        self.read_chunks(|chunk| destination.write_all(chunk))
+    }
+
+    /// Resolve only inside the recorded canonical store. Every component is
+    /// opened without following links, then bytes, format and digest are checked.
+    pub fn read(&self) -> Result<Vec<u8>, ImageError> {
+        self.read_cancellable(&CancellationToken::new())
+    }
+
+    fn read_cancellable(&self, cancel: &CancellationToken) -> Result<Vec<u8>, ImageError> {
+        let mut bytes = Vec::new();
+        self.read_chunks(|chunk| {
+            check_cancelled(cancel)?;
+            if bytes.is_empty() {
+                let size = usize::try_from(self.bytes).map_err(io::Error::other)?;
+                bytes.try_reserve_exact(size).map_err(io::Error::other)?;
+            }
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        })?;
         Ok(bytes)
     }
 
     pub fn data_url(&self) -> Result<String, ImageError> {
         self.read()
-            .map(|bytes| encode_data_url(self.format, &bytes))
+            .and_then(|bytes| encode_data_url(self.format, &bytes))
     }
 }
 
@@ -197,13 +238,16 @@ impl fmt::Display for ImageAsset {
     }
 }
 
-/// Request-only image representation. Persistent content holds ImageAsset,
-/// while preparation replaces Asset with the provider's URL representation.
+/// Request-only image representation. Prepared images encode in chunks.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ImageRef {
     Asset(ImageAsset),
     Url {
         url: String,
+        detail: Option<ImageDetail>,
+    },
+    Prepared {
+        source: PreparedImage,
         detail: Option<ImageDetail>,
     },
 }
@@ -213,6 +257,7 @@ impl ImageRef {
     pub fn asset(&self) -> Option<&ImageAsset> {
         match self {
             Self::Asset(asset) => Some(asset),
+            Self::Prepared { source, .. } => Some(&source.asset),
             Self::Url { .. } => None,
         }
     }
@@ -228,6 +273,7 @@ impl fmt::Display for ImageRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Asset(asset) => fmt::Display::fmt(asset, f),
+            Self::Prepared { source, .. } => fmt::Display::fmt(&source.asset, f),
             Self::Url { url, .. } if url.starts_with("data:") => f.write_str("(inline image)"),
             Self::Url { url, .. } => f.write_str(url),
         }
@@ -248,7 +294,6 @@ pub enum ImageError {
     Missing,
     NotAFile,
     Unreadable(String),
-    TooLarge { bytes: u64 },
     UnsupportedFormat,
 }
 
@@ -263,11 +308,6 @@ impl ImageError {
             Self::Missing => format!("[图片不可用 / image unavailable: {image}]"),
             Self::NotAFile => format!("[图片不可用 / image unavailable, not a file: {image}]"),
             Self::Unreadable(why) => format!("[图片不可读 / image unreadable: {image}: {why}]"),
-            Self::TooLarge { bytes } => format!(
-                "[图片过大 / image too large ({} > {}): {image}]",
-                size_label(*bytes),
-                size_label(MAX_IMAGE_BYTES),
-            ),
             Self::UnsupportedFormat => format!(
                 "[图片格式不支持 / unsupported image format, expected PNG/JPEG/GIF/WebP: {image}]"
             ),
@@ -296,10 +336,6 @@ fn not_accepted_note(image: &str) -> String {
     format!("[图片未发送 / image not sent, the current model does not accept images: {image}]")
 }
 
-fn over_count_note(image: &str) -> String {
-    format!("[图片已省略 / image omitted, at most {MAX_IMAGES_PER_MESSAGE} per message: {image}]")
-}
-
 fn over_total_note(image: &str, limit: u64) -> String {
     format!(
         "[图片已省略 / image omitted, request image total over {}: {image}]",
@@ -318,8 +354,14 @@ fn over_request_note(image: &str, limit: u64) -> String {
 /// The header is identified on the same opened file as the size metadata.
 pub fn inspect(path: &Path) -> Result<Attachment, ImageError> {
     let mut file = open_user_file(path)?;
+    inspect_open_file(&mut file, path)
+}
+
+fn inspect_open_file(file: &mut std::fs::File, path: &Path) -> Result<Attachment, ImageError> {
     let metadata = file.metadata().map_err(image_io_error)?;
-    check_source_metadata(&metadata)?;
+    if !metadata.is_file() {
+        return Err(ImageError::NotAFile);
+    }
     let mut header = [0u8; 16];
     let count = file.read(&mut header).map_err(image_io_error)?;
     let format = ImageFormat::sniff(&header[..count]).ok_or(ImageError::UnsupportedFormat)?;
@@ -350,58 +392,177 @@ fn open_user_file(path: &Path) -> Result<std::fs::File, ImageError> {
     options.open(path).map_err(image_io_error)
 }
 
-fn check_source_metadata(metadata: &std::fs::Metadata) -> Result<(), ImageError> {
-    if !metadata.is_file() {
-        return Err(ImageError::NotAFile);
-    }
-    if metadata.len() > MAX_IMAGE_BYTES {
-        return Err(ImageError::TooLarge {
-            bytes: metadata.len(),
-        });
-    }
-    Ok(())
-}
-
-fn read_user_image(path: &Path) -> Result<Vec<u8>, ImageError> {
-    let file = open_user_file(path)?;
-    check_source_metadata(&file.metadata().map_err(image_io_error)?)?;
+fn read_image_bytes(file: impl Read, size: u64) -> Result<Vec<u8>, ImageError> {
+    let capacity = usize::try_from(size.saturating_add(1))
+        .map_err(|error| ImageError::Unreadable(error.to_string()))?;
     let mut bytes = Vec::new();
-    file.take(MAX_IMAGE_BYTES + 1)
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|error| ImageError::Unreadable(error.to_string()))?;
+    file.take(size.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(image_io_error)?;
-    validate_bytes(&bytes)?;
+    if bytes.len() as u64 != size {
+        return Err(ImageError::Unreadable(
+            "image size changed while reading".into(),
+        ));
+    }
     Ok(bytes)
 }
 
-fn validate_bytes(bytes: &[u8]) -> Result<ImageFormat, ImageError> {
-    if bytes.len() as u64 > MAX_IMAGE_BYTES {
-        return Err(ImageError::TooLarge {
-            bytes: bytes.len() as u64,
-        });
-    }
-    ImageFormat::sniff(bytes).ok_or(ImageError::UnsupportedFormat)
+/// Read an explicitly selected image, checking the type on the same file handle.
+pub fn read_image_file(path: &Path) -> Result<Vec<u8>, ImageError> {
+    let mut file = open_user_file(path)?;
+    let attachment = inspect_open_file(&mut file, path)?;
+    file.rewind().map_err(image_io_error)?;
+    read_image_bytes(file, attachment.bytes)
 }
 
 /// Encode a user-selected file. Persisted request preparation uses verified
 /// ImageAsset reads instead of reopening arbitrary paths.
 pub fn data_url(path: &Path) -> Result<String, ImageError> {
-    let bytes = read_user_image(path)?;
-    let format = validate_bytes(&bytes)?;
-    Ok(encode_data_url(format, &bytes))
+    let bytes = read_image_file(path)?;
+    let format = ImageFormat::sniff(&bytes).ok_or(ImageError::UnsupportedFormat)?;
+    encode_data_url(format, &bytes)
 }
 
-fn encode_data_url(format: ImageFormat, bytes: &[u8]) -> String {
-    format!(
-        "data:{};base64,{}",
-        format.media_type(),
-        base64::engine::general_purpose::STANDARD.encode(bytes)
-    )
+fn encode_data_url(format: ImageFormat, bytes: &[u8]) -> Result<String, ImageError> {
+    let mut url = format!("data:{};base64,", format.media_type());
+    let encoded_bytes = base64::encoded_len(bytes.len(), true).ok_or_else(|| {
+        ImageError::Unreadable("image encoding size could not be represented".into())
+    })?;
+    url.try_reserve_exact(encoded_bytes)
+        .map_err(|error| ImageError::Unreadable(error.to_string()))?;
+    base64::engine::general_purpose::STANDARD.encode_string(bytes, &mut url);
+    Ok(url)
+}
+
+/// A new submission streams from its asset. A historical image keeps the
+/// bytes verified within the replay budget for this request and its retries.
+#[derive(Clone)]
+pub struct PreparedImage {
+    asset: ImageAsset,
+    replay: Option<Arc<Vec<u8>>>,
+}
+
+impl PreparedImage {
+    fn read_chunks(&self, consume: impl FnMut(&[u8]) -> io::Result<()>) -> Result<(), ImageError> {
+        match &self.replay {
+            Some(bytes) => bytes
+                .chunks(IMAGE_CHUNK_BYTES)
+                .try_for_each(consume)
+                .map_err(image_io_error),
+            None => self.asset.read_chunks(consume),
+        }
+    }
+}
+
+// The verified digest identifies the wire bytes for either backing. Cloning
+// or fingerprinting a request must not copy, log, or hash the pixels again.
+impl fmt::Debug for PreparedImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.asset, f)
+    }
+}
+impl PartialEq for PreparedImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.asset == other.asset
+    }
+}
+impl Eq for PreparedImage {}
+impl Hash for PreparedImage {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.asset.hash(state);
+    }
+}
+
+impl Serialize for PreparedImage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let url = DataUrlChunks {
+            source: self,
+            image_error: Cell::new(None),
+        };
+        let serialized = serializer.collect_str(&url);
+        match url.image_error.into_inner() {
+            Some(error) => Err(serde::ser::Error::custom(
+                error.note_about(&self.asset.to_string()),
+            )),
+            None => serialized,
+        }
+    }
+}
+
+struct DataUrlChunks<'a> {
+    source: &'a PreparedImage,
+    image_error: Cell<Option<ImageError>>,
+}
+
+impl fmt::Display for DataUrlChunks<'_> {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            out,
+            "data:{};base64,",
+            self.source.asset.format.media_type()
+        )?;
+        let mut encoded = [0; IMAGE_CHUNK_BYTES / 3 * 4];
+        let mut output_failed = false;
+        let result = self.source.read_chunks(|chunk| {
+            let len = base64::engine::general_purpose::STANDARD
+                .encode_slice(chunk, &mut encoded)
+                .expect("room for one encoded image chunk");
+            let text = std::str::from_utf8(&encoded[..len]).expect("base64 is ASCII");
+            out.write_str(text).map_err(|error| {
+                output_failed = true;
+                io::Error::other(error)
+            })
+        });
+        if output_failed {
+            return Err(fmt::Error);
+        }
+        // JSON's collect_str expects fmt::Error only for an output failure.
+        // Propagate input errors from Serialize after the formatter returns.
+        self.image_error.set(result.err());
+        Ok(())
+    }
+}
+
+fn read_image_chunks(
+    mut source: impl Read,
+    bytes: u64,
+    format: ImageFormat,
+    mut consume: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<String> {
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = [0; IMAGE_CHUNK_BYTES];
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let size = remaining.min(IMAGE_CHUNK_BYTES as u64) as usize;
+        let chunk = &mut buffer[..size];
+        source.read_exact(chunk)?;
+        if remaining == bytes && ImageFormat::sniff(chunk) != Some(format) {
+            return Err(io::Error::other("image format changed while reading"));
+        }
+        hash.update(chunk);
+        consume(chunk)?;
+        remaining -= size as u64;
+    }
+    if bytes == 0 || source.read(&mut buffer[..1])? != 0 {
+        return Err(io::Error::other("image size changed while reading"));
+    }
+    Ok(hex(hash.finish().as_ref()))
+}
+
+fn check_cancelled(cancel: &CancellationToken) -> io::Result<()> {
+    if cancel.is_cancelled() {
+        Err(io::Error::other("image preparation cancelled"))
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 pub enum StoreError {
     UnsupportedFormat,
-    TooLarge { bytes: u64 },
     Io(io::Error),
 }
 
@@ -411,12 +572,6 @@ impl fmt::Display for StoreError {
             Self::UnsupportedFormat => {
                 f.write_str("not a supported image format (PNG/JPEG/GIF/WebP)")
             }
-            Self::TooLarge { bytes } => write!(
-                f,
-                "image too large ({} > {})",
-                size_label(*bytes),
-                size_label(MAX_IMAGE_BYTES)
-            ),
             Self::Io(error) => fmt::Display::fmt(error, f),
         }
     }
@@ -434,16 +589,26 @@ impl From<io::Error> for StoreError {
 /// must be the caller's approved canonical workspace. Publication is atomic;
 /// successful return means the exact object is present and verifies.
 pub fn snapshot_bytes(workspace: &Path, bytes: &[u8]) -> Result<ImageAsset, StoreError> {
-    let format = validate_bytes(bytes).map_err(|error| match error {
-        ImageError::TooLarge { bytes } => StoreError::TooLarge { bytes },
-        _ => StoreError::UnsupportedFormat,
-    })?;
-    let asset = ImageAsset {
-        workspace: workspace.to_path_buf(),
-        digest: digest_of(bytes),
-        format,
-        bytes: bytes.len() as u64,
-    };
+    snapshot_bytes_cancellable(workspace, bytes, &CancellationToken::new())
+}
+
+pub fn snapshot_bytes_cancellable(
+    workspace: &Path,
+    bytes: &[u8],
+    cancel: &CancellationToken,
+) -> Result<ImageAsset, StoreError> {
+    check_cancelled(cancel)?;
+    let format = ImageFormat::sniff(bytes).ok_or(StoreError::UnsupportedFormat)?;
+    snapshot_reader(workspace, bytes, format, bytes.len() as u64, cancel)
+}
+
+fn snapshot_reader(
+    workspace: &Path,
+    source: impl Read,
+    format: ImageFormat,
+    bytes: u64,
+    cancel: &CancellationToken,
+) -> Result<ImageAsset, StoreError> {
     let root = crate::pinned_dir::open_canonical(workspace)?;
     let state = crate::pinned_dir::owned_child(&root, ".deep-code")?;
     let images = crate::pinned_dir::owned_child(&state, "images")?;
@@ -454,7 +619,7 @@ pub fn snapshot_bytes(workspace: &Path, bytes: &[u8]) -> Result<ImageAsset, Stor
         )
         .and_then(|mut file| file.write_all(crate::session_store::SELF_IGNORE_BODY.as_bytes()));
     let temporary = format!(".pending-{}.tmp", uuid::Uuid::new_v4());
-    let published = (|| -> io::Result<()> {
+    let published = (|| -> io::Result<ImageAsset> {
         let mut options = cap_std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -463,8 +628,19 @@ pub fn snapshot_bytes(workspace: &Path, bytes: &[u8]) -> Result<ImageAsset, Stor
             options.mode(0o600);
         }
         let mut file = images.open_with(&temporary, &options)?;
-        file.write_all(bytes)?;
+        let digest = read_image_chunks(source, bytes, format, |chunk| {
+            check_cancelled(cancel)?;
+            file.write_all(chunk)
+        })?;
+        let asset = ImageAsset {
+            workspace: workspace.to_path_buf(),
+            digest,
+            format,
+            bytes,
+        };
+        check_cancelled(cancel)?;
         file.sync_all()?;
+        check_cancelled(cancel)?;
         match images.hard_link(&temporary, &images, asset.file_name()) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -473,49 +649,38 @@ pub fn snapshot_bytes(workspace: &Path, bytes: &[u8]) -> Result<ImageAsset, Stor
         sync_directory(&images)?;
         sync_directory(&state)?;
         sync_directory(&root)?;
-        Ok(())
+        Ok(asset)
     })();
     let _ = images.remove_file(&temporary);
-    published?;
-    let stored = asset
-        .read()
+    let asset = published?;
+    asset
+        .verify_cancellable(cancel)
         .map_err(|error| io::Error::other(error.note_about(&asset.to_string())))?;
-    if stored != bytes {
-        return Err(io::Error::other("image asset does not match admitted bytes").into());
-    }
     Ok(asset)
 }
 
-/// Snapshot explicit user attachments. Tool-selected paths must not use this
+/// Snapshot an explicit user attachment. Tool-selected paths must not use this
 /// entry point: their caller supplies authorized bytes to snapshot_bytes.
-pub fn snapshot_paths(workspace: &Path, paths: &[PathBuf]) -> (Vec<ImageAsset>, Vec<String>) {
-    let mut assets = Vec::new();
-    let mut notes = Vec::new();
-    let mut remaining = MAX_TOTAL_BYTES;
-    for path in paths {
-        if assets.len() >= MAX_IMAGES_PER_MESSAGE {
-            notes.push(over_count_note(&path.display().to_string()));
-            continue;
-        }
-        match read_user_image(path) {
-            Ok(bytes) if bytes.len() as u64 > remaining => notes.push(over_total_note(
-                &path.display().to_string(),
-                MAX_TOTAL_BYTES,
-            )),
-            Ok(bytes) => match snapshot_bytes(workspace, &bytes) {
-                Ok(asset) => {
-                    remaining -= asset.bytes;
-                    assets.push(asset);
-                }
-                Err(error) => notes.push(format!(
-                    "[图片无法保存 / image snapshot failed: {}: {error}]",
-                    path.display()
-                )),
-            },
-            Err(error) => notes.push(error.note(path)),
-        }
-    }
-    (assets, notes)
+pub fn snapshot_path(workspace: &Path, path: &Path) -> Result<ImageAsset, String> {
+    snapshot_path_cancellable(workspace, path, &CancellationToken::new())
+}
+
+pub fn snapshot_path_cancellable(
+    workspace: &Path,
+    path: &Path,
+    cancel: &CancellationToken,
+) -> Result<ImageAsset, String> {
+    check_cancelled(cancel).map_err(|error| image_io_error(error).note(path))?;
+    let mut file = open_user_file(path).map_err(|error| error.note(path))?;
+    let attachment = inspect_open_file(&mut file, path).map_err(|error| error.note(path))?;
+    file.rewind()
+        .map_err(|error| image_io_error(error).note(path))?;
+    snapshot_reader(workspace, file, attachment.format, attachment.bytes, cancel).map_err(|error| {
+        format!(
+            "[图片无法保存 / image snapshot failed: {}: {error}]",
+            path.display()
+        )
+    })
 }
 
 /// Store clipboard pixels before attaching them to the draft. The returned
@@ -555,10 +720,6 @@ fn sync_directory(directory: &cap_std::fs::Dir) -> io::Result<()> {
     }
 }
 
-fn digest_of(bytes: &[u8]) -> String {
-    hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
-}
-
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -591,18 +752,37 @@ pub(crate) struct PreparedImageRequest {
 
 /// Prepare the actual request, including tools and model options, so image
 /// budgets use the same serialized body that the HTTP client will send.
-#[must_use]
+#[cfg(test)]
 pub(crate) fn prepare_request_images(
     request: ChatRequest,
     detail: Option<ImageDetail>,
     accepted: bool,
-) -> PreparedImageRequest {
+    submissions: &[usize],
+) -> Result<PreparedImageRequest, String> {
+    prepare_request_images_cancellable(
+        request,
+        detail,
+        accepted,
+        submissions,
+        &CancellationToken::new(),
+    )
+}
+
+pub(crate) fn prepare_request_images_cancellable(
+    request: ChatRequest,
+    detail: Option<ImageDetail>,
+    accepted: bool,
+    submissions: &[usize],
+    cancel: &CancellationToken,
+) -> Result<PreparedImageRequest, String> {
     prepare_request_images_with_limits(
         request,
         detail,
         accepted,
+        submissions,
         MAX_TOTAL_BYTES,
         MAX_REQUEST_BYTES,
+        cancel,
     )
 }
 
@@ -610,47 +790,67 @@ fn prepare_request_images_with_limits(
     mut request: ChatRequest,
     detail: Option<ImageDetail>,
     accepted: bool,
+    submissions: &[usize],
     total_limit: u64,
     request_limit: u64,
-) -> PreparedImageRequest {
-    let (messages, mut images) = prepare_messages(request.messages, detail, accepted, total_limit);
+    cancel: &CancellationToken,
+) -> Result<PreparedImageRequest, String> {
+    let (messages, mut images) = prepare_messages(
+        request.messages,
+        detail,
+        accepted,
+        submissions,
+        total_limit,
+        cancel,
+    )?;
     request.messages = messages;
-    fit_body(&mut request, request_limit, &mut images);
+    check_cancelled(cancel).map_err(|error| error.to_string())?;
+    fit_body(&mut request, request_limit, submissions, &mut images);
     images.sort_by_key(|image| (image.message_index, image.block_index));
-    PreparedImageRequest { request, images }
+    Ok(PreparedImageRequest { request, images })
 }
 
 fn prepare_messages(
     mut messages: Vec<Message>,
     detail: Option<ImageDetail>,
     accepted: bool,
+    submissions: &[usize],
     total_limit: u64,
-) -> (Vec<Message>, Vec<ImageDelivery>) {
+    cancel: &CancellationToken,
+) -> Result<(Vec<Message>, Vec<ImageDelivery>), String> {
     let mut remaining = total_limit;
     let mut deliveries = Vec::new();
     for (message_index, message) in messages.iter_mut().enumerate().rev() {
-        let mut retained = 0usize;
+        let submitted = submissions.contains(&message_index);
         for (block_index, block) in message.content.blocks.iter_mut().enumerate().rev() {
             let ContentBlock::Image { image } = block else {
                 continue;
             };
+            check_cancelled(cancel).map_err(|error| error.to_string())?;
             let description = image.to_string();
-            let outcome = if !accepted {
+            let bytes = match image {
+                ImageRef::Asset(asset) => asset.bytes,
+                ImageRef::Prepared { source, .. } => source.asset.bytes,
+                ImageRef::Url { url, .. } => inline_bytes(url).unwrap_or(0),
+            };
+            let outcome = if submitted {
+                // Send the user's selected attachments together. A local read
+                // failure stops the submission, leaving the draft recoverable.
+                Ok(prepare_image(image, detail, submitted, cancel)?)
+            } else if !accepted {
                 Err(not_accepted_note(&description))
             } else if message.role == Role::Assistant {
                 Err(format!(
                     "[图片未发送 / image not sent, assistant messages do not support images: {description}]"
                 ))
-            } else if retained >= MAX_IMAGES_PER_MESSAGE {
-                Err(over_count_note(&description))
+            } else if bytes > remaining {
+                Err(over_total_note(&description, total_limit))
             } else {
-                resolve_image(image, detail, remaining, total_limit)
+                prepare_image(image, detail, submitted, cancel)
             };
             let (included, reason) = match outcome {
-                Ok((resolved, bytes)) => {
-                    remaining -= bytes;
-                    retained += 1;
-                    *image = resolved;
+                Ok(()) => {
+                    remaining = remaining.saturating_sub(bytes);
                     (true, None)
                 }
                 Err(reason) => {
@@ -671,32 +871,33 @@ fn prepare_messages(
             });
         }
     }
-    (messages, deliveries)
+    Ok((messages, deliveries))
 }
 
-fn resolve_image(
-    image: &ImageRef,
+fn prepare_image(
+    image: &mut ImageRef,
     detail: Option<ImageDetail>,
-    remaining: u64,
-    total_limit: u64,
-) -> Result<(ImageRef, u64), String> {
-    let bytes = match image {
-        ImageRef::Asset(asset) => asset.bytes,
-        ImageRef::Url { url, .. } => inline_bytes(url).unwrap_or(0),
-    };
-    if bytes > MAX_IMAGE_BYTES {
-        return Err(ImageError::TooLarge { bytes }.note_about(&image.to_string()));
+    submitted: bool,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    if let ImageRef::Asset(asset) = image {
+        let replay = if submitted {
+            asset.verify_cancellable(cancel).map(|()| None)
+        } else {
+            asset
+                .read_cancellable(cancel)
+                .map(|bytes| Some(Arc::new(bytes)))
+        }
+        .map_err(|error| error.note_about(&asset.to_string()))?;
+        *image = ImageRef::Prepared {
+            source: PreparedImage {
+                asset: asset.clone(),
+                replay,
+            },
+            detail,
+        };
     }
-    if bytes > remaining {
-        return Err(over_total_note(&image.to_string(), total_limit));
-    }
-    match image {
-        ImageRef::Asset(asset) => asset
-            .data_url()
-            .map(|url| (ImageRef::Url { url, detail }, bytes))
-            .map_err(|error| error.note_about(&asset.to_string())),
-        ImageRef::Url { .. } => Ok((image.clone(), bytes)),
-    }
+    Ok(())
 }
 
 fn inline_bytes(url: &str) -> Option<u64> {
@@ -709,7 +910,20 @@ fn inline_bytes(url: &str) -> Option<u64> {
     Some(((encoded.len() as u64).saturating_mul(3) / 4).saturating_sub(padding.min(2)))
 }
 
-fn fit_body(request: &mut ChatRequest, limit: u64, deliveries: &mut [ImageDelivery]) {
+/// Make room by trimming replayed images. The newly submitted images reach the
+/// provider together even when they exceed the historical replay budget.
+fn fit_body(
+    request: &mut ChatRequest,
+    limit: u64,
+    submissions: &[usize],
+    deliveries: &mut [ImageDelivery],
+) {
+    if !deliveries
+        .iter()
+        .any(|image| image.included && !submissions.contains(&image.message_index))
+    {
+        return;
+    }
     loop {
         match serialized_size(request) {
             Some(size) if size <= limit => return,
@@ -718,6 +932,9 @@ fn fit_body(request: &mut ChatRequest, limit: u64, deliveries: &mut [ImageDelive
         }
         let mut removed = None;
         'messages: for (message_index, message) in request.messages.iter_mut().enumerate() {
+            if submissions.contains(&message_index) {
+                continue;
+            }
             for (block_index, block) in message.content.blocks.iter_mut().enumerate() {
                 let ContentBlock::Image { image } = block else {
                     continue;
@@ -745,8 +962,30 @@ fn fit_body(request: &mut ChatRequest, limit: u64, deliveries: &mut [ImageDelive
 }
 
 fn serialized_size(request: &ChatRequest) -> Option<u64> {
+    // The data URL alphabet needs no JSON escaping. Count those bytes from
+    // the asset sizes, then serialize the surrounding JSON with empty URLs.
+    let mut request = request.clone();
     let mut counter = ByteCounter::default();
-    serde_json::to_writer(&mut counter, request)
+    for message in &mut request.messages {
+        for block in &mut message.content.blocks {
+            let ContentBlock::Image { image } = block else {
+                continue;
+            };
+            if let ImageRef::Prepared { source, detail } = image {
+                let asset = &source.asset;
+                let prefix = "data:;base64,".len() + asset.format.media_type().len();
+                counter.bytes = counter.bytes.saturating_add(prefix as u64);
+                counter.bytes = counter
+                    .bytes
+                    .saturating_add(asset.bytes.div_ceil(3).saturating_mul(4));
+                *image = ImageRef::Url {
+                    url: String::new(),
+                    detail: *detail,
+                };
+            }
+        }
+    }
+    serde_json::to_writer(&mut counter, &request)
         .ok()
         .map(|()| counter.bytes)
 }

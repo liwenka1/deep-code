@@ -1,4 +1,5 @@
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::{AgentRuntime, RuntimeEvent, RuntimeEventReceiver, TurnId, TurnTelemetry, UserTurn};
 use crate::Usage;
@@ -64,7 +65,8 @@ impl TurnHandle {
             Some(RuntimeEvent::Error { kind, message, .. }) => Some(TurnOutcome {
                 reason: match kind {
                     super::RuntimeFailureKind::StepLimit => FinishReason::StepLimit,
-                    super::RuntimeFailureKind::Execution => FinishReason::Failed,
+                    super::RuntimeFailureKind::Submission
+                    | super::RuntimeFailureKind::Execution => FinishReason::Failed,
                 },
                 usage: None,
                 telemetry: None,
@@ -135,44 +137,47 @@ impl AgentRuntime {
             .await
             .is_err()
         {
-            super::event::emit(
+            self.fail_turn(
+                turn_id,
                 tx,
-                RuntimeEvent::Error {
-                    kind: super::RuntimeFailureKind::Execution,
-                    turn_id: Some(turn_id.clone()),
-                    message: "turn task panicked".into(),
-                },
-            );
-            self.abort_turn(turn_id).await;
+                super::RuntimeFailureKind::Execution,
+                "turn task panicked".into(),
+            )
+            .await;
         }
     }
 
     pub async fn start_turn(&self, prompt: impl Into<UserTurn>) -> TurnHandle {
-        // The bootstrap owns begin_turn even when its caller stops awaiting
-        // during persistence. Sending to a dropped receiver drops the newly
-        // created handle and cancels that exact turn before any tools run.
-        let (ready, receive) = tokio::sync::oneshot::channel();
-        let runtime = self.clone();
-        let prompt = prompt.into();
-        tokio::spawn(async move {
-            let turn = match runtime.begin_turn(prompt).await {
-                Ok(id) => runtime.drive_turn_handle(id).await,
-                Err(error) => {
-                    let id = TurnId::new();
-                    let (tx, events) = mpsc::unbounded_channel();
-                    super::event::emit(&tx, runtime.turn_start_error(Some(id.clone()), error));
-                    TurnHandle {
-                        runtime,
-                        id,
-                        events,
-                        outcome: None,
-                        cancel: tokio_util::sync::CancellationToken::new(),
-                    }
+        self.start_turn_cancellable(prompt, &CancellationToken::new())
+            .await
+    }
+
+    /// Allow the caller to cancel even while the prompt is being prepared.
+    /// Use [`TurnHandle::cancel`] to settle a parked approval as well.
+    pub async fn start_turn_cancellable(
+        &self,
+        prompt: impl Into<UserTurn>,
+        cancel: &CancellationToken,
+    ) -> TurnHandle {
+        match self.prepare_turn(prompt.into(), cancel.child_token()).await {
+            Ok(turn) => {
+                let handle = self.drive_turn_handle(turn.id.clone()).await;
+                turn.claim();
+                handle
+            }
+            Err(error) => {
+                let id = TurnId::new();
+                let (tx, events) = mpsc::unbounded_channel();
+                super::event::emit(&tx, self.turn_start_error(Some(id.clone()), error));
+                TurnHandle {
+                    runtime: self.clone(),
+                    id,
+                    events,
+                    outcome: None,
+                    cancel: CancellationToken::new(),
                 }
-            };
-            let _ = ready.send(turn);
-        });
-        receive.await.expect("runtime turn bootstrap stopped")
+            }
+        }
     }
 
     /// Drive a turn prepared by `begin_turn` (used by the sub-agent launcher).
@@ -181,7 +186,7 @@ impl AgentRuntime {
         let (prompt, cancel) = {
             let mut state = self.state.lock().await;
             if state.current_turn_id.as_ref() != Some(&id) {
-                let cancel = tokio_util::sync::CancellationToken::new();
+                let cancel = CancellationToken::new();
                 cancel.cancel();
                 super::event::emit(
                     &tx,
@@ -199,7 +204,7 @@ impl AgentRuntime {
             }
             state.turn_events = Some((id.clone(), tx.clone()));
             (
-                state.current_prompt.clone().unwrap_or_default().text,
+                state.current_prompt.clone().unwrap_or_default(),
                 state.cancel.clone(),
             )
         };

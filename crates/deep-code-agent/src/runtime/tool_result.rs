@@ -794,17 +794,6 @@ pub(super) fn tool_call_payload(call: &ToolCall) -> ToolCallPayload {
     }
 }
 
-pub(super) fn runtime_error_from_tool_error(
-    error: ToolError,
-    turn_id: Option<TurnId>,
-) -> RuntimeEvent {
-    RuntimeEvent::Error {
-        kind: crate::RuntimeFailureKind::Execution,
-        turn_id,
-        message: error.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

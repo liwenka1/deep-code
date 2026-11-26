@@ -77,14 +77,13 @@ pub use instructions::{
     INSTRUCTIONS_FILE, InstructionScope, InstructionSource, MAX_INSTRUCTIONS_CHARS,
     ProjectInstructions,
 };
-// The TUI reads the clipboard and writes the bytes, the runtime reads them back
-// and builds the URL, and compaction charges them against the window. All three
-// sides come through here so there is exactly one definition of what an
-// acceptable image is.
+// Attachment admission, the request projection, and compaction share the
+// same stored image identity.
 pub use image::{
     Attachment, ImageAsset, ImageDelivery, ImageDetail, ImageError, ImageFormat, ImageRef,
-    MAX_IMAGE_BYTES, MAX_IMAGES_PER_MESSAGE, MAX_REQUEST_BYTES, MAX_TOKENS_PER_IMAGE,
-    MAX_TOTAL_BYTES, StoreError, data_url, inspect, store, store_in_pinned_workspace,
+    MAX_TOKENS_PER_IMAGE, PreparedImage, StoreError, data_url, inspect, read_image_file,
+    snapshot_bytes, snapshot_bytes_cancellable, snapshot_path, snapshot_path_cancellable, store,
+    store_in_pinned_workspace,
 };
 // Already reachable through `AgentRuntime::session_messages`'s signature;
 // exported so consumers (the headless driver) can actually name them.
@@ -107,7 +106,7 @@ pub use runtime::LiveSessionSnapshot;
 pub use runtime::{
     AgentRuntime, CompactNowOutcome, CompactionReport, FinishReason, MAX_TURN_STEPS, PrefixStatus,
     RuntimeEvent, RuntimeEventReceiver, RuntimeFailureKind, ToolCallId, TurnHandle, TurnId,
-    TurnOutcome, TurnTelemetry, UserTurn, is_network_tool, session_consent_recordable,
+    TurnOutcome, TurnTelemetry, UserImage, UserTurn, is_network_tool, session_consent_recordable,
     unattended_denial_note,
 };
 pub use runtime_launch::{
@@ -118,6 +117,7 @@ pub use sandbox::{Enforcement, EnforcementGap, sandbox_available, sandbox_enforc
 pub use session::Session;
 pub use session_entry::{
     Ask, CompactionImageSource, EntryKind, ExchangeResult, SessionEntry, ToolExchange,
+    UnsentMessage,
 };
 pub use session_store::{
     CheckpointRecord, ImageProjectionState, ImageRequestRecord, JsonSessionStore, PreparedSession,

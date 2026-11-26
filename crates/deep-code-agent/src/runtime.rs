@@ -47,24 +47,67 @@ use crate::client::LlmClient;
 use crate::config::AgentConfig;
 use crate::error::{AgentError, AgentResult};
 use crate::execution_policy::SharedPermissionMode;
+use crate::image::ImageAsset;
 use crate::lsp::LspManager;
 use crate::message::Message;
 use crate::session::Session;
+use crate::session_entry::{SessionEntry, UnsentMessage};
 use crate::session_store::{TurnRecord, now_ms};
 use crate::tool::{ApprovalDecision, ApprovalRequest, ToolCall, ToolRegistry};
 use event::emit;
 pub use event::{RuntimeEvent, RuntimeEventReceiver, RuntimeFailureKind, ToolCallId, TurnId};
 
+/// Owns a registered turn until its caller or driver takes over.
+struct PreparedTurn<'a> {
+    id: TurnId,
+    runtime: &'a AgentRuntime,
+    cancel_on_drop: Option<CancellationToken>,
+    executor: tokio::runtime::Handle,
+}
+
+impl PreparedTurn<'_> {
+    fn claim(mut self) -> TurnId {
+        self.cancel_on_drop = None;
+        self.id.clone()
+    }
+}
+
+impl Drop for PreparedTurn<'_> {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel_on_drop.take() {
+            cancel.cancel();
+            let runtime = self.runtime.clone();
+            let id = self.id.clone();
+            self.executor
+                .spawn(async move { runtime.finish_turn(&id).await });
+        }
+    }
+}
+
 /// User input to admit: text followed by local image attachments.
 ///
-/// Admission snapshots every valid image before it enters the session or a
-/// steering queue. Text-only input can be supplied directly via `Into`.
+/// Admission snapshots user-selected files before requests reach the model.
+/// Text-only input can be supplied directly via `Into`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserTurn {
     pub text: String,
-    /// Source files in attachment order. These paths are input only; the
-    /// persisted observation holds immutable content-addressed assets.
-    pub images: Vec<PathBuf>,
+    images: Vec<(UserImage, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserImage {
+    File(PathBuf),
+    Saved(ImageAsset),
+}
+
+impl UserImage {
+    #[must_use]
+    pub fn path(&self) -> PathBuf {
+        match self {
+            Self::File(path) => path.clone(),
+            Self::Saved(image) => image.path(),
+        }
+    }
 }
 
 impl UserTurn {
@@ -72,12 +115,23 @@ impl UserTurn {
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            images: Vec::new(),
+            ..Self::default()
         }
     }
 
     #[must_use]
     pub fn with_images(text: impl Into<String>, images: Vec<PathBuf>) -> Self {
+        Self::with_labeled_images(
+            text,
+            images
+                .into_iter()
+                .map(|path| (UserImage::File(path), String::new()))
+                .collect(),
+        )
+    }
+
+    #[must_use]
+    pub fn with_labeled_images(text: impl Into<String>, images: Vec<(UserImage, String)>) -> Self {
         Self {
             text: text.into(),
             images,
@@ -87,6 +141,24 @@ impl UserTurn {
     #[must_use]
     pub fn has_images(&self) -> bool {
         !self.images.is_empty()
+    }
+
+    fn pending_content(&self) -> (Content, UnsentMessage) {
+        let mut content = Content::from(self.text.clone());
+        let mut unsent = UnsentMessage::default();
+        for (image, label) in &self.images {
+            match image {
+                UserImage::Saved(asset) => {
+                    content.push_image(asset.clone());
+                    unsent.image_labels.push(label.clone());
+                }
+                UserImage::File(_) if !label.is_empty() => {
+                    unsent.missing_image_labels.push(label.clone());
+                }
+                UserImage::File(_) => {}
+            }
+        }
+        (content, unsent)
     }
 }
 
@@ -126,6 +198,7 @@ pub struct AgentRuntime {
     is_subagent: bool,
     tools: Arc<ToolRegistry>,
     state: Arc<Mutex<RuntimeState>>,
+    turn_start: Arc<Mutex<()>>,
     checkpoints: Option<Arc<CheckpointStore>>,
     workspace: Option<PathBuf>,
     /// The session's live write boundary — the same shared policy instance
@@ -214,6 +287,7 @@ impl AgentRuntime {
             is_subagent: false,
             tools: Arc::new(tools),
             state: Arc::new(Mutex::new(RuntimeState::default())),
+            turn_start: Arc::new(Mutex::new(())),
             checkpoints: None,
             workspace: None,
             boundary: None,
@@ -260,6 +334,7 @@ impl AgentRuntime {
                 session,
                 ..Default::default()
             })),
+            turn_start: Arc::new(Mutex::new(())),
             checkpoints: None,
             workspace: None,
             boundary: None,
@@ -280,34 +355,82 @@ impl AgentRuntime {
         self
     }
 
-    async fn admit_user_content(&self, prompt: &UserTurn) -> Content {
-        let mut content = Content::from(prompt.text.clone());
-        if prompt.images.is_empty() {
-            return content;
+    async fn admit_user_content(
+        &self,
+        prompt: &UserTurn,
+        cancel: &CancellationToken,
+    ) -> Option<(Content, UnsentMessage)> {
+        if cancel.is_cancelled() {
+            return None;
         }
-        let Some(workspace) = self.workspace.clone() else {
-            content.push_text("\n[图片未接纳：运行时未配置图片存储目录 / images unavailable: no image workspace configured]");
-            return content;
+        let mut content = Content::from(prompt.text.clone());
+        let mut unsent = UnsentMessage::default();
+        if prompt.images.is_empty() {
+            return Some((content, unsent));
+        }
+        let labels = || {
+            prompt
+                .images
+                .iter()
+                .filter_map(|(_, label)| (!label.is_empty()).then_some(label.clone()))
+                .collect()
         };
-        let paths = prompt.images.clone();
-        match tokio::task::spawn_blocking(move || crate::image::snapshot_paths(&workspace, &paths))
-            .await
-        {
-            Ok((images, notes)) => {
-                content.blocks.extend(
-                    images
-                        .into_iter()
-                        .map(|image| ContentBlock::Image { image }),
-                );
-                for note in notes {
-                    content.push_text(format!("\n{note}"));
+        let Some(workspace) = self.workspace.clone() else {
+            unsent.error = Some("未配置图片存储目录 / no image workspace configured".into());
+            unsent.missing_image_labels = labels();
+            return Some((content, unsent));
+        };
+        let images = prompt.images.clone();
+        let worker_cancel = cancel.child_token();
+        let _cancel_on_drop = worker_cancel.clone().drop_guard();
+        let worker = tokio::task::spawn_blocking(move || {
+            images
+                .into_iter()
+                .map(|(source, label)| {
+                    let image = match source {
+                        UserImage::File(path) => crate::image::snapshot_path_cancellable(
+                            &workspace,
+                            &path,
+                            &worker_cancel,
+                        ),
+                        UserImage::Saved(image) => Ok(image),
+                    };
+                    (image, label)
+                })
+                .collect::<Vec<_>>()
+        });
+        let result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return None,
+            result = worker => result,
+        };
+        match result {
+            Ok(images) => {
+                let mut errors = Vec::new();
+                for (image, label) in images {
+                    match image {
+                        Ok(image) => {
+                            content.blocks.push(ContentBlock::Image { image });
+                            unsent.image_labels.push(label);
+                        }
+                        Err(error) => {
+                            errors.push(error);
+                            if !label.is_empty() {
+                                unsent.missing_image_labels.push(label);
+                            }
+                        }
+                    }
+                }
+                if !errors.is_empty() {
+                    unsent.error = Some(errors.join("\n"));
                 }
             }
             Err(error) => {
-                content.push_text(format!("\n[图片未接纳 / image admission failed: {error}]"))
+                unsent.error = Some(format!("图片读取失败 / image admission failed: {error}"));
+                unsent.missing_image_labels = labels();
             }
         }
-        content
+        Some((content, unsent))
     }
 
     /// Attach a shared permission-mode handle (created at launch and shared
@@ -426,8 +549,15 @@ impl AgentRuntime {
     /// [`RuntimeEvent`]s until either the turn finishes or an approval is
     /// required. After approval, call [`Self::submit_approval`] to resume.
     pub async fn submit_user(&self, prompt: impl Into<UserTurn>) -> RuntimeEventReceiver {
-        match self.begin_turn(prompt).await {
-            Ok(_) => self.drive_turn().await,
+        match self
+            .prepare_turn(prompt.into(), CancellationToken::new())
+            .await
+        {
+            Ok(turn) => {
+                let events = self.drive_turn_for(turn.id.clone()).await;
+                turn.claim();
+                events
+            }
             Err(error) => {
                 let (tx, rx) = mpsc::unbounded_channel();
                 emit(&tx, self.turn_start_error(None, error));
@@ -444,9 +574,20 @@ impl AgentRuntime {
         }
     }
 
-    /// Record a user prompt and start turn bookkeeping without spawning the loop.
+    /// Record a user prompt and snapshot its images without spawning the loop.
     pub async fn begin_turn(&self, prompt: impl Into<UserTurn>) -> AgentResult<TurnId> {
+        self.prepare_turn(prompt.into(), CancellationToken::new())
+            .await
+            .map(PreparedTurn::claim)
+    }
+
+    async fn prepare_turn(
+        &self,
+        prompt: UserTurn,
+        cancel: CancellationToken,
+    ) -> AgentResult<PreparedTurn<'_>> {
         self.config.resolved_model()?;
+        let start = self.turn_start.lock().await;
         // A previous turn may still be live (e.g. the HTTP client disconnected
         // mid-turn and a new prompt arrived): cancel its loop so it stops
         // streaming. The turn-id guard in `finish_turn` keeps that loop's late
@@ -466,23 +607,24 @@ impl AgentRuntime {
             }
         }
         self.finalize_orphan_turn().await;
-        let prompt = prompt.into();
-        let content = self.admit_user_content(&prompt).await;
+        let (content, unsent) = prompt.pending_content();
         let turn_id = TurnId::new();
         {
             let mut state = self.state.lock().await;
+            state
+                .session
+                .push_pending_user(turn_id.clone(), content, unsent);
             // Interrupted tool calls need no repair here: pending exchanges
             // synthesize their placeholder at wire derivation.
-            state.session.push_user(turn_id.clone(), content);
             state.pending = None;
             state.current_turn = Some(TurnRecord::new(turn_id.clone()));
-            state.current_prompt = Some(prompt);
+            state.current_prompt = Some(prompt.text.clone());
             state.current_turn_id = Some(turn_id.clone());
             // A fresh step budget for this turn, and only for it: the step cap
             // and the two one-shot nudges survive the approval parks inside a
             // turn (see `TurnBudget`), so only a new turn starts from zero.
             state.turn_budget = Some(TurnBudget::new(turn_id.clone()));
-            state.cancel = CancellationToken::new();
+            state.cancel = cancel.clone();
             state.turn_boundary_denials = 0;
             state.last_boundary_denial_path = None;
             state.turn_cost = Default::default();
@@ -494,21 +636,63 @@ impl AgentRuntime {
             // re-injecting a stale copy here would duplicate the user's words.
             state.steering.clear();
         }
+        // Install the cancellation owner before the first await after registration.
+        // Supersession itself stays inline so a queued approval observes it immediately.
+        let turn = PreparedTurn {
+            id: turn_id,
+            runtime: self,
+            cancel_on_drop: Some(cancel.clone()),
+            executor: tokio::runtime::Handle::current(),
+        };
+        drop(start);
         self.persist().await;
-        Ok(turn_id)
+        self.prepare_pending_user(&turn.id, &prompt, &cancel).await;
+        Ok(turn)
+    }
+
+    async fn prepare_pending_user(
+        &self,
+        turn_id: &TurnId,
+        prompt: &UserTurn,
+        cancel: &CancellationToken,
+    ) {
+        if !prompt.has_images() {
+            return;
+        }
+        let Some((content, unsent)) = self.admit_user_content(prompt, cancel).await else {
+            return;
+        };
+        let updated = {
+            let mut state = self.state.lock().await;
+            state.current_turn_id.as_ref() == Some(turn_id)
+                && state.session.update_pending_user(turn_id, content, unsent)
+        };
+        if updated {
+            self.persist().await;
+        }
     }
 
     /// Low-level step driver used by the runtime's focused tests. Application
     /// adapters own the complete stream through `start_turn` / `TurnHandle`.
     pub async fn drive_turn(&self) -> RuntimeEventReceiver {
-        let (turn_id, prompt) = self.current_turn_context().await;
+        match self.live_turn_id().await {
+            Some(turn_id) => self.drive_turn_for(turn_id).await,
+            None => mpsc::unbounded_channel().1,
+        }
+    }
+
+    async fn drive_turn_for(&self, turn_id: TurnId) -> RuntimeEventReceiver {
         let (tx, rx) = self.event_channel(Some(&turn_id)).await;
-        let cancel = {
+        let (prompt, cancel) = {
             let state = self.state.lock().await;
             if state.current_turn_id.as_ref() != Some(&turn_id) {
+                emit(&tx, RuntimeEvent::TurnCancelled { turn_id });
                 return rx;
             }
-            state.cancel.clone()
+            (
+                state.current_prompt.clone().unwrap_or_default(),
+                state.cancel.clone(),
+            )
         };
         self.spawn_turn(turn_id, prompt, cancel, tx);
         rx
@@ -531,7 +715,27 @@ impl AgentRuntime {
                         prompt,
                     },
                 );
+                if cancel.is_cancelled() {
+                    runtime.finish_turn_cancelled(&turn_id, &tx).await;
+                    return;
+                }
+                let input_error = runtime
+                    .state
+                    .lock()
+                    .await
+                    .session
+                    .entries()
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.turn_id.as_ref() == Some(&turn_id))
+                    .and_then(|entry| entry.unsent.as_ref()?.error.clone());
                 runtime.emit_session_updated(&tx).await;
+                if let Some(message) = input_error {
+                    runtime
+                        .fail_turn(&turn_id, &tx, RuntimeFailureKind::Submission, message)
+                        .await;
+                    return;
+                }
                 runtime
                     .snapshot_turn(&turn_id, "before_turn", &cancel, &tx)
                     .await;
@@ -555,15 +759,29 @@ impl AgentRuntime {
     /// is expected to fall back to sending it as the next prompt — which is
     /// exactly what the TUI's own queue does.
     pub async fn steer(&self, text: impl Into<UserTurn>) -> bool {
-        let target = self.state.lock().await.current_turn_id.clone();
-        let Some(target) = target else { return false };
+        let (target, cancel) = {
+            let state = self.state.lock().await;
+            let Some(target) = state.current_turn_id.clone() else {
+                return false;
+            };
+            (target, state.cancel.clone())
+        };
         let prompt = text.into();
-        let content = self.admit_user_content(&prompt).await;
-        let mut state = self.state.lock().await;
-        if state.current_turn_id.as_ref() != Some(&target) {
+        let Some((content, unsent)) = self.admit_user_content(&prompt, &cancel).await else {
+            return false;
+        };
+        if unsent.error.is_some() {
             return false;
         }
-        state.steering.push_back(Steered::User { prompt, content });
+        let mut state = self.state.lock().await;
+        if state.current_turn_id.as_ref() != Some(&target) || cancel.is_cancelled() {
+            return false;
+        }
+        state.steering.push_back(Steered::User {
+            prompt,
+            content,
+            unsent,
+        });
         true
     }
 
@@ -721,7 +939,26 @@ impl AgentRuntime {
     /// Snapshot the current wire-derived message history. Mostly for
     /// tests/debugging.
     pub async fn session_messages(&self) -> Vec<Message> {
-        self.state.lock().await.session.wire_messages()
+        let state = self.state.lock().await;
+        state
+            .session
+            .wire_messages_for(state.current_turn_id.as_ref())
+    }
+
+    /// Unconfirmed messages from this session, newest first, for explicit editing.
+    pub async fn unsent_messages(&self) -> Vec<Arc<SessionEntry>> {
+        let state = self.state.lock().await;
+        state
+            .session
+            .entries()
+            .iter()
+            .rev()
+            .filter(|entry| {
+                entry.unsent.is_some()
+                    && (entry.turn_id.is_none() || entry.turn_id != state.current_turn_id)
+            })
+            .cloned()
+            .collect()
     }
 
     /// Nonblocking idle check for a controller committing a prepared switch.
@@ -759,17 +996,12 @@ impl AgentRuntime {
         }
     }
 
-    async fn current_turn_context(&self) -> (TurnId, String) {
-        let state = self.state.lock().await;
-        (
-            state.current_turn_id.clone().unwrap_or_else(TurnId::new),
-            state.current_prompt.clone().unwrap_or_default().text,
-        )
-    }
-
     async fn emit_session_updated(&self, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
         let state = self.state.lock().await;
-        let message_count = state.session.wire_messages().len();
+        let message_count = state
+            .session
+            .wire_messages_for(state.current_turn_id.as_ref())
+            .len();
         let current_turn_id = state.current_turn_id.clone();
         drop(state);
 

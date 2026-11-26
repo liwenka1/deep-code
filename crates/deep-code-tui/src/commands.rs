@@ -68,6 +68,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, TextId, bool)] = &[
     ("/lang", TextId::HintLang, true),
     ("/add-dir", TextId::HintAddDir, true),
     ("/image", TextId::HintImage, true),
+    ("/retry", TextId::HintRetry, true),
 ];
 
 impl App {

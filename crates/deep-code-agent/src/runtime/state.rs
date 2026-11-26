@@ -114,21 +114,19 @@ pub(super) enum Steered {
     User {
         prompt: crate::runtime::UserTurn,
         content: crate::content::Content,
+        unsent: crate::session_entry::UnsentMessage,
     },
     /// A runtime-originated instruction to the model: recorded as a System
     /// entry, announced as no user injection.
     Notice(String),
 }
 
-/// Internal: the runtime can be in one of these states between
-/// One turn's step budget: how many model requests it has made, and the two
-/// one-shot nudges that ride on the count.
+/// One turn's request count and its one-shot wrap-up notice.
 ///
 /// Here rather than as locals of `run_loop` because an approval park returns
 /// from the loop and `resume_after_batch` re-enters it fresh: a local counter
 /// began again from zero at every human answer, so the step cap was multiplied
-/// by the number of approvals in the turn, and "one forced-compaction rescue"
-/// and "one wrap-up notice" were each handed out again per resume. Keyed by
+/// by the number of approvals in the turn. Keyed by
 /// turn for the same reason `threshold_compaction_tried` is: a superseded
 /// loop can still be on its way out and must not spend the next turn's
 /// allowance.
@@ -136,7 +134,6 @@ pub(super) enum Steered {
 pub(super) struct TurnBudget {
     pub(super) turn: TurnId,
     pub(super) steps: u32,
-    pub(super) overflow_rescued: bool,
     pub(super) wrap_up_sent: bool,
 }
 
@@ -145,7 +142,6 @@ impl TurnBudget {
         Self {
             turn,
             steps: 0,
-            overflow_rescued: false,
             wrap_up_sent: false,
         }
     }
@@ -180,7 +176,7 @@ pub(super) struct RuntimeState {
     pub(super) session_cache_miss_tokens: u64,
     /// Cumulative spend avoided by cache hits this session (vs all-miss).
     pub(super) session_cache_savings: CostEstimate,
-    pub(super) current_prompt: Option<crate::runtime::UserTurn>,
+    pub(super) current_prompt: Option<String>,
     pub(super) current_turn_id: Option<TurnId>,
     pub(super) turn_events: Option<(
         TurnId,

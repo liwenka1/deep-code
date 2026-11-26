@@ -1,3 +1,4 @@
+use std::io::{self, BufWriter, Write};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -5,18 +6,21 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures_core::Stream;
 use futures_util::StreamExt;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use reqwest::{Body, Response, StatusCode, Url};
+use tempfile::NamedTempFile;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentConfig;
-use crate::error::{AgentError, AgentResult};
+use crate::error::{AgentError, AgentResult, redact_api_key};
 use crate::event::{AgentEvent, chunk_to_events};
-use crate::image::MAX_REQUEST_BYTES;
 use crate::model::{ChatRequest, StreamChunk};
 
 pub type AgentEventStream = Pin<Box<dyn Stream<Item = AgentResult<AgentEvent>> + Send>>;
 
 const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_POST_REDIRECTS: usize = 10;
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
@@ -31,6 +35,11 @@ pub trait LlmClient: Send + Sync {
 pub struct DeepSeekClient {
     http: reqwest::Client,
     config: AgentConfig,
+}
+
+enum ChatBody {
+    Inline(Vec<u8>),
+    Spooled(NamedTempFile, u64),
 }
 
 impl DeepSeekClient {
@@ -58,13 +67,94 @@ impl DeepSeekClient {
             .timeout
             .unwrap_or(ERROR_BODY_TIMEOUT)
             .min(ERROR_BODY_TIMEOUT);
-        let message = match tokio::time::timeout(timeout, read_error_body(response)).await {
-            Ok(Ok(message)) => message,
-            Ok(Err(error)) => format!("{status} (error body could not be read: {error})"),
-            Err(_) => format!("{status} (error body timed out)"),
-        };
+        let (message, truncated) =
+            match tokio::time::timeout(timeout, read_error_body(response)).await {
+                Ok(Ok(body)) => body,
+                Ok(Err(error)) => (
+                    format!("{status} (error body could not be read: {error})"),
+                    false,
+                ),
+                Err(_) => (format!("{status} (error body timed out)"), false),
+            };
+        let mut message = redact_api_key(self.config.api_key.as_deref(), message, truncated);
+        if truncated {
+            message.push_str("\n[error response truncated]");
+        }
         AgentError::Api { status, message }
     }
+
+    async fn post_chat(
+        &self,
+        url: impl reqwest::IntoUrl,
+        body: Body,
+        length: u64,
+    ) -> AgentResult<Response> {
+        Ok(self
+            .http
+            .post(url)
+            .bearer_auth(self.config.require_api_key()?)
+            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_LENGTH, length)
+            .body(body)
+            .send()
+            .await?)
+    }
+
+    async fn send_chat(&self, body: ChatBody) -> AgentResult<Response> {
+        let endpoint = self.config.chat_completions_url();
+        let (file, length) = match body {
+            ChatBody::Inline(bytes) => {
+                let length = bytes.len() as u64;
+                return self.post_chat(endpoint, Body::from(bytes), length).await;
+            }
+            ChatBody::Spooled(file, length) => (file, length),
+        };
+
+        let mut url = self.http.post(endpoint).build()?.url().clone();
+        url.set_fragment(None);
+        let mut followed = 0;
+        loop {
+            // A fresh reader has an independent cursor even when the server
+            // returns a redirect before receiving the entire first upload.
+            let reader = file.reopen().map_err(image_request_error)?;
+            let response = self
+                .post_chat(
+                    url.clone(),
+                    Body::from(tokio::fs::File::from_std(reader)),
+                    length,
+                )
+                .await?;
+            let Some(next) = image_post_redirect(&response, &url) else {
+                return Ok(response);
+            };
+            if followed == MAX_POST_REDIRECTS {
+                return Err(AgentError::Api {
+                    status: response.status(),
+                    message: "too many image upload redirects".into(),
+                });
+            }
+            followed += 1;
+            url = next;
+        }
+    }
+}
+
+fn image_post_redirect(response: &Response, posted_to: &Url) -> Option<Url> {
+    // Reqwest follows method-changing redirects itself. Replay only a POST
+    // still at the URL we sent, and keep the image and authorization on origin.
+    if response.url() != posted_to
+        || !matches!(
+            response.status(),
+            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+        )
+    {
+        return None;
+    }
+    let location = std::str::from_utf8(response.headers().get(LOCATION)?.as_bytes()).ok()?;
+    let mut next = posted_to.join(location).ok()?;
+    next.set_fragment(None);
+    (next.origin() == posted_to.origin() && next.username().is_empty() && next.password().is_none())
+        .then_some(next)
 }
 
 #[async_trait]
@@ -83,25 +173,24 @@ impl LlmClient for DeepSeekClient {
         }
         request.stream = true;
 
-        let body = serde_json::to_vec(&request)?;
-        let body_bytes = body.len() as u64;
-        if body_bytes > MAX_REQUEST_BYTES {
-            return Err(AgentError::RequestTooLarge {
-                limit_bytes: MAX_REQUEST_BYTES,
-                actual_bytes: body_bytes,
-            });
-        }
+        let body = if request
+            .messages
+            .iter()
+            .any(|message| message.content.has_images())
+        {
+            let cancel = CancellationToken::new();
+            let _cancel_on_drop = cancel.clone().drop_guard();
+            let (file, length) =
+                tokio::task::spawn_blocking(move || spool_image_request(&request, &cancel))
+                    .await
+                    .map_err(image_request_error)?
+                    .map_err(image_request_error)?;
+            ChatBody::Spooled(file, length)
+        } else {
+            ChatBody::Inline(serde_json::to_vec(&request)?)
+        };
 
-        let send = self
-            .http
-            .post(self.config.chat_completions_url())
-            .header(
-                AUTHORIZATION,
-                format!("Bearer {}", self.config.require_api_key()?),
-            )
-            .header(CONTENT_TYPE, "application/json")
-            .body(body)
-            .send();
+        let send = self.send_chat(body);
 
         // `send()` resolves once response headers arrive, before the body, so
         // this bounds connect + request + headers without constraining how
@@ -128,10 +217,12 @@ impl LlmClient for DeepSeekClient {
             futures_util::pin_mut!(byte_stream);
 
             while let Some(bytes) = byte_stream.next().await {
-                let bytes = bytes?;
-                for event in decoder.push(&bytes)? {
+                let mut events = Vec::new();
+                let result = decoder.push(&bytes?, &mut events);
+                for event in events {
                     yield event;
                 }
+                result?;
             }
 
             for event in decoder.finish()? {
@@ -139,11 +230,69 @@ impl LlmClient for DeepSeekClient {
             }
         };
 
-        Ok(Box::pin(stream))
+        let api_key = self.config.api_key.clone();
+        Ok(Box::pin(stream.map(move |event| match event {
+            Ok(AgentEvent::Error { message }) => Ok(AgentEvent::Error {
+                message: redact_api_key(api_key.as_deref(), message, false),
+            }),
+            other => other,
+        })))
     }
 }
 
-async fn read_error_body(response: reqwest::Response) -> Result<String, reqwest::Error> {
+fn image_request_error(error: impl std::fmt::Display) -> AgentError {
+    AgentError::Attachment(format!(
+        "图片请求准备失败 / could not prepare the image request: {error}"
+    ))
+}
+
+/// Store the encoded request in a private temporary file so every image is
+/// verified before upload. Reqwest reads from that file with backpressure.
+fn spool_image_request(
+    request: &ChatRequest,
+    cancel: &CancellationToken,
+) -> io::Result<(NamedTempFile, u64)> {
+    check_spool_cancelled(cancel)?;
+    let mut writer = SpoolWriter {
+        file: BufWriter::new(NamedTempFile::new()?),
+        cancel,
+    };
+    serde_json::to_writer(&mut writer, request)?;
+    writer.flush()?;
+    let file = writer
+        .file
+        .into_inner()
+        .map_err(|error| error.into_error())?;
+    let length = file.as_file().metadata()?.len();
+    Ok((file, length))
+}
+
+struct SpoolWriter<'a, W> {
+    file: W,
+    cancel: &'a CancellationToken,
+}
+
+impl<W: Write> Write for SpoolWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        check_spool_cancelled(self.cancel)?;
+        self.file.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        check_spool_cancelled(self.cancel)?;
+        self.file.flush()
+    }
+}
+
+fn check_spool_cancelled(cancel: &CancellationToken) -> io::Result<()> {
+    if cancel.is_cancelled() {
+        // Write::write_all retries ErrorKind::Interrupted.
+        return Err(io::Error::other("image request was cancelled"));
+    }
+    Ok(())
+}
+
+async fn read_error_body(response: reqwest::Response) -> Result<(String, bool), reqwest::Error> {
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -152,13 +301,10 @@ async fn read_error_body(response: reqwest::Response) -> Result<String, reqwest:
         bytes.extend_from_slice(&chunk[..take]);
         if bytes.len() > MAX_ERROR_BODY_BYTES {
             bytes.truncate(MAX_ERROR_BODY_BYTES);
-            return Ok(format!(
-                "{}\n[error response truncated]",
-                String::from_utf8_lossy(&bytes)
-            ));
+            return Ok((String::from_utf8_lossy(&bytes).into_owned(), true));
         }
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), false))
 }
 
 /// Incremental SSE decoder.
@@ -216,8 +362,8 @@ impl SseDecoder {
         self.buffer.len() as u64 + self.data.len() as u64
     }
 
-    fn check_limit(&self) -> AgentResult<()> {
-        if self.buffered() > self.limit_bytes {
+    fn check_limit(&self, additional: usize) -> AgentResult<()> {
+        if self.buffered().saturating_add(additional as u64) > self.limit_bytes {
             return Err(AgentError::StreamOverflow {
                 limit_bytes: self.limit_bytes,
             });
@@ -225,22 +371,23 @@ impl SseDecoder {
         Ok(())
     }
 
-    /// Feed one network chunk; returns the events it completed.
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> AgentResult<Vec<AgentEvent>> {
-        self.buffer.extend_from_slice(bytes);
-        // Before draining lines, not after: a chunk that carries no newline at
-        // all leaves the loop below with nothing to do, which is precisely the
-        // shape that grows without bound.
-        self.check_limit()?;
-        let mut events = Vec::new();
-        while let Some(newline) = self.buffer.iter().position(|&byte| byte == b'\n') {
-            let line_bytes: Vec<u8> = self.buffer.drain(..=newline).collect();
-            let line = std::str::from_utf8(&line_bytes[..line_bytes.len() - 1])
-                .map_err(|error| AgentError::Parse(error.to_string()))?
-                .trim_end_matches('\r');
-            self.handle_line(line, &mut events)?;
+    /// Feed one network chunk, retaining completed events before a later error.
+    fn push(&mut self, bytes: &[u8], events: &mut Vec<AgentEvent>) -> AgentResult<()> {
+        for fragment in bytes.split_inclusive(|&byte| byte == b'\n') {
+            self.check_limit(fragment.len())?;
+            let Some(line) = fragment.strip_suffix(b"\n") else {
+                self.buffer.extend_from_slice(fragment);
+                break;
+            };
+            if self.buffer.is_empty() {
+                self.handle_line(line, events)?;
+            } else {
+                let mut line_bytes = std::mem::take(&mut self.buffer);
+                line_bytes.extend_from_slice(line);
+                self.handle_line(&line_bytes, events)?;
+            }
         }
-        Ok(events)
+        Ok(())
     }
 
     /// Flush a trailing event that was never terminated by a blank line.
@@ -248,16 +395,16 @@ impl SseDecoder {
         let mut events = Vec::new();
         if !self.buffer.is_empty() {
             let tail = std::mem::take(&mut self.buffer);
-            let line = std::str::from_utf8(&tail)
-                .map_err(|error| AgentError::Parse(error.to_string()))?
-                .trim_end_matches('\r');
-            self.handle_line(line, &mut events)?;
+            self.handle_line(&tail, &mut events)?;
         }
         self.dispatch(&mut events)?;
         Ok(events)
     }
 
-    fn handle_line(&mut self, line: &str, events: &mut Vec<AgentEvent>) -> AgentResult<()> {
+    fn handle_line(&mut self, line: &[u8], events: &mut Vec<AgentEvent>) -> AgentResult<()> {
+        let line = std::str::from_utf8(line)
+            .map_err(|error| AgentError::Parse(error.to_string()))?
+            .trim_end_matches('\r');
         if line.is_empty() {
             return self.dispatch(events);
         }
@@ -270,10 +417,6 @@ impl SseDecoder {
                 self.data.push('\n');
             }
             self.data.push_str(value);
-            // A stream of `data:` lines with no blank line between them
-            // accumulates here instead of in `buffer`; same unbounded growth,
-            // reached through the other half.
-            return self.check_limit();
         }
         Ok(())
     }
@@ -294,8 +437,16 @@ pub(crate) fn parse_sse_data(data: &str) -> AgentResult<Vec<AgentEvent>> {
         return Ok(Vec::new());
     }
 
-    let chunk: StreamChunk = serde_json::from_str(data)?;
-    Ok(chunk_to_events(chunk))
+    #[derive(serde::Deserialize)]
+    struct ErrorFrame {
+        error: Option<serde::de::IgnoredAny>,
+    }
+    if serde_json::from_str::<ErrorFrame>(data).is_ok_and(|frame| frame.error.is_some()) {
+        return Ok(vec![AgentEvent::Error {
+            message: data.to_owned(),
+        }]);
+    }
+    Ok(chunk_to_events(serde_json::from_str::<StreamChunk>(data)?))
 }
 
 #[cfg(test)]
@@ -306,12 +457,61 @@ mod http_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn cancelling_during_serialization_stops_writes_and_drops_the_temporary_file() {
+        struct CancelOnWrite<'a>(NamedTempFile, &'a CancellationToken, usize);
+        impl Write for CancelOnWrite<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.2 += 1;
+                self.1.cancel();
+                self.0.write(bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.flush()
+            }
+        }
+        let cancel = CancellationToken::new();
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let mut writer = SpoolWriter {
+            file: CancelOnWrite(file, &cancel, 0),
+            cancel: &cancel,
+        };
+        let error = serde_json::to_writer(&mut writer, &ChatRequest::streaming("test", vec![]))
+            .unwrap_err();
+        assert!(error.to_string().contains("image request was cancelled"));
+        assert_eq!(writer.file.2, 1);
+        drop(writer);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn sse_error_preserves_the_provider_payload() {
+        for body in [
+            r#"{"error":{"message":"input rejected","code":"invalid_request"}}"#,
+            r#"{"choices":[{"finish_reason":"error"}],"error":{"message":"input rejected"}}"#,
+        ] {
+            assert_eq!(
+                parse_sse_data(body).unwrap(),
+                [AgentEvent::Error {
+                    message: body.into()
+                }]
+            );
+        }
+    }
+
     const CHUNK: &str = r#"{"id":"1","model":"deepseek-v4-pro","choices":[{"index":0,"message":null,"delta":{"role":null,"content":"hi"},"finish_reason":null}],"usage":null}"#;
 
     fn text_delta(text: &str) -> AgentEvent {
         AgentEvent::TextDelta {
             text: text.to_string(),
         }
+    }
+
+    fn decode_chunk(decoder: &mut SseDecoder, bytes: &[u8]) -> AgentResult<Vec<AgentEvent>> {
+        let mut events = Vec::new();
+        decoder.push(bytes, &mut events)?;
+        Ok(events)
     }
 
     #[test]
@@ -329,9 +529,27 @@ mod tests {
         let mut decoder = SseDecoder::new();
         let frame = format!("data: {CHUNK}\n\n");
         assert_eq!(
-            decoder.push(frame.as_bytes()).unwrap(),
+            decode_chunk(&mut decoder, frame.as_bytes()).unwrap(),
             vec![text_delta("hi")]
         );
+    }
+
+    #[test]
+    fn decoder_keeps_completed_events_before_a_bad_frame_in_the_same_chunk() {
+        let first = format!("data: {CHUNK}\n\n");
+        let mut decoder = SseDecoder::with_limit(first.len() as u64);
+        let mut events = Vec::new();
+        let malformed = format!("{first}data: {{\n\n");
+        let error = decoder.push(malformed.as_bytes(), &mut events).unwrap_err();
+        assert!(matches!(error, AgentError::Serde(_)));
+        assert_eq!(events, vec![text_delta("hi")]);
+
+        let mut decoder = SseDecoder::with_limit(first.len() as u64);
+        events.clear();
+        let oversized = format!("{first}{}", "x".repeat(first.len() + 1));
+        let error = decoder.push(oversized.as_bytes(), &mut events).unwrap_err();
+        assert!(matches!(error, AgentError::StreamOverflow { .. }));
+        assert_eq!(events, vec![text_delta("hi")]);
     }
 
     #[test]
@@ -343,9 +561,12 @@ mod tests {
         let split = frame.find('你').unwrap() + 1;
 
         let mut decoder = SseDecoder::new();
-        assert_eq!(decoder.push(&bytes[..split]).unwrap(), Vec::new());
         assert_eq!(
-            decoder.push(&bytes[split..]).unwrap(),
+            decode_chunk(&mut decoder, &bytes[..split]).unwrap(),
+            Vec::new()
+        );
+        assert_eq!(
+            decode_chunk(&mut decoder, &bytes[split..]).unwrap(),
             vec![text_delta("你好")]
         );
     }
@@ -355,7 +576,7 @@ mod tests {
         let mut decoder = SseDecoder::new();
         let frame = format!("data: {CHUNK}\r\n\r\n");
         assert_eq!(
-            decoder.push(frame.as_bytes()).unwrap(),
+            decode_chunk(&mut decoder, frame.as_bytes()).unwrap(),
             vec![text_delta("hi")]
         );
     }
@@ -368,7 +589,7 @@ mod tests {
         let frame = format!("data: {head}\ndata: {tail}\n\n");
         let mut decoder = SseDecoder::new();
         assert_eq!(
-            decoder.push(frame.as_bytes()).unwrap(),
+            decode_chunk(&mut decoder, frame.as_bytes()).unwrap(),
             vec![text_delta("hi")]
         );
     }
@@ -377,7 +598,7 @@ mod tests {
     fn decoder_ignores_comment_and_done_frames() {
         let mut decoder = SseDecoder::new();
         assert_eq!(
-            decoder.push(b": keep-alive\n\ndata: [DONE]\n\n").unwrap(),
+            decode_chunk(&mut decoder, b": keep-alive\n\ndata: [DONE]\n\n").unwrap(),
             Vec::new()
         );
     }
@@ -386,7 +607,10 @@ mod tests {
     fn decoder_finish_flushes_unterminated_trailing_event() {
         let mut decoder = SseDecoder::new();
         let frame = format!("data: {CHUNK}");
-        assert_eq!(decoder.push(frame.as_bytes()).unwrap(), Vec::new());
+        assert_eq!(
+            decode_chunk(&mut decoder, frame.as_bytes()).unwrap(),
+            Vec::new()
+        );
         assert_eq!(decoder.finish().unwrap(), vec![text_delta("hi")]);
     }
 
@@ -444,9 +668,9 @@ mod tests {
     fn an_endless_line_is_refused_instead_of_buffered() {
         let mut decoder = SseDecoder::with_limit(1_024);
         let chunk = vec![b'x'; 512];
-        assert!(decoder.push(&chunk).unwrap().is_empty());
-        assert!(decoder.push(&chunk).unwrap().is_empty());
-        let error = decoder.push(&chunk).unwrap_err();
+        assert!(decode_chunk(&mut decoder, &chunk).unwrap().is_empty());
+        assert!(decode_chunk(&mut decoder, &chunk).unwrap().is_empty());
+        let error = decode_chunk(&mut decoder, &chunk).unwrap_err();
         assert!(
             matches!(error, AgentError::StreamOverflow { limit_bytes } if limit_bytes == 1_024),
             "got {error:?}"
@@ -461,7 +685,7 @@ mod tests {
         let line = format!("data: {}\n", "y".repeat(256));
         let mut last = Ok(Vec::new());
         for _ in 0..20 {
-            last = decoder.push(line.as_bytes());
+            last = decode_chunk(&mut decoder, line.as_bytes());
             if last.is_err() {
                 break;
             }
@@ -481,8 +705,7 @@ mod tests {
         // charging against the ceiling, the second push would already fail.
         let mut decoder = SseDecoder::with_limit(frame.len() as u64 + 8);
         for _ in 0..50 {
-            let events = decoder
-                .push(frame.as_bytes())
+            let events = decode_chunk(&mut decoder, frame.as_bytes())
                 .expect("a dispatched frame must not accumulate");
             assert_eq!(events, vec![text_delta("hi")]);
         }

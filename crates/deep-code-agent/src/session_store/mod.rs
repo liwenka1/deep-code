@@ -37,6 +37,10 @@ pub(crate) const MAX_SESSION_BODY_BYTES: u64 = 128 * 1024 * 1024;
 pub(crate) const MAX_SESSION_ENTRIES: usize = 4096;
 /// Image-report history has its own ceiling, independent of model context.
 pub(crate) const IMAGE_REPORT_BUDGET_BYTES: usize = 512 * 1024;
+const TURN_ERROR_BUDGET_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_SAVED_ERROR_BYTES: usize = 64 * 1024;
+pub(crate) const DRAFT_STORAGE_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_RETAINED_DRAFTS: usize = 32;
 /// Maximum number of records retained by the picker/list API.
 pub(crate) const MAX_SESSION_LIST: usize = 32;
 
@@ -69,6 +73,9 @@ pub struct TurnRecord {
     pub image_requests: Vec<ImageRequestRecord>,
     /// Cumulative observation reports removed by the retention budget.
     pub image_reports_omitted: u64,
+    /// Error after the conversation had already begun processing this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +121,7 @@ impl TurnRecord {
             started_at_ms: now_ms(),
             image_requests: Vec::new(),
             image_reports_omitted: 0,
+            error: None,
         }
     }
 
@@ -165,6 +173,29 @@ fn report_storage_cost(value: &impl Serialize) -> usize {
     let mut counter = Counter::default();
     serde_json::to_writer_pretty(&mut counter, value).expect("image report data serializes");
     counter.0
+}
+
+/// Charge serialized JSON to a budget without allocating a second copy.
+pub(crate) fn charge_json(value: &impl Serialize, remaining: &mut u64) -> bool {
+    struct Budget(u64);
+    impl std::io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len() as u64)
+                .ok_or_else(|| std::io::Error::other("session storage budget reached"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut budget = Budget(*remaining);
+    if serde_json::to_writer_pretty(&mut budget, value).is_err() {
+        return false;
+    }
+    *remaining = budget.0;
+    true
 }
 
 impl Default for TurnRecord {
@@ -255,6 +286,25 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
+    pub(crate) fn limit_turn_errors(&mut self) {
+        let mut remaining = TURN_ERROR_BUDGET_BYTES;
+        for turn in self.turns.iter_mut().rev() {
+            let Some(error) = &mut turn.error else {
+                continue;
+            };
+            if error.len() > MAX_SAVED_ERROR_BYTES {
+                *error = saved_diagnostic(error).into_owned();
+            }
+            // Include the enclosing field and its pretty-printed indentation.
+            let mut available = remaining.saturating_sub(32);
+            if charge_json(error, &mut available) {
+                remaining = available;
+            } else {
+                turn.error = None;
+            }
+        }
+    }
+
     pub(crate) fn limit_image_reports(&mut self) {
         let mut remaining = IMAGE_REPORT_BUDGET_BYTES;
         for turn in self.turns.iter_mut().rev() {
@@ -268,22 +318,10 @@ impl SessionRecord {
         if self.entries.len() >= MAX_SESSION_ENTRIES * 3 / 4 {
             return true;
         }
-        struct Budget(u64);
-        impl std::io::Write for Budget {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0 = self.0.checked_sub(bytes.len() as u64).ok_or_else(|| {
-                    std::io::Error::other("session compaction size threshold reached")
-                })?;
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
         // Count the actual on-disk representation, including metadata, without
         // allocating a second copy of the transcript. An unserializable record
         // also needs attention rather than being treated as safely small.
-        serde_json::to_writer_pretty(Budget(MAX_SESSION_FILE_BYTES * 3 / 4), self).is_err()
+        !charge_json(self, &mut (MAX_SESSION_FILE_BYTES * 3 / 4))
     }
 
     #[must_use]
@@ -371,6 +409,15 @@ impl SessionRecord {
     }
 }
 
+pub(crate) fn saved_diagnostic(message: &str) -> std::borrow::Cow<'_, str> {
+    const SUFFIX: &str = "\n[diagnostic shortened for session storage]";
+    if message.len() <= MAX_SAVED_ERROR_BYTES {
+        return std::borrow::Cow::Borrowed(message);
+    }
+    let end = message.floor_char_boundary(MAX_SAVED_ERROR_BYTES - SUFFIX.len());
+    std::borrow::Cow::Owned(format!("{}{SUFFIX}", &message[..end]))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionStoreError {
     #[error("session scan cancelled")]
@@ -426,6 +473,7 @@ pub(crate) fn prepare_record(
     record: &mut SessionRecord,
 ) -> Result<PreparedSession, SessionStoreError> {
     record.limit_image_reports();
+    record.limit_turn_errors();
     crate::session_integrity::ensure_key().map_err(|reason| SessionStoreError::KeyUnavailable {
         detail: reason.to_string(),
     })?;
@@ -529,6 +577,38 @@ pub fn format_sessions_storage_note(workspace: &Path, program: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_errors_keep_a_utf8_prefix_and_respect_the_serialized_session_budget() {
+        let mut record = SessionRecord::new(PathBuf::from("/workspace"), "system");
+        for index in 0..40 {
+            record.turns.push(TurnRecord {
+                error: Some(format!(
+                    "failure {index}: {}",
+                    "界\u{1}\"".repeat(MAX_SAVED_ERROR_BYTES / 2)
+                )),
+                ..TurnRecord::default()
+            });
+        }
+        record.limit_turn_errors();
+        assert!(record.turns.first().unwrap().error.is_none());
+        let newest = record.turns.last().unwrap().error.as_deref().unwrap();
+        assert!(newest.starts_with("failure 39: "));
+        assert!(newest.ends_with("[diagnostic shortened for session storage]"));
+        assert!(newest.len() <= MAX_SAVED_ERROR_BYTES);
+        assert!(
+            record
+                .turns
+                .iter()
+                .filter_map(|turn| turn.error.as_ref())
+                .map(|error| serde_json::to_vec(error).unwrap().len() as u64 + 32)
+                .sum::<u64>()
+                <= TURN_ERROR_BUDGET_BYTES
+        );
+        let once = record.clone();
+        record.limit_turn_errors();
+        assert_eq!(record, once);
+    }
 
     #[test]
     fn image_report_retention_budgets_serialized_bytes_and_is_idempotent() {

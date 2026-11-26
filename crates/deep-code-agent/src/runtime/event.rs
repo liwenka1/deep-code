@@ -56,6 +56,7 @@ impl From<&str> for ToolCallId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeFailureKind {
+    Submission,
     Execution,
     StepLimit,
 }

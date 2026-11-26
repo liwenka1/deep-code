@@ -2,12 +2,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::client::LlmClient;
 use crate::config::AgentConfig;
 use crate::runtime::AgentRuntime;
-use crate::runtime::event::TurnId;
+use crate::runtime::event::{RuntimeEvent, RuntimeFailureKind, TurnId, emit};
 use crate::runtime::persistence_actor::PersistenceActorHandle;
 use crate::runtime::state::{Persistence, RuntimeState};
 use crate::session::Session;
@@ -36,6 +36,11 @@ pub(crate) struct LiveSessionState {
     session_trusted_shell_prefixes: std::collections::HashSet<(String, bool)>,
     last_prefix: Option<(usize, u64)>,
     image_projections: super::state::ImageProjectionIndex,
+}
+
+struct ClosedTurn {
+    rejected: bool,
+    draft_retained: bool,
 }
 
 impl AgentRuntime {
@@ -96,12 +101,18 @@ impl AgentRuntime {
     pub(crate) fn from_record<C: LlmClient + 'static>(
         client: C,
         tools: ToolRegistry,
-        record: SessionRecord,
+        mut record: SessionRecord,
         store: Option<JsonSessionStore>,
         config: AgentConfig,
     ) -> Self {
         let workspace = record.workspace.clone();
-        let session = Session::from_entries(record.entries.clone());
+        record.limit_turn_errors();
+        let mut session = Session::from_entries(record.entries.clone());
+        let removed = session.limit_retained_drafts();
+        if session.entries().len() != record.entries.len() {
+            record.entries = session.entries().to_vec();
+            record.turns.retain(|turn| !removed.contains(&turn.id));
+        }
         let ui_lang = crate::i18n::SharedLang::new(crate::i18n::Lang::from_env(&config.language));
         Self {
             client: Arc::new(client),
@@ -121,6 +132,7 @@ impl AgentRuntime {
                 session_cache_savings: record.session_cache_savings,
                 ..Default::default()
             })),
+            turn_start: Arc::new(Mutex::new(())),
             checkpoints: None,
             workspace: Some(workspace.clone()),
             boundary: None,
@@ -293,32 +305,92 @@ impl AgentRuntime {
     /// cancelled by a newer `begin_turn`) finalizing late must not consume the
     /// new turn's state, so a mismatched id is a no-op.
     pub(super) async fn finish_turn(&self, turn_id: &TurnId) {
+        self.close_turn(turn_id, None).await;
+    }
+
+    async fn close_turn(&self, turn_id: &TurnId, error: Option<&str>) -> Option<ClosedTurn> {
+        let error = error.map(crate::session_store::saved_diagnostic);
         let mut state = self.state.lock().await;
         if state.current_turn_id.as_ref() != Some(turn_id) {
-            return;
+            return None;
         }
-        if let Some(turn) = state.current_turn.take() {
-            state.current_prompt = None;
-            state.current_turn_id = None;
-            state.turn_events = None;
-            drop(state);
-            if let Some(persistence) = self.persistence.as_ref() {
-                let mut record = persistence.record.lock().await;
+        let rejected =
+            error.is_some() && state.session.settle_submissions(turn_id, error.as_deref());
+        let removed = state.session.limit_retained_drafts();
+        let draft_retained = rejected
+            && state
+                .session
+                .entries()
+                .iter()
+                .any(|entry| entry.turn_id.as_ref() == Some(turn_id) && entry.unsent.is_some());
+        let turn = state.current_turn.take();
+        state.current_prompt = None;
+        state.current_turn_id = None;
+        state.turn_events = None;
+        state.pending = None;
+        drop(state);
+        if let (Some(mut turn), Some(persistence)) = (turn, &self.persistence) {
+            if !rejected {
+                turn.error = error.map(std::borrow::Cow::into_owned);
+            }
+            let mut record = persistence.record.lock().await;
+            if !removed.is_empty() {
+                record.turns.retain(|entry| !removed.contains(&entry.id));
+            }
+            if !removed.contains(&turn.id) {
                 if let Some(existing) = record.turns.iter_mut().find(|entry| entry.id == turn.id) {
                     *existing = turn;
                 } else {
                     record.turns.push(turn);
                 }
-                record.touch();
             }
-        } else {
-            drop(state);
+            record.limit_turn_errors();
+            record.touch();
         }
         self.persist().await;
+        Some(ClosedTurn {
+            rejected,
+            draft_retained,
+        })
     }
 
-    pub(super) async fn abort_turn(&self, turn_id: &TurnId) {
-        self.finish_turn(turn_id).await;
+    pub(super) async fn fail_turn(
+        &self,
+        turn_id: &TurnId,
+        tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        kind: RuntimeFailureKind,
+        message: String,
+    ) {
+        let mut message =
+            crate::error::redact_api_key(self.config.api_key.as_deref(), message, false);
+        let Some(closed) = self.close_turn(turn_id, Some(&message)).await else {
+            return;
+        };
+        if let Some(persistence) = &self.persistence {
+            persistence.actor.flush().await;
+        }
+        self.emit_session_updated(tx).await;
+        let kind = match (closed.rejected, closed.draft_retained, kind) {
+            (true, true, RuntimeFailureKind::Execution) => RuntimeFailureKind::Submission,
+            (true, false, kind) => {
+                message.push('\n');
+                message.push_str(crate::tr(self.ui_lang(), crate::TextId::RetryDraftTooLarge));
+                if kind == RuntimeFailureKind::Submission {
+                    RuntimeFailureKind::Execution
+                } else {
+                    kind
+                }
+            }
+            (_, _, kind) => kind,
+        };
+        emit(
+            tx,
+            RuntimeEvent::Error {
+                kind,
+                turn_id: Some(turn_id.clone()),
+                message,
+            },
+        );
     }
 
     pub(super) async fn finalize_orphan_turn(&self) {

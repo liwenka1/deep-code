@@ -180,9 +180,10 @@ async fn superseded_partial_reply_stays_with_its_request_and_is_saved() {
     persistence.actor.flush().await;
     let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let saved = store.load(&runtime.session_id().await.unwrap()).unwrap();
+    assert!(saved.entries.last().unwrap().unsent.is_some());
     assert_eq!(
         crate::session::Session::from_entries(saved.entries).wire_messages(),
-        messages
+        messages[..messages.len() - 1]
     );
     let mut rx = runtime.drive_turn().await;
     assert!(matches!(
@@ -238,8 +239,17 @@ async fn superseded_error_or_completed_reply_stays_with_its_request() {
         assert_eq!(
             events
                 .iter()
-                .any(|e| matches!(e, RuntimeEvent::Error { .. })),
-            !completed
+                .filter(|event| matches!(
+                    event,
+                    RuntimeEvent::TurnCancelled { .. } | RuntimeEvent::Error { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::TurnCancelled { .. }))
         );
         assert!(!events.iter().any(|e| matches!(
             e,
@@ -3074,6 +3084,247 @@ async fn stream_error_finalizes_open_turn() {
     let store = crate::session_store::JsonSessionStore::for_workspace(workspace.path()).unwrap();
     let record = store.load(&session_id).unwrap();
     assert_eq!(record.turns.len(), 1);
+    let draft = record.entries.last().unwrap().unsent.as_ref().unwrap();
+    assert_eq!(draft.error.as_deref(), Some("boom"));
+    assert_eq!(
+        Session::from_entries(record.entries).wire_messages().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_later_request_error_preserves_the_completed_tool_exchange() {
+    let client = ScriptedClient::new(vec![
+        vec![
+            AgentEvent::ToolCallDelta {
+                delta: tool_call_delta("call_1", MockEchoTool::NAME, r#"{"message":"executed"}"#),
+            },
+            AgentEvent::Done { usage: None },
+        ],
+        vec![AgentEvent::Error {
+            message: "provider interrupted".into(),
+        }],
+    ]);
+    let runtime = AgentRuntime::new(client, ToolRegistry::with_mock_tools());
+    let mut rx = runtime.submit_user("run the tool").await;
+    drain(&mut rx).await;
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
+    let events = drain(&mut rx).await;
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::Error {
+            kind: RuntimeFailureKind::Execution,
+            ..
+        })
+    ));
+    assert!(runtime.unsent_messages().await.is_empty());
+    let messages = runtime.session_messages().await;
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.role == crate::Role::User)
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.role == crate::Role::Tool
+                && message.content.text().contains("executed"))
+    );
+}
+
+#[tokio::test]
+async fn missing_confirmed_image_during_approval_does_not_block_the_tool_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().canonicalize().unwrap();
+    let path = workspace.join("image.gif");
+    std::fs::write(&path, b"GIF89a-content").unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let client = CapturingClient {
+        scripts: Mutex::new(vec![
+            vec![
+                AgentEvent::ToolCallDelta {
+                    delta: tool_call_delta(
+                        "call_1",
+                        MockEchoTool::NAME,
+                        r#"{"message":"completed"}"#,
+                    ),
+                },
+                AgentEvent::Done { usage: None },
+            ],
+            ok_turn(),
+        ]),
+        requests: Arc::clone(&requests),
+    };
+    let config = AgentConfig {
+        model: DEEPSEEK_FLASH.into(),
+        ..AgentConfig::builtin()
+    };
+    let runtime = AgentRuntime::with_config(client, ToolRegistry::with_mock_tools(), config)
+        .with_image_workspace(workspace);
+    let mut rx = runtime
+        .submit_user(UserTurn::with_images("look and run the tool", vec![path]))
+        .await;
+    let events = drain(&mut rx).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ApprovalRequired { .. }))
+    );
+
+    let image = runtime
+        .session_messages()
+        .await
+        .iter()
+        .find_map(|message| {
+            message
+                .content
+                .images()
+                .find_map(|image| image.asset().cloned())
+        })
+        .unwrap();
+    std::fs::remove_file(image.path()).unwrap();
+    let mut rx = submit_pending_approval(&runtime, ApprovalDecision::Approved).await;
+    let events = drain(&mut rx).await;
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+    assert!(events.iter().any(
+        |event| matches!(event, RuntimeEvent::ImageRequestPrepared { images, .. }
+        if images.iter().any(|image| !image.included))
+    ));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0]["messages"][0]["content"][1]["image_url"]["url"].is_string());
+    let messages = requests[1]["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|message| {
+        message["role"] == "tool"
+            && message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("completed"))
+    }));
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("image unavailable")
+    );
+}
+
+#[tokio::test]
+async fn persisted_errors_redact_provider_echoes_before_and_after_confirmation() {
+    const KEY: &str = "sk-test-echoed-credential";
+    for confirmed in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            api_key: Some(format!(" \t{KEY}\r\n")),
+            ..AgentConfig::builtin()
+        };
+        let mut script = Vec::new();
+        if confirmed {
+            script.push(AgentEvent::TextDelta {
+                text: "partial answer".into(),
+            });
+        }
+        let reported = if confirmed {
+            r#"{"error":"provider error for \u0073k-test-echoed-cred\u0065ntial"}"#.to_owned()
+        } else {
+            format!("provider error for {KEY}")
+        };
+        let expected = if confirmed {
+            r#"{"error":"provider error for [redacted]"}"#
+        } else {
+            "provider error for [redacted]"
+        };
+        script.push(AgentEvent::Error { message: reported });
+        let runtime = AgentRuntime::with_new_session(
+            ScriptedClient::new(vec![script]),
+            ToolRegistry::default(),
+            "system",
+            crate::canonicalize(workspace.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
+        let mut rx = runtime.submit_user("question").await;
+        let events = drain(&mut rx).await;
+        assert!(
+            matches!(events.last(), Some(RuntimeEvent::Error { message, .. })
+            if message == expected)
+        );
+        let store = crate::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+        let record = store.load(&runtime.session_id().await.unwrap()).unwrap();
+        let diagnostic = if confirmed {
+            record.turns[0].error.as_deref()
+        } else {
+            record
+                .entries
+                .last()
+                .unwrap()
+                .unsent
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+        };
+        assert_eq!(diagnostic, Some(expected));
+        assert!(!serde_json::to_string(&record).unwrap().contains(KEY));
+        let destination = tempfile::tempdir().unwrap();
+        let exported = store.export_bundle(&record.id, destination.path()).unwrap();
+        let exported = serde_json::to_string(&exported).unwrap();
+        assert!(exported.contains("[redacted]"));
+        assert!(!exported.contains(KEY));
+        runtime.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn large_turn_error_is_complete_live_and_bounded_on_disk() {
+    let workspace = tempfile::tempdir().unwrap();
+    let reported =
+        "provider diagnostic 界\n".repeat(crate::session_store::MAX_SAVED_ERROR_BYTES / 8);
+    assert!(reported.len() > crate::session_store::MAX_SAVED_ERROR_BYTES);
+    let runtime = AgentRuntime::with_new_session(
+        ScriptedClient::new(vec![
+            vec![
+                AgentEvent::TextDelta {
+                    text: "partial answer".into(),
+                },
+                AgentEvent::Error {
+                    message: reported.clone(),
+                },
+            ],
+            ok_turn(),
+        ]),
+        ToolRegistry::default(),
+        "system",
+        workspace.path(),
+        &AgentConfig::builtin(),
+    )
+    .unwrap();
+    let events = drain(&mut runtime.submit_user("question").await).await;
+    assert!(
+        matches!(events.last(), Some(RuntimeEvent::Error { kind: RuntimeFailureKind::Execution, message, .. })
+        if message == &reported)
+    );
+    let events = drain(&mut runtime.submit_user("continue").await).await;
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+    assert!(runtime.flush_session().await.is_none());
+    let store = crate::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let saved = store.load(&runtime.session_id().await.unwrap()).unwrap();
+    let error = saved.turns[0].error.as_deref().unwrap();
+    assert!(error.len() <= crate::session_store::MAX_SAVED_ERROR_BYTES);
+    assert!(error.starts_with("provider diagnostic"));
+    assert!(error.ends_with("[diagnostic shortened for session storage]"));
+    assert!(
+        Session::from_entries(saved.entries)
+            .wire_messages()
+            .iter()
+            .any(|message| message.content.text() == "partial answer")
+    );
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -3295,7 +3546,7 @@ async fn unauthorized_api_error_does_not_retry() {
     assert_eq!(*client.calls.lock().unwrap(), 1);
     assert!(matches!(
         events.last(),
-        Some(RuntimeEvent::Error { message, .. }) if message.contains("鉴权失败")
+        Some(RuntimeEvent::Error { message, .. }) if message.contains("401") && message.contains("invalid key")
     ));
 }
 
@@ -3785,7 +4036,7 @@ impl LlmClient for AttemptScriptClient {
             match behavior {
                 AttemptBehavior::ConnectFail(_) => unreachable!("handled above"),
                 AttemptBehavior::StreamErr => {
-                    Err(AgentError::Parse("connection reset".to_string()))?;
+                    Err(AgentError::RequestTimeout { seconds: 1 })?;
                 }
                 AttemptBehavior::TextThenErr(text) => {
                     yield AgentEvent::TextDelta { text };
@@ -4217,13 +4468,7 @@ async fn begin_turn_supersedes_live_turn_without_clobbering() {
         state.current_turn.is_some(),
         "stale finalization must not consume the new turn's record"
     );
-    assert_eq!(
-        state
-            .current_prompt
-            .as_ref()
-            .map(|prompt| prompt.text.as_str()),
-        Some("second")
-    );
+    assert_eq!(state.current_prompt.as_deref(), Some("second"));
     assert!(state.current_turn_id.is_some());
 }
 
@@ -4255,13 +4500,7 @@ async fn cancel_turn_if_only_cancels_the_named_turn() {
         "a stale turn's lease must not cancel the successor"
     );
     assert_eq!(
-        runtime
-            .state
-            .lock()
-            .await
-            .current_prompt
-            .as_ref()
-            .map(|prompt| prompt.text.as_str()),
+        runtime.state.lock().await.current_prompt.as_deref(),
         Some("second"),
         "the successor turn stays live"
     );
@@ -5312,28 +5551,28 @@ struct RefusingClient {
 struct RefusingInner {
     refuse_at_call: usize,
     refusal_message: String,
-    calls: Mutex<usize>,
-    message_counts: Mutex<Vec<usize>>,
+    refusal_status: u16,
+    requests: Mutex<Vec<Vec<crate::Message>>>,
 }
 
 impl RefusingClient {
-    fn new(refuse_at_call: usize, refusal_message: &str) -> Self {
+    fn new(refuse_at_call: usize, refusal_status: u16, refusal_message: &str) -> Self {
         Self {
             inner: Arc::new(RefusingInner {
                 refuse_at_call,
                 refusal_message: refusal_message.to_string(),
-                calls: Mutex::new(0),
-                message_counts: Mutex::new(Vec::new()),
+                refusal_status,
+                requests: Mutex::new(Vec::new()),
             }),
         }
     }
 
     fn calls(&self) -> usize {
-        *self.inner.calls.lock().unwrap()
+        self.inner.requests.lock().unwrap().len()
     }
 
-    fn message_counts(&self) -> Vec<usize> {
-        self.inner.message_counts.lock().unwrap().clone()
+    fn requests(&self) -> Vec<Vec<crate::Message>> {
+        self.inner.requests.lock().unwrap().clone()
     }
 }
 
@@ -5349,18 +5588,13 @@ impl LlmClient for RefusingClient {
 
     async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
         let call = {
-            let mut calls = self.inner.calls.lock().unwrap();
-            *calls += 1;
-            *calls
+            let mut requests = self.inner.requests.lock().unwrap();
+            requests.push(request.messages);
+            requests.len()
         };
-        self.inner
-            .message_counts
-            .lock()
-            .unwrap()
-            .push(request.messages.len());
         if call == self.inner.refuse_at_call {
             return Err(AgentError::Api {
-                status: reqwest::StatusCode::BAD_REQUEST,
+                status: reqwest::StatusCode::from_u16(self.inner.refusal_status).unwrap(),
                 message: self.inner.refusal_message.clone(),
             });
         }
@@ -5374,115 +5608,95 @@ impl LlmClient for RefusingClient {
     }
 }
 
-/// A 400 the provider blames on the context window is recovered from by
-/// compacting history and retrying the same request — instead of ending the
-/// turn with an error the user can neither read nor act on.
 #[tokio::test]
-async fn a_context_overflow_refusal_compacts_and_retries() {
-    let workspace = tempfile::tempdir().unwrap();
-    let client = RefusingClient::new(
-        4,
-        r#"{"error":{"message":"This model's maximum context length is 131072 tokens.","code":"context_length_exceeded"}}"#,
-    );
-    let runtime = AgentRuntime::with_new_session(
-        client.clone(),
-        ToolRegistry::default(),
-        "system",
-        workspace.path(),
-        &crate::config::AgentConfig::builtin(),
-    )
-    .unwrap();
-
-    // Three turns first, so there is a middle to fold away: `compact_entries`
-    // keeps the system head plus the last five entries, and needs something
-    // between them to archive.
+async fn provider_context_refusal_is_reported_without_rewriting_history_or_retrying() {
+    let body =
+        r#"{"error":{"message":"context length exceeded","code":"context_length_exceeded"}}"#;
+    let client = RefusingClient::new(4, 400, body);
+    let runtime = AgentRuntime::new(client.clone(), ToolRegistry::default());
     for prompt in ["one", "two", "three"] {
         let mut rx = runtime.submit_user(prompt).await;
         drain(&mut rx).await;
     }
-
-    // The fourth turn's request is refused.
+    let history = runtime.session_messages().await;
     let mut rx = runtime.submit_user("four").await;
     let events = drain(&mut rx).await;
 
     assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, RuntimeEvent::Error { .. })),
-        "the refusal must be recovered, not surfaced: {events:?}"
+        matches!(events.last(), Some(RuntimeEvent::Error { kind: RuntimeFailureKind::Submission, message, .. })
+        if message.contains("400") && message.contains(body))
     );
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            RuntimeEvent::CompactionApplied { archived_count, .. } if *archived_count > 0
-        )),
-        "the rescue must actually fold history: {events:?}"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, RuntimeEvent::Warning { .. })),
-        "the user must be told why the turn paused: {events:?}"
-    );
-    assert!(
-        matches!(events.last(), Some(RuntimeEvent::TurnFinished { .. })),
-        "the recovered turn still finishes normally: {events:?}"
-    );
-
-    // The proof it helped: the retry carried strictly fewer messages than the
-    // request that was refused. Without this the test would pass on a rescue
-    // that compacted and then re-sent the identical context.
-    let counts = client.message_counts();
-    // Three turns, the refused attempt, the handover summarizer's own request
-    // (two messages: its instructions and the flattened transcript), the retry.
-    assert_eq!(
-        counts.len(),
-        6,
-        "one refused attempt, one summarizer request, one retry: {counts:?}"
-    );
-    assert_eq!(
-        counts[4], 2,
-        "the summarizer sends its own two-message request: {counts:?}"
-    );
-    let (refused, retried) = (counts[3], counts[5]);
-    assert!(
-        retried < refused,
-        "the retry must carry a smaller context: refused={refused} retried={retried} ({counts:?})"
-    );
+    assert_eq!(runtime.session_messages().await, history);
+    assert_eq!(client.calls(), 4);
 }
 
-/// The other half of the contract: a 400 naming something else must NOT be
-/// re-read as an overflow. Compacting there would cost a rewrite and a request
-/// before finally reporting the real problem.
 #[tokio::test]
-async fn a_400_that_does_not_name_the_context_window_is_not_retried() {
+async fn rejected_draft_budget_leaves_room_for_new_history_and_resume() {
+    use crate::session_store::{DRAFT_STORAGE_BUDGET_BYTES, MAX_RETAINED_DRAFTS};
     let workspace = tempfile::tempdir().unwrap();
-    let client = RefusingClient::new(1, r#"{"error":{"message":"invalid tool schema"}}"#);
+    let refused = vec![AgentEvent::Error {
+        message: "provider refused".into(),
+    }];
+    let mut scripts = vec![ok_turn()];
+    scripts.extend(std::iter::repeat_n(refused, MAX_RETAINED_DRAFTS + 3));
+    scripts.push(ok_turn());
     let runtime = AgentRuntime::with_new_session(
-        client.clone(),
+        ScriptedClient::new(scripts),
         ToolRegistry::default(),
         "system",
         workspace.path(),
-        &crate::config::AgentConfig::builtin(),
+        &AgentConfig::builtin(),
     )
     .unwrap();
-
-    let mut rx = runtime.submit_user("hi").await;
-    let events = drain(&mut rx).await;
-
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, RuntimeEvent::Error { .. })),
-        "an unrelated 400 is the user's to see: {events:?}"
+    drain(&mut runtime.submit_user("the accepted exchange").await).await;
+    for index in 0..MAX_RETAINED_DRAFTS + 2 {
+        drain(&mut runtime.submit_user(format!("rejected {index}")).await).await;
+    }
+    let drafts = runtime.unsent_messages().await;
+    assert_eq!(drafts.len(), MAX_RETAINED_DRAFTS);
+    let crate::EntryKind::User { content } = &drafts.last().unwrap().kind else {
+        panic!("expected user draft");
+    };
+    assert_eq!(content.text(), "rejected 2");
+    assert_eq!(
+        compact(&runtime, None).await,
+        CompactNowOutcome::NothingToFold
     );
+
+    let oversized = "x".repeat(DRAFT_STORAGE_BUDGET_BYTES as usize);
+    let events = drain(&mut runtime.submit_user(oversized).await).await;
     assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, RuntimeEvent::CompactionApplied { .. })),
-        "and must not cost a compaction: {events:?}"
+        matches!(events.last(), Some(RuntimeEvent::Error { kind: RuntimeFailureKind::Execution, message, .. })
+        if message.contains("provider refused") && message.contains("/retry"))
     );
-    assert_eq!(client.calls(), 1, "and must not be retried");
+    assert_eq!(runtime.unsent_messages().await.len(), MAX_RETAINED_DRAFTS);
+    let events = drain(&mut runtime.submit_user("continue").await).await;
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+    assert!(runtime.flush_session().await.is_none());
+    let store = crate::JsonSessionStore::for_workspace(workspace.path()).unwrap();
+    let saved = store.load(&runtime.session_id().await.unwrap()).unwrap();
+    assert_eq!(saved.turns.len(), MAX_RETAINED_DRAFTS + 2);
+    assert_eq!(
+        saved
+            .entries
+            .iter()
+            .filter(|entry| entry.unsent.is_some())
+            .count(),
+        MAX_RETAINED_DRAFTS
+    );
+    assert_eq!(
+        Session::from_entries(saved.entries)
+            .wire_messages()
+            .iter()
+            .filter(|message| message.role == crate::Role::User)
+            .map(|message| message.content.text())
+            .collect::<Vec<_>>(),
+        ["the accepted exchange", "continue"]
+    );
+    runtime.shutdown().await;
 }
 
 /// `/compact`'s runtime half: fold now, and answer honestly when there is
@@ -5614,73 +5828,165 @@ async fn compacting_only_short_messages_reports_a_context_that_grew() {
     );
 }
 
-/// A model that cannot take images degrades the image; it does not wedge the
-/// session.
-///
-/// The failure this pins, and why it is not merely a nicer error: the user's
-/// images are recorded in the session *before* the turn runs, and every turn
-/// re-derives the whole transcript, so a refusal here re-fires on every later
-/// turn — including text-only ones — for as long as the transcript holds that
-/// image. The advice it would carry ("remove the images") is unactionable
-/// because the images left the draft at submit. So the image becomes a sentence
-/// in the text and the turn still goes; what the request actually contained is
-/// `image::tests`, which can inspect it.
 #[tokio::test]
-async fn a_model_that_cannot_take_images_keeps_the_session_usable() {
+async fn unreadable_attachment_is_reported_on_its_turn_without_sending_partial_input() {
     let dir = tempfile::tempdir().unwrap();
-    let image = dir.path().join("shot.png");
-    std::fs::write(&image, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1]).unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let image = workspace.join("shot.png");
+    std::fs::write(&image, b"GIF89a-good").unwrap();
+    let client = RefusingClient::new(usize::MAX, 413, "unused");
+    let runtime = AgentRuntime::with_new_session(
+        client.clone(),
+        ToolRegistry::default(),
+        "system",
+        &workspace,
+        &AgentConfig::builtin(),
+    )
+    .unwrap();
+    let mut turn = runtime
+        .start_turn(UserTurn::with_images(
+            "attach two files",
+            vec![image, workspace.join("missing.png")],
+        ))
+        .await;
+    let id = turn.id().clone();
+    while let Some(event) = turn.recv().await {
+        if let RuntimeEvent::Error {
+            kind,
+            turn_id,
+            message,
+        } = event
+        {
+            assert_eq!(kind, RuntimeFailureKind::Submission);
+            assert_eq!(turn_id, Some(id.clone()));
+            assert!(message.contains("missing.png"));
+        }
+    }
+    assert_eq!(turn.outcome().unwrap().reason, FinishReason::Failed);
+    assert!(runtime.is_idle());
+    assert!(client.requests().is_empty());
+    let drafts = runtime.unsent_messages().await;
+    assert_eq!(drafts.len(), 1);
+    assert_eq!(drafts[0].turn_id.as_ref(), Some(&id));
+    let crate::EntryKind::User { content } = &drafts[0].kind else {
+        panic!("expected user draft")
+    };
+    assert_eq!(content.image_count(), 1);
+    let mut next = runtime.start_turn("continue").await;
+    while next.recv().await.is_some() {}
+    assert_eq!(next.outcome().unwrap().reason, FinishReason::Completed);
+    assert!(client.requests()[0].iter().all(|message| {
+        message.content.text() != "attach two files" && !message.content.has_images()
+    }));
+}
 
-    // Two turns, so an exhausted script cannot be mistaken for a refusal.
-    let client = ScriptedClient::new(vec![
-        vec![AgentEvent::Done { usage: None }],
-        vec![AgentEvent::Done { usage: None }],
-    ]);
+#[tokio::test]
+async fn rejected_images_are_saved_for_editing_without_being_replayed() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().canonicalize().unwrap();
+    let image = workspace.join("shot.png");
+    let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1];
+    std::fs::write(&image, png).unwrap();
+    let body = r#"{"error":{"message":"the provider rejected these images"}}"#;
+    let client = RefusingClient::new(2, 413, body);
     let config = AgentConfig {
         model: DEEPSEEK_V4_PRO.to_string(),
         ..AgentConfig::builtin()
     };
-    let runtime =
-        AgentRuntime::with_system_prompt(client, ToolRegistry::default(), "system", config, false)
-            .with_image_workspace(dir.path().canonicalize().unwrap());
+    let runtime = AgentRuntime::with_new_session(
+        client.clone(),
+        ToolRegistry::default(),
+        "system",
+        &workspace,
+        &config,
+    )
+    .unwrap();
+    let mut rx = runtime.submit_user("first").await;
+    drain(&mut rx).await;
 
-    let mut rx = runtime
-        .submit_user(UserTurn::with_images("look at this", vec![image]))
+    let mut turn = runtime
+        .start_turn(UserTurn::with_images(
+            "look at this",
+            vec![image.clone(); 6],
+        ))
         .await;
-    let events = drain(&mut rx).await;
+    let mut failure = None;
+    while let Some(event) = turn.recv().await {
+        if let RuntimeEvent::Error { kind, message, .. } = event {
+            failure = Some((kind, message));
+        }
+    }
     assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, RuntimeEvent::Error { .. })),
-        "the turn must run, with the image degraded: {events:?}"
+        matches!(failure, Some((RuntimeFailureKind::Submission, message))
+        if message.contains("413") && message.contains(body))
+    );
+    assert!(runtime.is_idle());
+    assert_eq!(
+        client.requests()[1].last().unwrap().content.image_count(),
+        6
     );
 
-    assert!(
-        events.iter().any(|event| matches!(event,
-            RuntimeEvent::ImageRequestPrepared { model, images, .. }
-                if model == DEEPSEEK_V4_PRO && images.len() == 1 && !images[0].included
-        )),
-        "fixed model must report the omitted admitted image: {events:?}"
-    );
-    assert!(events.iter().any(|event| matches!(event,
-        RuntimeEvent::Warning { message } if message.contains("image observations unavailable")
-    )));
-
-    // The turn after it must not be refused for the picture still in the
-    // history — that is the wedge.
-    let mut rx = runtime.submit_user("and now a plain question").await;
-    let events = drain(&mut rx).await;
-    assert!(
-        !events
+    let mut next = runtime.start_turn("plain text after failure").await;
+    while next.recv().await.is_some() {}
+    assert_eq!(next.outcome().unwrap().reason, FinishReason::Completed);
+    assert_eq!(
+        client.requests()[2]
             .iter()
-            .any(|event| matches!(event, RuntimeEvent::Error { .. })),
-        "a text-only turn must not inherit the history's images: {events:?}"
+            .filter(|message| message.role == crate::Role::User)
+            .map(|message| message.content.text())
+            .collect::<Vec<_>>(),
+        ["first", "plain text after failure"]
+    );
+
+    let session_id = runtime.session_id().await.unwrap();
+    assert!(runtime.flush_session().await.is_none());
+    runtime.shutdown().await;
+    std::fs::remove_file(image).unwrap();
+    let store = crate::JsonSessionStore::for_workspace(&workspace).unwrap();
+    let record = store.load(&session_id).unwrap();
+    let resumed = AgentRuntime::from_session_record(
+        client.clone(),
+        ToolRegistry::default(),
+        record,
+        store,
+        config,
+    );
+    let drafts = resumed.unsent_messages().await;
+    assert_eq!(drafts.len(), 1);
+    let crate::EntryKind::User { content } = &drafts[0].kind else {
+        panic!("expected user draft")
+    };
+    assert_eq!(content.text(), "look at this");
+    assert_eq!(content.image_count(), 6);
+    let attachment = content.images().next().unwrap();
+    assert_eq!(attachment.read().unwrap(), png);
+
+    let mut rx = resumed.submit_user("plain text after resume").await;
+    assert!(matches!(
+        drain(&mut rx).await.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+    assert!(
+        client.requests()[3]
+            .iter()
+            .all(|message| !message.content.has_images())
+    );
+    let mut rx = resumed
+        .submit_user(UserTurn::with_labeled_images(
+            "edited draft",
+            vec![(crate::UserImage::Saved(attachment.clone()), String::new())],
+        ))
+        .await;
+    assert!(matches!(
+        drain(&mut rx).await.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+    assert_eq!(
+        client.requests()[4].last().unwrap().content.image_count(),
+        1
     );
 }
 
-/// The same turn on Flash goes through. Paired with the test above so the
-/// refusal is pinned to the model's capability rather than to the presence of an
-/// image.
 #[tokio::test]
 async fn the_same_image_turn_is_accepted_on_flash() {
     let dir = tempfile::tempdir().unwrap();
@@ -7266,6 +7572,137 @@ async fn aborting_start_during_persistence_cancels_the_bootstrap_before_model_wo
     );
 }
 
+#[test]
+fn image_preparation_is_released_on_cancel_replacement_or_dropped_submission() {
+    #[derive(Clone, Copy)]
+    enum Stop {
+        Cancel,
+        Supersede,
+        DropSubmit,
+        DropBegin,
+        DropStart,
+    }
+    for stop in [
+        Stop::Cancel,
+        Stop::Supersede,
+        Stop::DropSubmit,
+        Stop::DropBegin,
+        Stop::DropStart,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().canonicalize().unwrap();
+        let source = workspace.join("queued.gif");
+        std::fs::write(&source, b"GIF89a-queued").unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (started, occupied) = tokio::sync::oneshot::channel();
+                let (release, blocked) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    let _ = blocked.recv();
+                });
+                occupied.await.unwrap();
+
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let runtime = AgentRuntime::new(
+                    CapturingClient {
+                        scripts: Mutex::new(vec![ok_turn()]),
+                        requests: Arc::clone(&requests),
+                    },
+                    ToolRegistry::default(),
+                )
+                .with_image_workspace(workspace.clone());
+                let cancel = CancellationToken::new();
+                let old = tokio::spawn({
+                    let runtime = runtime.clone();
+                    let cancel = cancel.clone();
+                    let prompt = UserTurn::with_labeled_images(
+                        "[image #1 GIF] first",
+                        vec![(UserImage::File(source.clone()), "[image #1 GIF]".into())],
+                    );
+                    async move {
+                        match stop {
+                            Stop::DropSubmit => {
+                                runtime.submit_user(prompt).await;
+                            }
+                            Stop::DropBegin => {
+                                runtime.begin_turn(prompt).await.unwrap();
+                            }
+                            Stop::DropStart => {
+                                drop(runtime.start_turn(prompt).await);
+                            }
+                            Stop::Cancel | Stop::Supersede => {
+                                let mut turn =
+                                    runtime.start_turn_cancellable(prompt, &cancel).await;
+                                while turn.recv().await.is_some() {}
+                                assert_eq!(turn.outcome().unwrap().reason, FinishReason::Cancelled);
+                            }
+                        }
+                    }
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while runtime.live_turn_id().await.is_none() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("turn ownership must be established before the image worker runs");
+
+                let next = match stop {
+                    Stop::Supersede => Some(runtime.start_turn("continue").await),
+                    Stop::Cancel => {
+                        cancel.cancel();
+                        None
+                    }
+                    Stop::DropBegin | Stop::DropSubmit | Stop::DropStart => {
+                        old.abort();
+                        None
+                    }
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let result = old.await;
+                    if matches!(stop, Stop::DropBegin | Stop::DropSubmit | Stop::DropStart) {
+                        assert!(result.unwrap_err().is_cancelled());
+                    } else {
+                        result.unwrap();
+                    }
+                    if next.is_none() {
+                        while runtime.live_turn_id().await.is_some() {
+                            tokio::task::yield_now().await;
+                        }
+                        assert!(runtime.is_idle());
+                        assert_eq!(runtime.unsent_messages().await.len(), 1);
+                    }
+                })
+                .await
+                .expect("cancellation must settle even while the image worker is queued");
+                let mut next = match next {
+                    Some(next) => next,
+                    None => runtime.start_turn("continue").await,
+                };
+                while next.recv().await.is_some() {}
+                assert_eq!(next.outcome().unwrap().reason, FinishReason::Completed);
+                let drafts = runtime.unsent_messages().await;
+                assert_eq!(drafts.len(), 1);
+                let draft = drafts[0].unsent.as_ref().unwrap();
+                assert_eq!(draft.missing_image_labels, ["[image #1 GIF]"]);
+                {
+                    let requests = requests.lock().unwrap();
+                    assert_eq!(requests.len(), 1);
+                    assert_eq!(requests[0]["messages"].as_array().unwrap().len(), 1);
+                    assert_eq!(requests[0]["messages"][0]["content"], "continue");
+                }
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+            });
+        assert!(!workspace.join(".deep-code/images").exists());
+    }
+}
+
 #[tokio::test]
 async fn user_images_are_snapshotted_before_the_first_request() {
     let directory = tempfile::tempdir().unwrap();
@@ -7902,9 +8339,6 @@ async fn repeated_image_attachments_after_compaction_keep_distinct_reports_and_w
             .submit_user(UserTurn::with_images("observe", vec![source.clone()]))
             .await;
         let events = drain(&mut receiver).await;
-        assert!(events.iter().any(|event| matches!(event,
-            RuntimeEvent::Warning { message } if message.contains("image observations unavailable")
-        )), "each fresh omitted observation needs its own warning");
         let image = events
             .iter()
             .find_map(|event| match event {
@@ -7915,18 +8349,23 @@ async fn repeated_image_attachments_after_compaction_keep_distinct_reports_and_w
                 _ => None,
             })
             .expect("fresh image request is reported");
-        assert!(!image.included);
+        assert!(image.included);
         assert!(
             image.observation_id.is_some(),
             "session observations must have stable identity"
         );
         observed.push(image);
-        for _ in 0..3 {
+        for index in 0..3 {
             let mut receiver = runtime.submit_user("plain follow-up").await;
             let events = drain(&mut receiver).await;
-            assert!(!events.iter().any(|event| matches!(event,
+            let warned = events.iter().any(|event| matches!(event,
                 RuntimeEvent::Warning { message } if message.contains("image observations unavailable")
-            )), "an unchanged historical omission must not warn again");
+            ));
+            assert_eq!(
+                warned,
+                index == 0,
+                "only the first historical omission warns"
+            );
         }
         folded(compact(&runtime, None).await);
     }
@@ -7952,11 +8391,13 @@ async fn repeated_image_attachments_after_compaction_keep_distinct_reports_and_w
         .collect();
     assert_eq!(
         reports.len(),
-        2,
+        4,
         "unchanged history must not expand every later turn's audit"
     );
     assert_eq!(reports[0].observation_id, observed[0].observation_id);
-    assert_eq!(reports[1].observation_id, observed[1].observation_id);
+    assert_eq!(reports[1].observation_id, observed[0].observation_id);
+    assert_eq!(reports[2].observation_id, observed[1].observation_id);
+    assert_eq!(reports[3].observation_id, observed[1].observation_id);
 
     // Restore the persisted identities and attach the same asset again at the
     // same compacted wire position. It must still be a fresh observation.
@@ -7971,9 +8412,6 @@ async fn repeated_image_attachments_after_compaction_keep_distinct_reports_and_w
         .submit_user(UserTurn::with_images("observe again", vec![source]))
         .await;
     let events = drain(&mut receiver).await;
-    assert!(events.iter().any(|event| matches!(event,
-        RuntimeEvent::Warning { message } if message.contains("image observations unavailable")
-    )));
     let image = events
         .iter()
         .find_map(|event| match event {

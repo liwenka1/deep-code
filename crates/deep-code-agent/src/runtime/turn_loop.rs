@@ -4,15 +4,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::estimate_token_count;
-use crate::error::AgentError;
 use crate::event::AgentEvent;
 use crate::model::{ChatRequest, Usage};
-use crate::model_registry::context_window_for_model;
 use crate::runtime::AgentRuntime;
-use crate::runtime::compaction_flow::{FoldOutcome, Trigger};
-use crate::runtime::event::{RuntimeEvent, ToolCallId, TurnId, emit};
+use crate::runtime::event::{RuntimeEvent, RuntimeFailureKind, ToolCallId, TurnId, emit};
 use crate::runtime::telemetry::probe_prefix;
-use crate::runtime::tool_result::{BatchOutcome, runtime_error_from_tool_error, tool_call_payload};
+use crate::runtime::tool_result::{BatchOutcome, tool_call_payload};
 use crate::tool::ToolCallAccumulator;
 
 /// Maximum model requests in a single turn. Generous enough that no legitimate
@@ -60,21 +57,21 @@ const BOUNDARY_DENIAL_BREAKER: u32 = 3;
 
 impl AgentRuntime {
     /// Spend one step of `turn_id`'s budget: increments the count and hands
-    /// back `(steps, wrap_up_sent, overflow_rescued)`.
+    /// back `(steps, wrap_up_sent)`.
     ///
     /// `None` when the state's budget belongs to a newer turn — a superseded
     /// loop still on its way out must not spend, or reset, the allowance of the
     /// turn that replaced it.
     ///
     /// See [`super::state::TurnBudget`] for why this is state and not a local.
-    async fn spend_step(&self, turn_id: &TurnId) -> Option<(u32, bool, bool)> {
+    async fn spend_step(&self, turn_id: &TurnId) -> Option<(u32, bool)> {
         let mut state = self.state.lock().await;
         let budget = state.turn_budget.as_mut()?;
         if &budget.turn != turn_id {
             return None;
         }
         budget.steps += 1;
-        Some((budget.steps, budget.wrap_up_sent, budget.overflow_rescued))
+        Some((budget.steps, budget.wrap_up_sent))
     }
 
     /// Record that the one wrap-up nudge has been sent this turn.
@@ -84,20 +81,6 @@ impl AgentRuntime {
             && &budget.turn == turn_id
         {
             budget.wrap_up_sent = true;
-        }
-    }
-
-    /// Record that this turn has used its one forced-compaction rescue.
-    ///
-    /// One per turn, because a second overflow means the oversized part is the
-    /// turn's own retained tail — which compaction structurally cannot reach,
-    /// so retrying would only re-bill the same rejected request.
-    async fn mark_overflow_rescued(&self, turn_id: &TurnId) {
-        let mut state = self.state.lock().await;
-        if let Some(budget) = state.turn_budget.as_mut()
-            && &budget.turn == turn_id
-        {
-            budget.overflow_rescued = true;
         }
     }
 
@@ -116,8 +99,8 @@ impl AgentRuntime {
 
     /// End the turn when its boundary denials crossed the breaker threshold.
     /// Mirrors the step-limit exit: a user-facing Error event with the remedy
-    /// (`/add-dir`, with the denied directory when one was captured), then
-    /// `abort_turn`. Returns whether the caller should stop looping. Consulted
+    /// (`/add-dir`, with the denied directory when one was captured).
+    /// Returns whether the caller should stop looping. Consulted
     /// after every completed batch — the loop's own and the ones
     /// `handle_approval` resumes after a human answer — so the batch that
     /// crosses the threshold ends the turn, not the one after it.
@@ -145,15 +128,8 @@ impl AgentRuntime {
                 &[("limit", &BOUNDARY_DENIAL_BREAKER.to_string())],
             ),
         };
-        emit(
-            tx,
-            RuntimeEvent::Error {
-                kind: crate::RuntimeFailureKind::Execution,
-                turn_id: Some(turn_id.clone()),
-                message,
-            },
-        );
-        self.abort_turn(turn_id).await;
+        self.fail_turn(turn_id, tx, RuntimeFailureKind::Execution, message)
+            .await;
         true
     }
 
@@ -190,14 +166,13 @@ impl AgentRuntime {
             // press Esc. Sub-agents have had a step cap all along; the parent
             // loop, which is the one holding the key, had none.
             //
-            // The count, the forced-compaction rescue and the wrap-up guard all
+            // The count and wrap-up guard
             // live in `TurnBudget` (the state) rather than here: an approval
             // park leaves this loop and `resume_after_batch` enters it again, so
             // locals started over at every human answer. `None` means the
             // budget belongs to a newer turn — this loop was superseded and has
             // nothing left to spend.
-            let Some((steps, wrap_up_sent, overflow_rescued)) = self.spend_step(&turn_id).await
-            else {
+            let Some((steps, wrap_up_sent)) = self.spend_step(&turn_id).await else {
                 return;
             };
             // `0` is the user's explicit "no ceiling": the loop then has no
@@ -207,19 +182,17 @@ impl AgentRuntime {
             // why the config documents it as removing the backstop.
             let cap = self.config.turn_steps;
             if cap > 0 && steps > cap {
-                emit(
+                self.fail_turn(
+                    &turn_id,
                     tx,
-                    RuntimeEvent::Error {
-                        kind: crate::RuntimeFailureKind::StepLimit,
-                        turn_id: Some(turn_id.clone()),
-                        message: crate::tr_with(
-                            self.ui_lang(),
-                            crate::TextId::TurnStepLimitReached,
-                            &[("limit", &cap.to_string())],
-                        ),
-                    },
-                );
-                self.abort_turn(&turn_id).await;
+                    RuntimeFailureKind::StepLimit,
+                    crate::tr_with(
+                        self.ui_lang(),
+                        crate::TextId::TurnStepLimitReached,
+                        &[("limit", &cap.to_string())],
+                    ),
+                )
+                .await;
                 return;
             }
             if cancel.is_cancelled() {
@@ -271,42 +244,24 @@ impl AgentRuntime {
             // this is the only place a request's exact messages exist next to
             // what the last turn sent, and the last iteration's probe is the one
             // telemetry reports.
-            let (messages, prior_prefix, reply_anchor, image_occurrences) = {
+            let (projection, prior_prefix, reply_anchor) = {
                 let state = self.state.lock().await;
-                let (messages, image_occurrences) =
-                    state.session.wire_messages_with_image_occurrences();
                 (
-                    messages,
+                    state
+                        .session
+                        .wire_messages_with_image_occurrences(Some(&turn_id)),
                     state.last_prefix,
                     state.session.entries().last().cloned(),
-                    image_occurrences,
                 )
             };
-            let request = ChatRequest::streaming(model, messages)
+            let request = ChatRequest::streaming(model, projection.messages)
                 .with_tools(self.tools.chat_tools())
                 .with_reasoning_effort(reasoning_effort);
-
-            let estimated_context_tokens = estimate_token_count(&request.messages);
-            // Our own read on how close this request is to the window, used only
-            // for the overflow rescue below. The provider's error wording is not
-            // ours to rely on across versions; this number is, so the rescue has
-            // a signal that does not depend on it.
-            let near_window = estimated_context_tokens
-                >= context_window_for_model(model).saturating_mul(95) / 100;
 
             let opened = tokio::select! {
                 biased;
                 () = cancel.cancelled() => None,
-                opened = self.open_turn_stream(request) => Some(opened),
-            };
-            // A 400 the provider blames on the context window, OR any 400 at a
-            // context we ourselves read as within 5% of it. Two independent
-            // signals on purpose: the phrase match is the provider's wording,
-            // `near_window` is our own estimate and survives a rewording.
-            let overflow_refusal = |error: &AgentError| {
-                error.blames_context_window()
-                    || (near_window
-                        && matches!(error, AgentError::Api { status, .. } if status.as_u16() == 400))
+                opened = self.open_turn_stream(request, &projection.submissions, &cancel) => Some(opened),
             };
 
             let mut stream = match opened {
@@ -315,74 +270,14 @@ impl AgentRuntime {
                     return;
                 }
                 Some(Ok(stream)) => stream,
-                Some(Err(error)) if !overflow_rescued && overflow_refusal(&error) => {
-                    // The provider refused the request for being over the model's
-                    // window. Shrinking history is the only recovery there is,
-                    // and it has to be FORCED: the estimate that normally gates
-                    // compaction is the very number that just proved too
-                    // optimistic.
-                    //
-                    // The loop simply continues — the retry is the same request
-                    // over a now-shorter history, so a UI must not read it as a
-                    // new turn. Hence a warning rather than an error, and no
-                    // TurnStarted.
-                    // Turn-scoped, so a resumed loop cannot rescue twice.
-                    self.mark_overflow_rescued(&turn_id).await;
-                    match self
-                        .compact_session(Trigger::OverflowRescue, Some(tx), None, &cancel)
-                        .await
-                    {
-                        FoldOutcome::Applied(_) => {}
-                        FoldOutcome::Cancelled => {
-                            self.finish_turn_cancelled(&turn_id, tx).await;
-                            return;
-                        }
-                        // Nothing left to archive: the oversized part is this
-                        // turn's own retained tail — a single huge tool result,
-                        // say — which the retention rule keeps by design and
-                        // compaction can never reach. Report that instead of
-                        // re-raising the raw 400, and name the way out. (A
-                        // rescue folds mechanically when the summarizer fails,
-                        // so the other two arms only share this one's ending.)
-                        FoldOutcome::Nothing | FoldOutcome::Offline | FoldOutcome::Failed(_) => {
-                            emit(
-                                tx,
-                                RuntimeEvent::Error {
-                                    kind: crate::RuntimeFailureKind::Execution,
-                                    turn_id: Some(turn_id.clone()),
-                                    message: crate::tr_with(
-                                        self.ui_lang(),
-                                        crate::TextId::ErrContextOverflow,
-                                        &[("estimate", &estimated_context_tokens.to_string())],
-                                    ),
-                                },
-                            );
-                            self.abort_turn(&turn_id).await;
-                            return;
-                        }
-                    }
-                    emit(
-                        tx,
-                        RuntimeEvent::Warning {
-                            message: crate::tr(
-                                self.ui_lang(),
-                                crate::TextId::ContextOverflowRescued,
-                            )
-                            .to_string(),
-                        },
-                    );
-                    continue;
-                }
                 Some(Err(error)) => {
-                    emit(
+                    self.fail_turn(
+                        &turn_id,
                         tx,
-                        RuntimeEvent::Error {
-                            kind: crate::RuntimeFailureKind::Execution,
-                            turn_id: Some(turn_id.clone()),
-                            message: error.user_message(self.ui_lang()),
-                        },
-                    );
-                    self.abort_turn(&turn_id).await;
+                        RuntimeFailureKind::Execution,
+                        error.user_message(self.ui_lang()),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -395,7 +290,8 @@ impl AgentRuntime {
                 .iter()
                 .map(|image| {
                     let mut image = image.clone();
-                    image.observation_id = image_occurrences
+                    image.observation_id = projection
+                        .image_occurrences
                         .get(&(image.message_index, image.block_index))
                         .cloned();
                     image
@@ -409,21 +305,34 @@ impl AgentRuntime {
             let mut text_buffer = String::new();
             let mut reasoning_buffer = String::new();
             let mut last_usage: Option<Usage> = None;
-            let mut had_error = false;
-            let mut cancelled = false;
+            let mut failure = None;
+            let mut pending = projection.has_pending;
 
             loop {
                 let event = tokio::select! {
                     biased;
-                    () = cancel.cancelled() => {
-                        cancelled = true;
-                        break;
-                    }
+                    () = cancel.cancelled() => break,
                     event = stream.next() => match event {
                         Some(event) => event,
                         None => break,
                     },
                 };
+                if pending
+                    && event
+                        .as_ref()
+                        .is_ok_and(|event| !matches!(event, AgentEvent::Error { .. }))
+                {
+                    pending = false;
+                    let confirmed = self
+                        .state
+                        .lock()
+                        .await
+                        .session
+                        .settle_submissions(&turn_id, None);
+                    if confirmed {
+                        self.persist().await;
+                    }
+                }
                 match event {
                     Ok(AgentEvent::TextDelta { text }) => {
                         text_buffer.push_str(&text);
@@ -481,40 +390,19 @@ impl AgentRuntime {
                         last_usage = usage;
                     }
                     Ok(AgentEvent::Error { message }) => {
-                        emit(
-                            tx,
-                            RuntimeEvent::Error {
-                                kind: crate::RuntimeFailureKind::Execution,
-                                turn_id: Some(turn_id.clone()),
-                                message,
-                            },
-                        );
-                        had_error = true;
-                        // `Error` is terminal for the turn (consumers stop
-                        // observing on it), so stop reading here: a provider
-                        // that follows one error frame with another must not
-                        // produce a second terminal event. The transport-error
-                        // arm below gets the same exit from `GuardedStream`,
-                        // which fuses itself after an `Err`.
+                        failure = Some(message);
                         break;
                     }
                     Err(error) => {
-                        emit(
-                            tx,
-                            RuntimeEvent::Error {
-                                kind: crate::RuntimeFailureKind::Execution,
-                                turn_id: Some(turn_id.clone()),
-                                message: error.user_message(self.ui_lang()),
-                            },
-                        );
-                        had_error = true;
+                        failure = Some(error.user_message(self.ui_lang()));
+                        break;
                     }
                 }
             }
 
             stream_retries += stream.retries_used();
 
-            if cancelled {
+            if cancel.is_cancelled() {
                 // Partial assistant output stays in the transcript; partial
                 // tool-call deltas are discarded before they become real
                 // calls, so no tool_call/tool pairing is broken.
@@ -529,7 +417,7 @@ impl AgentRuntime {
                 return;
             }
 
-            if had_error {
+            if let Some(message) = failure {
                 // Same semantics as cancellation: streamed partial output is
                 // kept (no tool_calls were pushed, so pairing is intact).
                 self.record_partial_reply(
@@ -539,18 +427,28 @@ impl AgentRuntime {
                     reasoning_buffer,
                 )
                 .await;
-                self.abort_turn(&turn_id).await;
+                self.fail_turn(&turn_id, tx, RuntimeFailureKind::Execution, message)
+                    .await;
                 return;
             }
 
             let calls = match accumulator.finish() {
                 Ok(calls) => calls,
                 Err(error) => {
-                    emit(
+                    self.record_partial_reply(
+                        &turn_id,
+                        reply_anchor.as_ref(),
+                        text_buffer,
+                        reasoning_buffer,
+                    )
+                    .await;
+                    self.fail_turn(
+                        &turn_id,
                         tx,
-                        runtime_error_from_tool_error(error, Some(turn_id.clone())),
-                    );
-                    self.abort_turn(&turn_id).await;
+                        RuntimeFailureKind::Execution,
+                        error.to_string(),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -767,9 +665,13 @@ impl AgentRuntime {
             let drained: Vec<Steered> = std::mem::take(&mut state.steering).into();
             for steered in &drained {
                 match steered {
-                    Steered::User { content, .. } => {
-                        state.session.push_user(turn_id.clone(), content.clone())
-                    }
+                    Steered::User {
+                        content, unsent, ..
+                    } => state.session.push_pending_user(
+                        turn_id.clone(),
+                        content.clone(),
+                        unsent.clone(),
+                    ),
                     // A runtime nudge (the budget wrap-up): recorded as a System
                     // entry, never a user one. As a user entry it would become
                     // the newest user message and pull compaction's anchor off

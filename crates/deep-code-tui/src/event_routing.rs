@@ -1,4 +1,4 @@
-use deep_code_agent::{RuntimeEvent, ToolCallId};
+use deep_code_agent::{RuntimeEvent, RuntimeFailureKind, ToolCallId};
 
 use crate::active_turn::{ActiveToolCell, ActiveTurn};
 use crate::app::App;
@@ -13,20 +13,12 @@ impl App {
             self.turn_compaction_since = None;
         }
         match event {
-            RuntimeEvent::TurnStarted { turn_id, .. } => {
+            RuntimeEvent::TurnStarted { .. } => {
                 // Never drop a predecessor that streamed content but missed
                 // its terminal event — flush it into history first.
                 self.flush_active_turn();
                 self.active_turn = Some(ActiveTurn::default());
-                // Esc can arrive before the async bootstrap registers its
-                // turn. Repeat that intent against the exact id now observed.
                 if self.cancel_requested {
-                    let runtime = self.runtime.clone();
-                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                        handle.spawn(async move {
-                            drop(runtime.cancel_turn_if(turn_id).await);
-                        });
-                    }
                     self.status = self.tr(TextId::StatusCancelling).to_string();
                     return;
                 }
@@ -329,7 +321,7 @@ impl App {
                 self.pending_steering_flush = true;
             }
             RuntimeEvent::TurnCancelled { .. } => self.finish_turn_cancelled(),
-            RuntimeEvent::Error { message, .. } => {
+            RuntimeEvent::Error { kind, message, .. } => {
                 if self.is_streaming
                     && self
                         .streaming_since
@@ -337,7 +329,13 @@ impl App {
                 {
                     self.request_notification(crate::app::Notification::TurnFailed);
                 }
-                self.record_error(message);
+                if kind == RuntimeFailureKind::Submission {
+                    let hint = self.tr(TextId::RetryHint);
+                    self.record_error(format!("{message}\n{hint}"));
+                    self.status = self.tr(TextId::StatusSendFailed).to_owned();
+                } else {
+                    self.record_error(message);
+                }
             }
         }
     }

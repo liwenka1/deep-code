@@ -12,6 +12,12 @@
 //! is why this module has a dependency the copy path never needed.
 
 use std::io::Write;
+use std::path::PathBuf;
+
+pub(crate) enum ClipboardImage {
+    File(PathBuf),
+    Encoded(Vec<u8>),
+}
 
 /// An image from the system clipboard.
 ///
@@ -25,10 +31,7 @@ use std::io::Write;
 ///   themselves, and those users are usually copying text.
 /// * `Some(Err(_))` — there is genuinely something to say: an image was found
 ///   and could not be encoded.
-/// * `Some(Ok(bytes))` — image bytes, in one of the four formats
-///   [`deep_code_agent::ImageFormat`] accepts. **Not necessarily PNG**: copying
-///   a file in Finder puts the file itself on the clipboard, and re-encoding it
-///   would only lose quality.
+/// * `Some(Ok(image))` — a selected image file or image pixels encoded as PNG.
 ///
 /// A **non-image file** on the clipboard is not a fourth outcome, and that is a
 /// decision rather than an oversight: it reads as `None`. The alternative —
@@ -37,7 +40,7 @@ use std::io::Write;
 /// sixty characters of path for a file the model still cannot open is a worse
 /// surprise than silence. Dropping a file onto the terminal, or naming it with
 /// `@`, is how a path gets into a prompt.
-pub(crate) fn read_image() -> Option<Result<Vec<u8>, String>> {
+pub(crate) fn read_image() -> Option<Result<ClipboardImage, String>> {
     // Over SSH there is no *local* clipboard to read: the terminal's own paste is
     // how text gets in, and `arboard` would either fail or hand back the remote
     // host's clipboard — which is not what the user just copied. Reading is the
@@ -53,19 +56,11 @@ pub(crate) fn read_image() -> Option<Result<Vec<u8>, String>> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
 
     // A file copied in Finder (or Explorer) is a file LIST, not pixels, and the
-    // file is already where we want it — so prefer it, and hand back its bytes
-    // untouched.
+    // file can be snapshotted directly without buffering it in the clipboard path.
     if let Ok(files) = clipboard.get().file_list() {
         for file in files {
-            // `inspect` before `read`: it is a metadata check plus a 16-byte
-            // header sniff, so a file we would refuse anyway — too big, not an
-            // image, already gone — costs nothing. Reading first would pull a
-            // multi-gigabyte file into memory to find out.
-            if deep_code_agent::inspect(&file).is_err() {
-                continue;
-            }
-            if let Ok(bytes) = std::fs::read(&file) {
-                return Some(Ok(bytes));
+            if deep_code_agent::inspect(&file).is_ok() {
+                return Some(Ok(ClipboardImage::File(file)));
             }
         }
     }
@@ -74,7 +69,7 @@ pub(crate) fn read_image() -> Option<Result<Vec<u8>, String>> {
     // browser — and those arrive as raw RGBA, which has to be encoded before it
     // can be sent anywhere.
     match clipboard.get_image() {
-        Ok(image) => Some(encode_png(image)),
+        Ok(image) => Some(encode_png(image).map(ClipboardImage::Encoded)),
         Err(_) => None,
     }
 }

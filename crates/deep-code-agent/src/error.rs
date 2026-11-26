@@ -1,8 +1,64 @@
+use std::sync::LazyLock;
+
+use regex::Regex;
 use thiserror::Error;
 
 use crate::i18n::{Lang, TextId, tr, tr_with};
 
 pub type AgentResult<T> = Result<T, AgentError>;
+
+/// Keep provider diagnostics useful while removing a configured credential.
+pub(crate) fn redact_api_key(key: Option<&str>, mut message: String, truncated: bool) -> String {
+    let Some(key) = crate::config::normalized_api_key(key) else {
+        return message;
+    };
+    // Match complete strings and a final string cut short by the HTTP body cap.
+    static JSON_STRING: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#""(?:[^"\\\r\n]|\\.)*(?:(")|\\?$)"#).expect("JSON string pattern")
+    });
+    if message.contains('\\') {
+        let mut redacted = String::new();
+        let mut copied = 0;
+        for captures in JSON_STRING.captures_iter(&message) {
+            let token = captures.get(0).expect("JSON string match");
+            if !token.as_str().contains('\\') {
+                continue;
+            }
+            let replacement = if captures.get(1).is_some() {
+                serde_json::from_str::<String>(token.as_str())
+                    .ok()
+                    .filter(|decoded| decoded.contains(key))
+                    .map(|decoded| decoded.replace(key, "[redacted]"))
+            } else if truncated {
+                match serde_json::from_str::<String>(&format!("{}\"", token.as_str())) {
+                    Ok(decoded) if decoded.contains(key) => {
+                        Some(decoded.replace(key, "[redacted]"))
+                    }
+                    Ok(_) => None,
+                    // A cut through an escape leaves this fragment undecodable.
+                    Err(_) => Some("[truncated JSON string]".into()),
+                }
+            } else {
+                None
+            };
+            let Some(replacement) = replacement else {
+                continue;
+            };
+            redacted.push_str(&message[copied..token.start()]);
+            redacted.push_str(&serde_json::to_string(&replacement).expect("a string serializes"));
+            copied = token.end();
+        }
+        if copied > 0 {
+            redacted.push_str(&message[copied..]);
+            message = redacted;
+        }
+    }
+    if message.contains(key) {
+        message.replace(key, "[redacted]")
+    } else {
+        message
+    }
+}
 
 /// `Display` stays English and terse — it is the log/`{:?}` form for
 /// developers. User-facing text (localized, with guidance) comes from
@@ -36,8 +92,8 @@ pub enum AgentError {
     #[error("request timed out: no response headers within {seconds}s")]
     RequestTimeout { seconds: u64 },
 
-    #[error("request body exceeded {limit_bytes} bytes (actual: {actual_bytes})")]
-    RequestTooLarge { limit_bytes: u64, actual_bytes: u64 },
+    #[error("{0}")]
+    Attachment(String),
 
     #[error("stream stalled: no data for {seconds}s")]
     StreamStalled { seconds: u64 },
@@ -49,47 +105,7 @@ pub enum AgentError {
     StreamOverflow { limit_bytes: u64 },
 }
 
-/// Provider phrases that name the context window in a rejected request's body.
-///
-/// Both spellings are OpenAI-compatible: the code half
-/// (`context_length_exceeded`) and the human half ("This model's maximum
-/// context length is N tokens"). The list is a list precisely because the body
-/// belongs to the provider, not to us — a third spelling costs one more entry
-/// and nothing else.
-///
-/// Matched against the RAW body rather than a parsed field: the code appears
-/// verbatim in the JSON, so parsing would add a failure mode (a proxy returning
-/// a non-JSON page) without adding any reach.
-const CONTEXT_WINDOW_HINTS: &[&str] = &["context_length_exceeded", "context length"];
-
 impl AgentError {
-    /// Does this look like the provider refusing the request because it
-    /// exceeded the model's context window?
-    ///
-    /// Only answers for a `400`; a `429`/`5xx` is the retry path's business, and
-    /// the two must not be confused — one retries the same request, the other
-    /// has to shrink it first.
-    ///
-    /// Asymmetric on purpose. `false` is always safe: the caller falls back to
-    /// reporting the error exactly as it did before. A wrong `true` costs one
-    /// wasted request. That is why the caller pairs this with its own token
-    /// estimate rather than trusting the provider's wording alone, and why the
-    /// match is on a couple of distinctive phrases rather than anything looser
-    /// ("too long" would catch unrelated 400s).
-    #[must_use]
-    pub fn blames_context_window(&self) -> bool {
-        let Self::Api { status, message } = self else {
-            return false;
-        };
-        if status.as_u16() != 400 {
-            return false;
-        }
-        let lowered = message.to_ascii_lowercase();
-        CONTEXT_WINDOW_HINTS
-            .iter()
-            .any(|hint| lowered.contains(hint))
-    }
-
     /// The localized, guidance-carrying message shown to the user (status line
     /// + error cell). `Display` remains the English log form.
     #[must_use]
@@ -98,22 +114,11 @@ impl AgentError {
             Self::UnknownModel => tr(lang, TextId::ErrUnknownModel).to_string(),
             Self::MissingApiKey => tr(lang, TextId::ErrMissingApiKey).to_string(),
             Self::Http(error) => tr_with(lang, TextId::ErrHttp, &[("error", &error.to_string())]),
-            Self::Api { status, message } => {
-                let id = if *status == reqwest::StatusCode::UNAUTHORIZED {
-                    TextId::ErrApiUnauthorized
-                } else if *status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    TextId::ErrApiRateLimited
-                } else if status.is_server_error() {
-                    TextId::ErrApiServer
-                } else {
-                    TextId::ErrApiGeneric
-                };
-                tr_with(
-                    lang,
-                    id,
-                    &[("status", status.as_str()), ("message", message)],
-                )
-            }
+            Self::Api { status, message } => tr_with(
+                lang,
+                TextId::ErrApiGeneric,
+                &[("status", status.as_str()), ("message", message)],
+            ),
             Self::Parse(detail) => tr_with(lang, TextId::ErrParse, &[("detail", detail)]),
             Self::Serde(error) => {
                 tr_with(lang, TextId::ErrSerde, &[("detail", &error.to_string())])
@@ -123,17 +128,7 @@ impl AgentError {
                 TextId::ErrRequestTimeout,
                 &[("seconds", &seconds.to_string())],
             ),
-            Self::RequestTooLarge {
-                limit_bytes,
-                actual_bytes,
-            } => tr_with(
-                lang,
-                TextId::ErrRequestTooLarge,
-                &[
-                    ("limit", &limit_bytes.to_string()),
-                    ("actual", &actual_bytes.to_string()),
-                ],
-            ),
+            Self::Attachment(message) => message.clone(),
             Self::StreamStalled { seconds } => tr_with(
                 lang,
                 TextId::ErrStreamStalled,
@@ -178,55 +173,14 @@ mod tests {
     }
 
     #[test]
-    fn api_error_selects_variant_by_status() {
+    fn api_error_shows_provider_status_and_message() {
         let unauthorized = AgentError::Api {
             status: reqwest::StatusCode::UNAUTHORIZED,
             message: "bad key".to_string(),
         };
-        assert!(unauthorized.user_message(Lang::Zh).contains("鉴权失败"));
-        assert!(
-            unauthorized
-                .user_message(Lang::En)
-                .contains("authentication failed")
-        );
-    }
-
-    #[test]
-    fn only_a_400_mentioning_the_context_window_blames_it() {
-        let api = |status: u16, message: &str| AgentError::Api {
-            status: reqwest::StatusCode::from_u16(status).unwrap(),
-            message: message.to_string(),
-        };
-
-        // Both spellings the provider may use for the same refusal.
-        assert!(
-            api(
-                400,
-                r#"{"error":{"message":"This model's maximum context length is 131072 tokens.","code":"context_length_exceeded"}}"#
-            )
-            .blames_context_window()
-        );
-        assert!(
-            api(
-                400,
-                r#"{"error":{"message":"This model's maximum context length is 131072 tokens."}}"#
-            )
-            .blames_context_window()
-        );
-
-        // A 400 naming something else must not reach the compaction path: it
-        // would burn a compaction and a request before reporting the real
-        // problem.
-        assert!(
-            !api(400, r#"{"error":{"message":"invalid tool schema"}}"#).blames_context_window()
-        );
-        // ...and neither must a context-flavoured message that is NOT a 400 —
-        // a 429 is the retry path's, and must keep retrying the same request.
-        assert!(
-            !api(429, "context length exceeded, slow down").blames_context_window(),
-            "a retriable status must never be re-read as an overflow"
-        );
-        // Non-API variants have no body to read.
-        assert!(!AgentError::RequestTimeout { seconds: 30 }.blames_context_window());
+        for lang in [Lang::Zh, Lang::En] {
+            let message = unauthorized.user_message(lang);
+            assert!(message.contains("401") && message.contains("bad key"));
+        }
     }
 }

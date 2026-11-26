@@ -119,7 +119,7 @@ impl ReadFileTool {
         cancel: &CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         use crate::content::Content;
-        use crate::image::{ImageFormat, MAX_IMAGE_BYTES, snapshot_bytes};
+        use crate::image::{ImageFormat, MAX_TOOL_IMAGE_BYTES, snapshot_bytes};
         use std::io::{Read, Seek, SeekFrom};
 
         if cancel.is_cancelled() {
@@ -164,9 +164,15 @@ impl ReadFileTool {
                 ));
             }
             let mut bytes = Vec::new();
-            file.take(MAX_IMAGE_BYTES + 1)
+            file.take(MAX_TOOL_IMAGE_BYTES + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|error| ToolError::exec_failed(Self::NAME, error.to_string()))?;
+            if bytes.len() as u64 > MAX_TOOL_IMAGE_BYTES {
+                return Err(invalid(
+                    Self::NAME,
+                    "an image read by a tool exceeds 32 MiB",
+                ));
+            }
             if cancel.is_cancelled() {
                 return Err(ToolError::exec_failed(Self::NAME, "read cancelled"));
             }

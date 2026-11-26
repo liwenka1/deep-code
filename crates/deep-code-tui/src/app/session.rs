@@ -114,6 +114,7 @@ impl App {
         self.pending_launch_warnings = warnings;
         // The permission warning was shown for the outgoing runtime.
         self.cancel_yolo_confirmation();
+        self.discard_image_work();
         self.runtime = handle;
         self.backend_label = backend_label;
         self.backend_offline = offline;

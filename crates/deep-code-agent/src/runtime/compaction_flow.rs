@@ -47,10 +47,6 @@ pub(super) enum Trigger {
     /// The persisted record is approaching a JSON size or entry-count limit.
     /// Preserve room to save even when the summarizer is unavailable.
     StoragePressure,
-    /// The provider refused the request as over its window. Folding is the only
-    /// way the turn can go on, so the mechanical summary stands in when the
-    /// model cannot write one.
-    OverflowRescue,
 }
 
 /// One applied compaction.
@@ -98,9 +94,7 @@ impl AgentRuntime {
     /// newest user message anchors the kept tail): after the first, all that
     /// is left to archive is the previous turn's tail, one entry per step as
     /// the window slides, and each of those folds was a summarizer round trip
-    /// of its own. A failed attempt counts too — the next step would only fail
-    /// the same way, and the overflow rescue is still there if the context
-    /// really runs out.
+    /// of its own. A failed attempt counts too.
     ///
     /// `cancel` is the turn's token: an Esc while the summarizer writes ends
     /// the turn with nothing folded.
@@ -123,7 +117,7 @@ impl AgentRuntime {
             } else if state.threshold_compaction_tried.as_ref() != Some(turn_id)
                 && should_compact(
                     model,
-                    &state.session.wire_messages(),
+                    &state.session.wire_messages_for(Some(turn_id)),
                     self.config.compaction_threshold,
                 )
             {
@@ -187,9 +181,8 @@ impl AgentRuntime {
     }
 
     /// Fold history: ask the model for a handover summary of the archived
-    /// range and replace the range with it. When the model cannot deliver, only
-    /// an overflow rescue or storage pressure folds anyway (mechanically);
-    /// see [`Trigger`].
+    /// range and replace the range with it. Storage pressure can also fold
+    /// mechanically when the model cannot deliver.
     ///
     /// `tx` is `None` for a compaction no turn is running (`/compact`): its
     /// events have no turn stream to ride, so the caller renders the outcome
@@ -203,11 +196,14 @@ impl AgentRuntime {
         focus: Option<&str>,
         cancel: &CancellationToken,
     ) -> FoldOutcome {
-        let entries: Vec<Arc<SessionEntry>> = {
+        let (entries, active_turn) = {
             let state = self.state.lock().await;
-            state.session.entries().to_vec()
+            (
+                state.session.entries().to_vec(),
+                state.current_turn_id.clone(),
+            )
         };
-        let Some(plan) = plan_compaction(&entries) else {
+        let Some(plan) = plan_compaction(&entries, active_turn.as_ref()) else {
             return FoldOutcome::Nothing;
         };
         // The offline backend answers every request with its setup hint, and
@@ -225,7 +221,7 @@ impl AgentRuntime {
             // The turn is ending, or the user changed their mind: either way
             // nothing is folded, and a later compaction has the originals.
             Err(HandoverError::Cancelled) => return FoldOutcome::Cancelled,
-            Err(error) if matches!(trigger, Trigger::OverflowRescue | Trigger::StoragePressure) => {
+            Err(error) if matches!(trigger, Trigger::StoragePressure) => {
                 let reason = match error {
                     HandoverError::Failed(reason) => reason,
                     HandoverError::Offline | HandoverError::Cancelled => "offline".to_string(),
@@ -265,8 +261,8 @@ impl AgentRuntime {
                     .all(|(now, then)| Arc::ptr_eq(now, then));
             let result = if prefix_intact {
                 apply_compaction(&current, &plan, summary)
-            } else if matches!(trigger, Trigger::OverflowRescue | Trigger::StoragePressure) {
-                let Some(plan) = plan_compaction(&current) else {
+            } else if matches!(trigger, Trigger::StoragePressure) {
+                let Some(plan) = plan_compaction(&current, state.current_turn_id.as_ref()) else {
                     return FoldOutcome::Nothing;
                 };
                 fallback_reason =

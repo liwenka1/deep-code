@@ -211,6 +211,75 @@ fn a_bundle_survives_workspace_cleanup_with_images_full_output_and_nested_growin
 }
 
 #[test]
+fn export_copies_and_verifies_large_images_referenced_by_failed_drafts() {
+    use std::io::{Seek, SeekFrom};
+
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().canonicalize().unwrap();
+    let input = source.join("large.gif");
+    std::fs::write(&input, b"GIF89a-source").unwrap();
+    let size = MAX_SOURCE_BYTES + 1;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&input)
+        .unwrap()
+        .set_len(size)
+        .unwrap();
+    let image = crate::image::snapshot_path(&source, &input).unwrap();
+    let store = JsonSessionStore::for_workspace(&source).unwrap();
+    let mut record = SessionRecord::new(source, "system");
+    let mut draft = SessionEntry::user_with_images("draft", vec![image.clone()]);
+    draft.unsent = Some(crate::UnsentMessage {
+        error: Some("provider refused".into()),
+        ..Default::default()
+    });
+    record.entries.push(Arc::new(draft));
+    store.save(&mut record).unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let destination = out.path().join("bundle");
+    let exported = store.export_bundle(&record.id, &destination).unwrap();
+    let entry = exported.entries.last().unwrap();
+    assert!(entry.unsent.is_some());
+    let EntryKind::User { content } = &entry.kind else {
+        panic!("expected draft")
+    };
+    let copied = content.images().next().unwrap();
+    assert_eq!(copied.bytes, size);
+    assert_eq!(copied.digest, image.digest);
+    assert_eq!(copied.workspace, destination.canonicalize().unwrap());
+    copied.verify().unwrap();
+
+    let mut corrupted = std::fs::OpenOptions::new()
+        .write(true)
+        .open(image.path())
+        .unwrap();
+    corrupted.seek(SeekFrom::End(-1)).unwrap();
+    corrupted.write_all(&[0xff]).unwrap();
+    drop(corrupted);
+    let rejected = out.path().join("corrupt-bundle");
+    assert!(
+        store
+            .export_bundle(&record.id, &rejected)
+            .unwrap_err()
+            .to_string()
+            .contains("image asset content changed")
+    );
+    assert_eq!(
+        std::fs::read_dir(rejected.join(".deep-code/images"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(matches!(
+        JsonSessionStore::for_workspace(rejected)
+            .unwrap()
+            .load(&record.id),
+        Err(SessionStoreError::NotFound { .. })
+    ));
+}
+
+#[test]
 fn missing_and_outside_sources_fail_without_publishing_a_successful_export() {
     for outside in [false, true] {
         let workspace = tempfile::tempdir().unwrap();
@@ -427,6 +496,7 @@ fn in_flight_sources_are_bounded_and_successful_siblings_release_their_budget() 
         destination: crate::pinned_dir::open_canonical(&destination_path).unwrap(),
         destination_path,
         copied: HashMap::new(),
+        copied_images: HashSet::new(),
         active: HashSet::new(),
         in_flight_bytes: super::super::MAX_SESSION_BODY_BYTES - 3,
     };

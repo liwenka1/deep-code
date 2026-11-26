@@ -757,7 +757,8 @@ async fn read_file_returns_native_image_observation_with_fixed_identity() {
     );
     let request = crate::ChatRequest::streaming("deepseek-flash", vec![message]);
     let prepared =
-        crate::image::prepare_request_images(request, Some(crate::ImageDetail::Auto), true);
+        crate::image::prepare_request_images(request, Some(crate::ImageDetail::Auto), true, &[])
+            .unwrap();
     assert_eq!(
         prepared
             .images
