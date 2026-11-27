@@ -193,6 +193,9 @@ fn handle_yolo_key<B: Backend>(
 
 /// A terminal may deliver an IME commit as a burst of text keys.
 fn handle_paste(app: &mut App, text: String) {
+    if app.restore_picker.is_some() {
+        return;
+    }
     app.cancel_yolo_confirmation();
     if app.history_search_focused() {
         app.history_search_append(&App::normalize_paste_line_endings(text));
@@ -204,6 +207,14 @@ fn handle_paste(app: &mut App, text: String) {
 /// Route one mouse event; returns the text a finished drag selected, for the
 /// caller to put on the clipboard.
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Option<String> {
+    if app.restore_picker.is_some() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => app.move_restore_picker(-1),
+            MouseEventKind::ScrollDown => app.move_restore_picker(1),
+            _ => {}
+        }
+        return None;
+    }
     // The `/resume` overlay covers the transcript and composer, but the last
     // frame's snapshots outlive it: a drag across the overlay must not copy
     // hidden text, fold an unseen block, or scroll the transcript.
@@ -326,6 +337,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     let shift_tab = is_shift_tab(&key);
     if !shift_tab {
         app.cancel_yolo_confirmation();
+    }
+
+    if app.restore_picker.is_some() {
+        match key.code {
+            KeyCode::Up => app.move_restore_picker(-1),
+            KeyCode::Down => app.move_restore_picker(1),
+            KeyCode::PageUp => app.move_restore_picker(-10),
+            KeyCode::PageDown => app.move_restore_picker(10),
+            KeyCode::Home => app.move_restore_picker(isize::MIN),
+            KeyCode::End => app.move_restore_picker(isize::MAX),
+            KeyCode::Enter if key.modifiers.is_empty() => app.accept_restore_picker(),
+            _ if quit_key.is_some() => app.restore_picker = None,
+            _ => {}
+        }
+        return;
     }
 
     // The `/resume` modal is a full-screen overlay: it owns all keys while open.

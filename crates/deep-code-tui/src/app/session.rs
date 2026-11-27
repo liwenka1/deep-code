@@ -1,6 +1,7 @@
 use super::*;
 use deep_code_agent::{
-    GlobalConfigUpdate, LoadedAgentConfig, RestorePoint, SessionId, write_global_config_update,
+    GlobalConfigUpdate, LoadedAgentConfig, RestorePoint, RestoreRound, SessionId,
+    write_global_config_update,
 };
 
 #[cfg(test)]
@@ -190,7 +191,8 @@ impl App {
 
     async fn stop_current_runtime(&mut self) {
         self.session_scan = None;
-        self.restore_points_scan = None;
+        self.restore_scan = None;
+        self.restore_picker = None;
         self.session_switch = None;
         if let Some(stop) = self.subagent_shutdown.take() {
             stop();
@@ -651,7 +653,7 @@ impl App {
     pub(crate) fn cancel_session_scan(&mut self) -> bool {
         let scan = self.session_scan.take();
         let switch = self.session_switch.take();
-        let restore = self.restore_points_scan.take();
+        let restore = self.restore_scan.take();
         if scan.is_some() || switch.is_some() || restore.is_some() {
             let restoring =
                 restore.is_some() || switch.as_ref().is_some_and(|switch| switch.restoring);
@@ -669,7 +671,7 @@ impl App {
     }
 
     pub(crate) fn restore_command(&mut self, selector: &str) {
-        if !selector.is_empty() && self.runtime_busy() {
+        if self.runtime_busy() {
             self.status = self.busy_status(TextId::BusyRestore);
             return;
         }
@@ -685,11 +687,11 @@ impl App {
         let workspace = self.workspace.clone();
         if selector.is_empty() {
             let scan = crate::session_scan::SessionScan::spawn(move |cancel| {
-                JsonSessionStore::for_pinned_workspace(&workspace)?.restore_points(&id, &cancel)
+                JsonSessionStore::for_pinned_workspace(&workspace)?.restore_rounds(&id, &cancel)
             });
             match scan {
                 Ok(task) => {
-                    self.restore_points_scan = Some(task);
+                    self.restore_scan = Some(task);
                     self.status = self.tr(TextId::StatusReadingRestorePoints).to_string();
                 }
                 Err(error) => {
@@ -730,23 +732,42 @@ impl App {
         )
     }
 
-    fn show_restore_points(&mut self, points: Vec<RestorePoint>) {
-        if points.is_empty() {
-            self.status = self.tr(TextId::NoCheckpoints).to_string();
-            return;
+    pub(crate) fn move_restore_picker(&mut self, by: isize) {
+        if let Some(picker) = &mut self.restore_picker {
+            picker.selected = picker
+                .selected
+                .saturating_add_signed(by)
+                .min(picker.rounds.len() - 1);
         }
-        let mut lines = vec![self.tr(TextId::CheckpointsHeader).to_string()];
-        lines.extend(
-            points
+    }
+
+    pub(crate) fn accept_restore_picker(&mut self) {
+        let point = self.restore_picker.as_ref().and_then(|picker| {
+            picker.rounds[picker.selected]
+                .checkpoints
                 .iter()
-                .map(|point| format!("- {}  {}", self.restore_point_label(point), point.id.0)),
-        );
-        lines.push(self.tr(TextId::UsageRestore).to_string());
-        self.history.push(HistoryCell::system(lines.join("\n")));
-        self.status = self.tr_with(
-            TextId::CheckpointsCount,
-            &[("count", &points.len().to_string())],
-        );
+                .min_by_key(|point| point.before_turn)
+        });
+        if let Some(point) = point {
+            let selector = point.id.0.clone();
+            self.restore_picker = None;
+            self.restore_command(&selector);
+        }
+    }
+
+    fn show_restore_rounds(&mut self, mut rounds: Vec<RestoreRound>) {
+        if rounds.is_empty() {
+            self.status = self.tr(TextId::NoCheckpoints).to_string();
+        } else if self.runtime_busy() {
+            self.status = self.busy_status(TextId::BusyRestore);
+        } else {
+            rounds.reverse();
+            self.restore_picker = Some(RestorePicker {
+                rounds,
+                selected: 0,
+            });
+            self.status.clear();
+        }
     }
 
     /// Nonblocking: the terminal loop still drains keys and runtime events
@@ -757,13 +778,13 @@ impl App {
             return true;
         }
         if let Some(result) = self
-            .restore_points_scan
+            .restore_scan
             .as_mut()
             .and_then(|task| task.try_result())
         {
-            self.restore_points_scan = None;
+            self.restore_scan = None;
             match result {
-                Ok(points) => self.show_restore_points(points),
+                Ok(rounds) => self.show_restore_rounds(rounds),
                 Err(error) => {
                     self.status =
                         self.tr_with(TextId::RestoreFailed, &[("error", &error.to_string())])

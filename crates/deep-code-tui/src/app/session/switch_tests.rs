@@ -51,7 +51,7 @@ fn app_with_restore_point() -> (tempfile::TempDir, App, SessionRecord) {
 
 async fn finish_restore_request(app: &mut App) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        while app.restore_points_scan.is_some() || app.session_switch.is_some() {
+        while app.restore_scan.is_some() || app.session_switch.is_some() {
             app.poll_session_scan();
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -65,12 +65,15 @@ async fn restore_lists_the_round_and_switches_to_an_independently_resumable_work
     let (_parent, mut app, source) = app_with_restore_point();
     assert!(app.handle_slash_command("/restore"));
     finish_restore_request(&mut app).await;
-    assert!(
-        matches!(app.history.last(), Some(HistoryCell::System { text })
-        if text.contains("第 1 轮结束") && text.contains("after_turn_1"))
-    );
-    app.insert_str_at_cursor("/restore 1");
-    app.submit();
+    let picker = app.restore_picker.as_ref().expect("restore picker");
+    assert_eq!(picker.rounds[0].round, 2);
+    assert!(picker.rounds[0].checkpoints.is_empty());
+    assert_eq!(picker.rounds[1].prompt.as_deref(), Some("first question"));
+    assert_eq!(picker.rounds[1].checkpoints[0].id.0, "after_turn_1");
+    app.accept_restore_picker();
+    assert!(app.session_switch.is_none(), "round 2 has no snapshot");
+    app.move_restore_picker(1);
+    app.accept_restore_picker();
     assert_eq!(app.workspace, source.workspace);
     finish_restore_request(&mut app).await;
     assert_ne!(app.workspace, source.workspace, "{}", app.status);

@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use super::{CheckpointRecord, JsonSessionStore, SessionId, SessionRecord, SessionStoreError};
+use super::{
+    CheckpointRecord, JsonSessionStore, SessionId, SessionRecord, SessionStoreError, TurnRecord,
+};
 use crate::checkpoint::{CheckpointId, CheckpointStore};
 use crate::runtime::TurnId;
 use crate::session_entry::{EntryKind, SessionEntry};
@@ -15,6 +17,15 @@ pub struct RestorePoint {
     pub id: CheckpointId,
     pub round: usize,
     pub before_turn: bool,
+}
+
+/// A saved conversation round, including those without a workspace snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreRound {
+    pub round: usize,
+    pub prompt: Option<String>,
+    pub image_count: usize,
+    pub checkpoints: Vec<RestorePoint>,
 }
 
 /// A saved branch whose private workspace is removed if the caller abandons it.
@@ -97,6 +108,56 @@ impl JsonSessionStore {
             .collect())
     }
 
+    /// List rounds with prompt previews from the original transcript. Read one
+    /// archive at a time to keep the picker independent of transcript length.
+    pub fn restore_rounds(
+        &self,
+        session: &SessionId,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<RestoreRound>, SessionStoreError> {
+        let record = self.restore_source(session, cancel)?;
+        let mut numbers = HashMap::new();
+        let mut rounds: Vec<_> = numbered_turns(&record)
+            .map(|(round, turn)| {
+                numbers.insert(&turn.id, round);
+                RestoreRound {
+                    round,
+                    prompt: None,
+                    image_count: 0,
+                    checkpoints: Vec::new(),
+                }
+            })
+            .collect();
+        for (_, point) in self.available_points(&record)? {
+            rounds[point.round - 1].checkpoints.push(point);
+        }
+        // Read newest to oldest, so if a turn has steering messages in
+        // different segments the opening prompt supplies the final preview.
+        let mut preview = |entries: &[Arc<SessionEntry>]| {
+            for entry in entries.iter().rev().filter(|entry| entry.unsent.is_none()) {
+                let Some(round) = entry.turn_id.as_ref().and_then(|id| numbers.get(id)) else {
+                    continue;
+                };
+                if let EntryKind::User { content } = &entry.kind {
+                    let round = &mut rounds[round - 1];
+                    let mut chars = content.text_blocks().flat_map(str::chars);
+                    let mut text: String = chars.by_ref().take(120).collect();
+                    if chars.next().is_some() {
+                        text.push('…');
+                    }
+                    round.prompt = Some(text.split_whitespace().collect::<Vec<_>>().join(" "));
+                    round.image_count += content.image_count();
+                }
+            }
+        };
+        preview(&record.entries);
+        self.visit_archives(&record.entries, cancel, |archive| {
+            preview(&archive.entries);
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(rounds)
+    }
+
     /// Build the conversation up to a restore point under a new session id.
     /// The selector is a round number for completed turns or a checkpoint id.
     pub fn session_at_checkpoint(
@@ -168,13 +229,8 @@ impl JsonSessionStore {
         }
         let store = CheckpointStore::new(self.workspace_path()).map_err(restore_error)?;
         let saved = store.list().map_err(restore_error)?;
-        let drafts = draft_turns(&record.entries);
-        let rounds: HashMap<_, _> = record
-            .turns
-            .iter()
-            .filter(|turn| !drafts.contains(&turn.id))
-            .enumerate()
-            .map(|(index, turn)| (&turn.id, index + 1))
+        let rounds: HashMap<_, _> = numbered_turns(record)
+            .map(|(round, turn)| (&turn.id, round))
             .collect();
         Ok(record
             .checkpoints
@@ -276,6 +332,16 @@ fn draft_turns(entries: &[Arc<SessionEntry>]) -> HashSet<&TurnId> {
         .filter(|entry| entry.unsent.is_some())
         .filter_map(|entry| entry.turn_id.as_ref())
         .collect()
+}
+
+fn numbered_turns(record: &SessionRecord) -> impl Iterator<Item = (usize, &TurnRecord)> {
+    let drafts = draft_turns(&record.entries);
+    record
+        .turns
+        .iter()
+        .filter(move |turn| !drafts.contains(&turn.id))
+        .enumerate()
+        .map(|(index, turn)| (index + 1, turn))
 }
 
 fn restore_error(error: impl std::fmt::Display) -> SessionStoreError {

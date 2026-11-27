@@ -23,6 +23,7 @@ use super::COMPOSER_MAX_VISIBLE_ROWS;
 mod approval;
 mod completion;
 mod composer;
+mod restore;
 mod transcript;
 
 // Flatten the submodules back into this namespace: the split is file
@@ -39,6 +40,12 @@ pub(crate) use composer::{char_index_at, layout_input, neutralize_composer_text}
 pub(crate) use transcript::sanitize_for_clipboard;
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
+    if let Some(picker) = &app.restore_picker {
+        app.yolo_confirmation.set_visible(None);
+        restore::render_restore_picker(frame, picker, app.lang);
+        app.composer = None;
+        return;
+    }
     if let Some(picker) = &app.resume_picker {
         app.yolo_confirmation.set_visible(None);
         render_resume_picker(frame, picker, app.lang);

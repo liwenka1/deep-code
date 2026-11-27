@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 pub use json::JsonSessionStore;
 pub(crate) use json::StoreLock;
-pub use restore::{PreparedRestore, RestorePoint};
+pub use restore::{PreparedRestore, RestorePoint, RestoreRound};
 
 /// Make sure `<state_dir>/.gitignore` excludes everything, for every writer of
 /// `<workspace>/.deep-code` — not just whichever one happens to run first.

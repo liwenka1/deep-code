@@ -288,12 +288,12 @@ pub struct App {
     /// Open `/resume` modal: rendered as an in-app overlay (no alt-screen
     /// churn, so switching sessions doesn't flicker) over the live TUI.
     pub(crate) resume_picker: Option<ResumePicker>,
+    pub(crate) restore_picker: Option<RestorePicker>,
     /// Open `/model` picker. The model and effort menus are edited in memory
     /// and applied together when the second Enter is pressed.
     pub(crate) model_picker: Option<ModelPicker>,
     session_scan: Option<session::PendingSessionScan>,
-    restore_points_scan:
-        Option<crate::session_scan::SessionScan<Vec<deep_code_agent::RestorePoint>>>,
+    restore_scan: Option<crate::session_scan::SessionScan<Vec<deep_code_agent::RestoreRound>>>,
     session_switch: Option<session::PendingSessionSwitch>,
     session_cleanup: Vec<crate::session_switch::SessionCleanup>,
     /// UI language, resolved from config at launch; `/lang` switches it live.
@@ -314,6 +314,11 @@ pub struct App {
 /// the highlighted row.
 pub(crate) struct ResumePicker {
     pub(crate) sessions: Vec<SessionRecord>,
+    pub(crate) selected: usize,
+}
+
+pub(crate) struct RestorePicker {
+    pub(crate) rounds: Vec<deep_code_agent::RestoreRound>,
     pub(crate) selected: usize,
 }
 
@@ -977,9 +982,10 @@ impl App {
             composer: None,
             composer_scroll: 0,
             resume_picker: None,
+            restore_picker: None,
             model_picker: None,
             session_scan: None,
-            restore_points_scan: None,
+            restore_scan: None,
             session_switch: None,
             session_cleanup: Vec::new(),
             lang,
@@ -1012,6 +1018,7 @@ impl App {
             && self.permission_mode() == deep_code_agent::PermissionMode::AcceptEdits
             && self.pending_approval.is_none()
             && !self.resume_picker_open()
+            && self.restore_picker.is_none()
             && !self.model_picker_open()
             && !self.history_search_open()
     }

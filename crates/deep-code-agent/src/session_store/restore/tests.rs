@@ -70,6 +70,17 @@ fn session_at_checkpoint_uses_the_round_boundary_even_inside_archives() {
     }
     store.save(&mut source).unwrap();
     let cancel = CancellationToken::new();
+    std::fs::remove_dir(source.workspace.join(".deep-code/checkpoints/after_turn_1")).unwrap();
+    let rounds = store.restore_rounds(&source.id, &cancel).unwrap();
+    assert_eq!(
+        rounds.len(),
+        12,
+        "failed submissions do not count as rounds"
+    );
+    assert_eq!(rounds[0].prompt.as_deref(), Some("question 1"));
+    assert!(rounds[0].checkpoints.is_empty());
+    assert_eq!(rounds[9].prompt.as_deref(), Some("question 10"));
+    assert_eq!(rounds[9].checkpoints.len(), 2);
     let before_ten = before_ten.unwrap();
     let projections = [("3", 3), ("10", 10), (before_ten.0.as_str(), 9)];
     for (selector, expected) in projections {
