@@ -172,12 +172,18 @@ fn preparing_or_abandoning_a_restore_never_publishes_a_partial_session() {
     drop(prepared);
     assert!(!fork.exists());
 
-    std::fs::remove_file(image.path()).unwrap();
-    let error = store
+    let missing_path = image.path();
+    std::fs::remove_file(&missing_path).unwrap();
+    let diagnostic = store
         .prepare_restore(&record.id, "1", &cancel)
         .err()
-        .unwrap();
-    assert!(error.to_string().contains(".deep-code/images"));
+        .expect("a restore with a missing attachment must fail")
+        .to_string();
+    assert!(
+        diagnostic.contains("image unavailable")
+            && diagnostic.contains(missing_path.to_string_lossy().as_ref()),
+        "{diagnostic}"
+    );
     cancel.cancel();
     assert!(matches!(
         store.prepare_restore(&record.id, "1", &cancel),
