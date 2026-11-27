@@ -158,6 +158,49 @@ impl JsonSessionStore {
         Ok(rounds)
     }
 
+    /// Load the saved original entries for one round independently of its
+    /// workspace snapshot and the active model context.
+    pub fn restore_round_entries(
+        &self,
+        session: &SessionId,
+        round: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Arc<SessionEntry>>, SessionStoreError> {
+        let record = self.restore_source(session, cancel)?;
+        let (_, turn) = numbered_turns(&record)
+            .find(|(number, _)| *number == round)
+            .ok_or_else(|| {
+                restore_error(format!("round {round} is unavailable in this conversation"))
+            })?;
+        let mut entries = Vec::new();
+        let mut collect = |segment: &[Arc<SessionEntry>]| {
+            entries.extend(
+                segment
+                    .iter()
+                    .rev()
+                    .filter(|entry| {
+                        entry.unsent.is_none() && entry.turn_id.as_ref() == Some(&turn.id)
+                    })
+                    .cloned(),
+            );
+        };
+        collect(&record.entries);
+        self.visit_archives(&record.entries, cancel, |archive| {
+            collect(&archive.entries);
+            Ok(ControlFlow::Continue(()))
+        })?;
+        if !entries
+            .iter()
+            .any(|entry| matches!(entry.kind, EntryKind::User { .. }))
+        {
+            return Err(restore_error(format!(
+                "original messages for round {round} are unavailable"
+            )));
+        }
+        entries.reverse();
+        Ok(entries)
+    }
+
     /// Build the conversation up to a restore point under a new session id.
     /// The selector is a round number for completed turns or a checkpoint id.
     pub fn session_at_checkpoint(
@@ -175,8 +218,16 @@ impl JsonSessionStore {
                 point.id.0 == selector || (!point.before_turn && round == Some(point.round))
             })
             .ok_or_else(|| {
+                let exists = round.is_some_and(|round| {
+                    numbered_turns(&source).any(|(number, _)| number == round)
+                });
+                let reason = if exists {
+                    "there is no saved end-of-round workspace snapshot"
+                } else {
+                    "it is not recorded in this conversation"
+                };
                 restore_error(format!(
-                    "restore point '{selector}' is unavailable in this conversation"
+                    "restore point '{selector}' is unavailable: {reason}"
                 ))
             })?;
         let mut entries =

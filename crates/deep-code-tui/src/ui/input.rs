@@ -193,7 +193,7 @@ fn handle_yolo_key<B: Backend>(
 
 /// A terminal may deliver an IME commit as a burst of text keys.
 fn handle_paste(app: &mut App, text: String) {
-    if app.restore_picker.is_some() {
+    if app.restore_overlay_open() {
         return;
     }
     app.cancel_yolo_confirmation();
@@ -207,6 +207,14 @@ fn handle_paste(app: &mut App, text: String) {
 /// Route one mouse event; returns the text a finished drag selected, for the
 /// caller to put on the clipboard.
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Option<String> {
+    if let Some(reader) = &mut app.restore_reader {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => reader.scroll_by(-3),
+            MouseEventKind::ScrollDown => reader.scroll_by(3),
+            _ => {}
+        }
+        return None;
+    }
     if app.restore_picker.is_some() {
         match mouse.kind {
             MouseEventKind::ScrollUp => app.move_restore_picker(-1),
@@ -339,6 +347,23 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         app.cancel_yolo_confirmation();
     }
 
+    if let Some(reader) = &mut app.restore_reader {
+        let page = reader.height.max(1) as isize;
+        match key.code {
+            KeyCode::Left => reader.move_entry(-1),
+            KeyCode::Right => reader.move_entry(1),
+            KeyCode::Up => reader.scroll_by(-1),
+            KeyCode::Down => reader.scroll_by(1),
+            KeyCode::PageUp => reader.scroll_by(-page),
+            KeyCode::PageDown => reader.scroll_by(page),
+            KeyCode::Home => reader.scroll = 0,
+            KeyCode::End => reader.scroll = usize::MAX,
+            _ if quit_key.is_some() => app.close_restore_overlay(),
+            _ => {}
+        }
+        return;
+    }
+
     if app.restore_picker.is_some() {
         match key.code {
             KeyCode::Up => app.move_restore_picker(-1),
@@ -348,7 +373,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Home => app.move_restore_picker(isize::MIN),
             KeyCode::End => app.move_restore_picker(isize::MAX),
             KeyCode::Enter if key.modifiers.is_empty() => app.accept_restore_picker(),
-            _ if quit_key.is_some() => app.restore_picker = None,
+            KeyCode::Char('v' | 'V')
+                if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() =>
+            {
+                app.preview_restore_round();
+            }
+            _ if quit_key.is_some() => app.close_restore_overlay(),
             _ => {}
         }
         return;
@@ -946,6 +976,53 @@ mod tests {
             .collect();
         let caret = terminal.get_cursor_position().unwrap();
         (rows, (caret.x, caret.y))
+    }
+
+    #[test]
+    fn restored_round_reader_scrolls_original_entries_and_returns_to_the_draft() {
+        use crate::app::{RestorePicker, RestoreReader};
+        use deep_code_agent::{RestoreRound, SessionEntry};
+        use std::sync::Arc;
+
+        let mut app = en_app("unsent draft");
+        app.restore_picker = Some(RestorePicker {
+            rounds: vec![RestoreRound {
+                round: 1,
+                prompt: Some("original prompt".into()),
+                image_count: 0,
+                checkpoints: Vec::new(),
+            }],
+            selected: 0,
+        });
+        app.restore_reader = Some(RestoreReader {
+            round: 1,
+            entries: vec![
+                Arc::new(SessionEntry::user("original prompt")),
+                Arc::new(SessionEntry::assistant(
+                    format!("{}last saved line", "long response\n\n".repeat(40)),
+                    None,
+                    Vec::new(),
+                )),
+            ],
+            selected: 0,
+            scroll: 0,
+            height: 0,
+            lines: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let (rows, _) = draw(&mut terminal, &mut app);
+        assert!(rows.iter().any(|row| row.contains("original prompt")));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        let (rows, _) = draw(&mut terminal, &mut app);
+        assert!(rows.iter().any(|row| row.contains("last saved line")));
+
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, escape);
+        assert!(app.restore_reader.is_none() && app.restore_picker.is_some());
+        handle_key(&mut app, escape);
+        assert!(!app.restore_overlay_open());
+        assert_eq!(app.input, "unsent draft");
     }
 
     fn show_yolo_key_hint(terminal: &mut Terminal<TestBackend>, app: &mut App) -> Vec<String> {

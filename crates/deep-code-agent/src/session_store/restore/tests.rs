@@ -81,6 +81,19 @@ fn session_at_checkpoint_uses_the_round_boundary_even_inside_archives() {
     assert!(rounds[0].checkpoints.is_empty());
     assert_eq!(rounds[9].prompt.as_deref(), Some("question 10"));
     assert_eq!(rounds[9].checkpoints.len(), 2);
+    let entries = store
+        .restore_round_entries(&source.id, 10, &cancel)
+        .unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(
+        matches!(&entries[0].kind, EntryKind::User { content } if content.text() == "question 10")
+    );
+    assert!(
+        matches!(&entries[1].kind, EntryKind::User { content } if content.text() == "steering within 10")
+    );
+    assert!(
+        matches!(&entries[2].kind, EntryKind::Assistant { content, .. } if content == "answer 10")
+    );
     let before_ten = before_ten.unwrap();
     let projections = [("3", 3), ("10", 10), (before_ten.0.as_str(), 9)];
     for (selector, expected) in projections {
@@ -110,6 +123,85 @@ fn session_at_checkpoint_uses_the_round_boundary_even_inside_archives() {
             EntryKind::Assistant { content, .. } if content == &format!("answer {expected}")));
     }
     assert_eq!(store.load(&source.id).unwrap(), source);
+}
+
+#[test]
+fn a_restore_too_long_for_live_history_keeps_readable_original_rounds() {
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("original");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = crate::canonicalize(&workspace).unwrap();
+    let store = JsonSessionStore::for_pinned_workspace(&workspace).unwrap();
+    let mut record = SessionRecord::new(workspace.clone(), "system");
+    let first = TurnId::new();
+    let middle = TurnId::new();
+    let last = TurnId::new();
+    let bytes = b"GIF89a-original-round-one-image";
+    let image = crate::snapshot_bytes(&workspace, bytes).unwrap();
+    let mut archived = vec![
+        Arc::new(
+            SessionEntry::user_with_images("old question", vec![image]).with_turn_id(first.clone()),
+        ),
+        Arc::new(
+            SessionEntry::assistant("old answer", None, Vec::new()).with_turn_id(first.clone()),
+        ),
+        Arc::new(SessionEntry::user("long middle round").with_turn_id(middle.clone())),
+    ];
+    let limit = crate::session_store::MAX_SESSION_ENTRIES;
+    archived.extend((archived.len()..limit).map(|_| {
+        Arc::new(
+            SessionEntry::assistant("middle output", None, Vec::new()).with_turn_id(middle.clone()),
+        )
+    }));
+    let mut summary = SessionEntry::compaction("summary", archived.len());
+    let EntryKind::Compaction { has_archive, .. } = &mut summary.kind else {
+        unreachable!("compaction entry");
+    };
+    *has_archive = true;
+    store
+        .save_compaction_archive(&summary.id, archived)
+        .unwrap();
+    record.entries.extend([
+        Arc::new(summary),
+        Arc::new(SessionEntry::user("selected question").with_turn_id(last.clone())),
+        Arc::new(
+            SessionEntry::assistant("selected answer", None, Vec::new()).with_turn_id(last.clone()),
+        ),
+    ]);
+    record.turns.extend(
+        [first, middle, last.clone()]
+            .into_iter()
+            .map(TurnRecord::new),
+    );
+    save_point(&mut record, &last, "after_turn", 3);
+    store.save(&mut record).unwrap();
+
+    let cancel = CancellationToken::new();
+    let fork = store
+        .prepare_restore(&record.id, "3", &cancel)
+        .unwrap()
+        .commit();
+    assert!(
+        fork.summary.is_some(),
+        "the copied history must remain archived"
+    );
+    let fork_store = JsonSessionStore::for_pinned_workspace(&fork.workspace).unwrap();
+    let entries = fork_store
+        .restore_round_entries(&fork.id, 1, &cancel)
+        .unwrap();
+    let [question, answer] = entries.as_slice() else {
+        panic!("expected the original question and answer");
+    };
+    let EntryKind::User { content } = &question.kind else {
+        panic!("expected the user's original message");
+    };
+    assert_eq!(content.text(), "old question");
+    let image = content.images().next().unwrap();
+    assert!(image.path().starts_with(&fork.workspace));
+    assert_eq!(image.read().unwrap(), bytes);
+    assert!(
+        matches!(&answer.kind, EntryKind::Assistant { content, .. } if content == "old answer")
+    );
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use super::*;
 use deep_code_agent::{
-    GlobalConfigUpdate, LoadedAgentConfig, RestorePoint, RestoreRound, SessionId,
+    GlobalConfigUpdate, LoadedAgentConfig, RestorePoint, RestoreRound, SessionEntry, SessionId,
     write_global_config_update,
 };
 
@@ -8,6 +8,14 @@ use deep_code_agent::{
 mod switch_tests;
 #[cfg(test)]
 pub(super) mod tests;
+
+pub(super) enum RestoreRead {
+    Rounds(Vec<RestoreRound>),
+    Transcript {
+        round: usize,
+        entries: Vec<Arc<SessionEntry>>,
+    },
+}
 
 fn run_runtime_future<F: std::future::Future>(future: F) -> Result<F::Output, String> {
     match tokio::runtime::Handle::try_current() {
@@ -193,6 +201,7 @@ impl App {
         self.session_scan = None;
         self.restore_scan = None;
         self.restore_picker = None;
+        self.restore_reader = None;
         self.session_switch = None;
         if let Some(stop) = self.subagent_shutdown.take() {
             stop();
@@ -685,14 +694,39 @@ impl App {
             return;
         };
         let workspace = self.workspace.clone();
-        if selector.is_empty() {
+        let mut args = selector.split_whitespace();
+        let round = if args.next() == Some("view") {
+            match args.next().and_then(|arg| arg.parse::<usize>().ok()) {
+                Some(round) if round > 0 && args.next().is_none() => Some(round),
+                _ => {
+                    self.status = self.tr(TextId::UsageRestoreView).to_string();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if selector.is_empty() || round.is_some() {
             let scan = crate::session_scan::SessionScan::spawn(move |cancel| {
-                JsonSessionStore::for_pinned_workspace(&workspace)?.restore_rounds(&id, &cancel)
+                let store = JsonSessionStore::for_pinned_workspace(&workspace)?;
+                match round {
+                    Some(round) => Ok(RestoreRead::Transcript {
+                        round,
+                        entries: store.restore_round_entries(&id, round, &cancel)?,
+                    }),
+                    None => store.restore_rounds(&id, &cancel).map(RestoreRead::Rounds),
+                }
             });
             match scan {
                 Ok(task) => {
                     self.restore_scan = Some(task);
-                    self.status = self.tr(TextId::StatusReadingRestorePoints).to_string();
+                    self.status = self
+                        .tr(if round.is_some() {
+                            TextId::StatusReadingRestoreRound
+                        } else {
+                            TextId::StatusReadingRestorePoints
+                        })
+                        .to_string();
                 }
                 Err(error) => {
                     self.status =
@@ -730,6 +764,24 @@ impl App {
             },
             &[("round", &point.round.to_string())],
         )
+    }
+
+    pub(crate) fn restore_overlay_open(&self) -> bool {
+        self.restore_picker.is_some() || self.restore_reader.is_some()
+    }
+
+    pub(crate) fn close_restore_overlay(&mut self) {
+        if self.restore_reader.take().is_none() {
+            self.restore_picker = None;
+            self.cancel_session_scan();
+        }
+        self.status.clear();
+    }
+
+    pub(crate) fn preview_restore_round(&mut self) {
+        if let Some(picker) = &self.restore_picker {
+            self.restore_command(&format!("view {}", picker.rounds[picker.selected].round));
+        }
     }
 
     pub(crate) fn move_restore_picker(&mut self, by: isize) {
@@ -784,7 +836,21 @@ impl App {
         {
             self.restore_scan = None;
             match result {
-                Ok(rounds) => self.show_restore_rounds(rounds),
+                Ok(RestoreRead::Rounds(rounds)) => self.show_restore_rounds(rounds),
+                Ok(RestoreRead::Transcript { round, entries }) if !self.runtime_busy() => {
+                    self.restore_reader = Some(RestoreReader {
+                        round,
+                        entries,
+                        selected: 0,
+                        scroll: 0,
+                        height: 0,
+                        lines: None,
+                    });
+                    self.status.clear();
+                }
+                Ok(RestoreRead::Transcript { .. }) => {
+                    self.status = self.busy_status(TextId::BusyRestore);
+                }
                 Err(error) => {
                     self.status =
                         self.tr_with(TextId::RestoreFailed, &[("error", &error.to_string())])

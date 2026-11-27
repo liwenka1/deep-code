@@ -289,11 +289,12 @@ pub struct App {
     /// churn, so switching sessions doesn't flicker) over the live TUI.
     pub(crate) resume_picker: Option<ResumePicker>,
     pub(crate) restore_picker: Option<RestorePicker>,
+    pub(crate) restore_reader: Option<RestoreReader>,
     /// Open `/model` picker. The model and effort menus are edited in memory
     /// and applied together when the second Enter is pressed.
     pub(crate) model_picker: Option<ModelPicker>,
     session_scan: Option<session::PendingSessionScan>,
-    restore_scan: Option<crate::session_scan::SessionScan<Vec<deep_code_agent::RestoreRound>>>,
+    restore_scan: Option<crate::session_scan::SessionScan<session::RestoreRead>>,
     session_switch: Option<session::PendingSessionSwitch>,
     session_cleanup: Vec<crate::session_switch::SessionCleanup>,
     /// UI language, resolved from config at launch; `/lang` switches it live.
@@ -320,6 +321,33 @@ pub(crate) struct ResumePicker {
 pub(crate) struct RestorePicker {
     pub(crate) rounds: Vec<deep_code_agent::RestoreRound>,
     pub(crate) selected: usize,
+}
+
+pub(crate) struct RestoreReader {
+    pub(crate) round: usize,
+    pub(crate) entries: Vec<Arc<deep_code_agent::SessionEntry>>,
+    pub(crate) selected: usize,
+    pub(crate) scroll: usize,
+    pub(crate) height: usize,
+    pub(crate) lines: Option<(u16, Vec<Line<'static>>)>,
+}
+
+impl RestoreReader {
+    pub(crate) fn move_entry(&mut self, by: isize) {
+        let next = self
+            .selected
+            .saturating_add_signed(by)
+            .min(self.entries.len() - 1);
+        if next != self.selected {
+            self.selected = next;
+            self.scroll = 0;
+            self.lines = None;
+        }
+    }
+
+    pub(crate) fn scroll_by(&mut self, by: isize) {
+        self.scroll = self.scroll.saturating_add_signed(by);
+    }
 }
 
 /// Draft state for the model + reasoning picker.
@@ -983,6 +1011,7 @@ impl App {
             composer_scroll: 0,
             resume_picker: None,
             restore_picker: None,
+            restore_reader: None,
             model_picker: None,
             session_scan: None,
             restore_scan: None,
@@ -1018,7 +1047,7 @@ impl App {
             && self.permission_mode() == deep_code_agent::PermissionMode::AcceptEdits
             && self.pending_approval.is_none()
             && !self.resume_picker_open()
-            && self.restore_picker.is_none()
+            && !self.restore_overlay_open()
             && !self.model_picker_open()
             && !self.history_search_open()
     }

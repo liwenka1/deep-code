@@ -40,9 +40,15 @@ pub(crate) use composer::{char_index_at, layout_input, neutralize_composer_text}
 pub(crate) use transcript::sanitize_for_clipboard;
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
+    if let Some(reader) = &mut app.restore_reader {
+        app.yolo_confirmation.set_visible(None);
+        restore::render_restore_reader(frame, reader, app.lang);
+        app.composer = None;
+        return;
+    }
     if let Some(picker) = &app.restore_picker {
         app.yolo_confirmation.set_visible(None);
-        restore::render_restore_picker(frame, picker, app.lang);
+        restore::render_restore_picker(frame, picker, &app.status, app.lang);
         app.composer = None;
         return;
     }

@@ -72,6 +72,20 @@ async fn restore_lists_the_round_and_switches_to_an_independently_resumable_work
     assert_eq!(picker.rounds[1].checkpoints[0].id.0, "after_turn_1");
     app.accept_restore_picker();
     assert!(app.session_switch.is_none(), "round 2 has no snapshot");
+    app.preview_restore_round();
+    finish_restore_request(&mut app).await;
+    let reader = app
+        .restore_reader
+        .as_mut()
+        .expect("view round without a snapshot");
+    assert_eq!(reader.round, 2);
+    assert!(matches!(&reader.entries[0].kind,
+        deep_code_agent::EntryKind::User { content } if content.text() == "later question"));
+    reader.move_entry(1);
+    assert!(matches!(&reader.entries[reader.selected].kind,
+        deep_code_agent::EntryKind::Assistant { content, .. } if content == "later answer"));
+    app.close_restore_overlay();
+    assert!(app.restore_picker.is_some());
     app.move_restore_picker(1);
     app.accept_restore_picker();
     assert_eq!(app.workspace, source.workspace);
@@ -117,6 +131,9 @@ async fn restore_lists_the_round_and_switches_to_an_independently_resumable_work
             .any(|cell| matches!(cell, HistoryCell::User { text, .. }
         if text == "first question"))
     );
+    assert!(resumed.handle_slash_command("/restore view 1"));
+    finish_restore_request(&mut resumed).await;
+    assert_eq!(resumed.restore_reader.as_ref().unwrap().entries.len(), 2);
     assert_eq!(
         JsonSessionStore::for_pinned_workspace(&source.workspace)
             .unwrap()
