@@ -125,6 +125,7 @@ deepcode --add-dir ../host-app
 - **Grants follow the run**: within one `deepcode` run they stay with you — a new conversation started by `/clear` inherits the current grants (the startup banner and transcript always name the effective set).
 - **Human decision only**: there is deliberately no config key for this — a grant is the launch flag, the `/add-dir` command typed at the keyboard, or your explicit approval of the model's `request_write_root` request. A malicious repo cannot self-grant through project config, and the request path has no automatic yes: no permission mode approves it (`yolo` included), config auto-allow and session memory are ignored for it, and its prompt deliberately offers no "approve for session".
 - Checkpoints cover project files in the primary workspace. Git metadata, generated directories such as `target` and `node_modules`, and extra writable roots are outside their scope. Legacy checkpoints are listed as the start of their turn. Restore reports missing assets or history from older compactions that only saved a summary.
+- Completed-round checkpoints are kept by default so older rounds stay restorable. To limit disk usage, set a positive `[checkpoints] max_snapshots` in the global config. The oldest workspace snapshots are removed when the limit is exceeded.
 - **Repeated write-boundary denials stop the turn.** The first denial tells the model it needs `request_write_root` to expand its write access. Three in one turn stop it and show you the same guidance.
 
 ### Headless one-shot (`-p`)

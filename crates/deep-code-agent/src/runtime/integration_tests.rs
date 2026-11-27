@@ -6331,6 +6331,8 @@ fn ok_turn() -> Vec<AgentEvent> {
 
 #[tokio::test]
 async fn restoring_round_ten_keeps_its_files_attachments_and_context() {
+    // Round ten must stay restorable after more than twenty later snapshots.
+    const LAST_ROUND: usize = 32;
     let parent = tempfile::tempdir().unwrap();
     let workspace = parent.path().join("original");
     std::fs::create_dir(&workspace).unwrap();
@@ -6345,7 +6347,7 @@ async fn restoring_round_ten_keeps_its_files_attachments_and_context() {
     let tool_output = "unabridged round ten output\n".repeat(650);
     let arguments = serde_json::json!({"message": &tool_output}).to_string();
     let mut script = Vec::new();
-    for round in 1..=12 {
+    for round in 1..=LAST_ROUND {
         if round == 10 {
             script.push(vec![
                 AgentEvent::ToolCallDelta {
@@ -6372,7 +6374,7 @@ async fn restoring_round_ten_keeps_its_files_attachments_and_context() {
     )
     .unwrap()
     .with_checkpoints(&workspace, &mut Vec::new());
-    for round in 1..=12 {
+    for round in 1..=LAST_ROUND {
         std::fs::write(&version, round.to_string()).unwrap();
         if round == 10 {
             std::fs::write(workspace.join("ten.txt"), "exists at the checkpoint").unwrap();
@@ -6418,7 +6420,10 @@ async fn restoring_round_ten_keeps_its_files_attachments_and_context() {
     );
     assert!(fork.workspace.join("ten.txt").is_file());
     assert!(!fork.workspace.join("later.txt").exists());
-    assert_eq!(std::fs::read_to_string(&version).unwrap(), "12");
+    assert_eq!(
+        std::fs::read_to_string(&version).unwrap(),
+        LAST_ROUND.to_string()
+    );
     assert_eq!(store.load(&source_id).unwrap(), source_record);
     #[cfg(unix)]
     assert_eq!(

@@ -111,6 +111,8 @@ deepcode session list|resume|delete|export
 
 常用 slash 命令:`/help` `/model` `/apikey` `/lang` `/resume` `/clear` `/sessions` `/checkpoints` `/restore` `/agents` `/copy` `/add-dir` `/image` `/init`（`/model` 打开模型/思考强度选择器,`/model <名称>` 直接切换；`/help` 查看全部与快捷键）。
 
+默认保留已完成轮次的工作区快照，方便恢复到较早的轮次。需要限制磁盘用量时，可在全局配置里将 `[checkpoints]` 下的 `max_snapshots` 设为正数。超出上限后会清理最早的工作区快照。
+
 ### 跨仓库联调(`--add-dir`)
 
 SDK 仓库 + 宿主应用这类"一个项目拆多个仓库"的场景,在启动时把兄弟仓库授权进来:

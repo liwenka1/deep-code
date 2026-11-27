@@ -81,12 +81,10 @@ pub(crate) const MAX_SNAPSHOT_ENTRIES: usize = 20_000;
 /// quit during a large snapshot aborts promptly instead of after the whole
 /// tree is copied.
 const CANCEL_CHECK_INTERVAL: usize = 512;
-/// Default retention: snapshots beyond this count are pruned oldest-first.
-/// Each completed turn creates a snapshot, so without a cap the storage
-/// grows by one workspace copy per turn. On CoW filesystems (APFS, btrfs/XFS)
-/// snapshots clone rather than rewrite, so unchanged files cost no extra disk
-/// and the cap mostly bounds directory count, not bytes.
-pub const DEFAULT_MAX_SNAPSHOTS: usize = 20;
+/// Keep the snapshots needed to restore old rounds by default. An explicit
+/// positive cap prunes the oldest snapshots. On copy-on-write filesystems,
+/// unchanged file contents are shared between snapshots.
+pub const DEFAULT_MAX_SNAPSHOTS: usize = 0;
 
 /// Identifier for a workspace snapshot stored outside `.git`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
