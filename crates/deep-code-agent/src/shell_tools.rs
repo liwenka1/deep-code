@@ -553,13 +553,8 @@ fn new_spill_dir(primary_root: &Path) -> PathBuf {
     ))
 }
 
-/// How long a spill run outlives its session. Spill files must survive the
-/// job record and the process — a transcript names their paths and a resumed
-/// session may still mine last week's build log — but not forever: a single
-/// overflowing job can leave up to 128 MB behind (64 MB per stream), and
-/// nothing else ever deletes it. Checkpoints prune by count; spill prunes by
-/// age, because a reference from an old transcript loses value with time
-/// while a fresh one must keep working.
+/// Clean up inactive shell runs in workspaces with no saved conversations.
+/// A saved transcript or archive may reference a run regardless of its age.
 const SPILL_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Gate so retention runs once per process. Every interactive mode (tui, `-p`,
@@ -588,7 +583,24 @@ fn prune_stale_spill_runs(spill_home: &Path, cutoff: std::time::SystemTime) {
     // this is its missing sibling on the prune side. `symlink_metadata` (not
     // `metadata`) so the check does not itself follow the link.
     let real_dir = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir());
-    if !real_dir(spill_home) || spill_home.parent().is_some_and(|parent| !real_dir(parent)) {
+    let Some(state_dir) = spill_home.parent() else {
+        return;
+    };
+    if !real_dir(spill_home) || !real_dir(state_dir) {
+        return;
+    }
+    // Session and archive entries can point at any older run. Preserve the
+    // logs while the workspace has saved sessions, including when storage
+    // cannot be inspected to confirm that it is empty.
+    let has_sessions = match std::fs::read_dir(state_dir.join("sessions")) {
+        Ok(mut entries) => entries.any(|entry| {
+            entry.map_or(true, |entry| {
+                entry.path().extension().is_some_and(|ext| ext == "json")
+            })
+        }),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    };
+    if has_sessions {
         return;
     }
     let Ok(entries) = std::fs::read_dir(spill_home) else {

@@ -850,6 +850,19 @@ fn prune_stale_spill_runs_removes_only_stale_run_dirs() {
 
     // Future cutoff: every run is stale — only run dirs go.
     let future = std::time::SystemTime::now() + Duration::from_secs(3600);
+    {
+        use crate::session_store::{JsonSessionStore, SessionRecord, SessionStore};
+        let workspace = crate::canonicalize(tmp.path()).unwrap();
+        let store = JsonSessionStore::for_pinned_workspace(&workspace).unwrap();
+        let mut record = SessionRecord::new(workspace, "system");
+        store.save(&mut record).unwrap();
+        prune_stale_spill_runs(&home, future);
+        assert!(
+            run.is_dir(),
+            "an old run may be part of the saved transcript"
+        );
+        store.delete(&record.id).unwrap();
+    }
     prune_stale_spill_runs(&home, future);
     assert!(!run.exists(), "stale run dirs are removed");
     assert!(unrelated_dir.is_dir(), "non-run dirs are never touched");
