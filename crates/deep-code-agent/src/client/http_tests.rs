@@ -14,14 +14,8 @@ async fn client_for_response(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        let (mut peer, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        let mut buffer = [0; 4096];
-        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-            let n = peer.read(&mut buffer).await.unwrap();
-            assert!(n > 0);
-            request.extend_from_slice(&buffer[..n]);
-        }
+        let (peer, _) = listener.accept().await.unwrap();
+        let (mut peer, _, _) = read_request(peer).await;
         // The reader may stop early on an oversized response.
         let _ = peer.write_all(&response).await;
         if stall {
@@ -212,7 +206,7 @@ async fn a_truncated_json_error_cannot_expose_an_escaped_credential() {
     }
 }
 
-async fn read_post(peer: tokio::net::TcpStream) -> (tokio::net::TcpStream, String, Vec<u8>) {
+async fn read_request(peer: tokio::net::TcpStream) -> (tokio::net::TcpStream, String, Vec<u8>) {
     let mut peer = BufReader::new(peer);
     let mut request_line = String::new();
     peer.read_line(&mut request_line).await.unwrap();
@@ -231,8 +225,16 @@ async fn read_post(peer: tokio::net::TcpStream) -> (tokio::net::TcpStream, Strin
             .trim_end_matches(['\r', '\n'])
             .eq_ignore_ascii_case("authorization: Bearer local-test-placeholder");
     }
-    assert!(authorized);
-    let mut body = vec![0; length.expect("POST includes a Content-Length")];
+    let length = if request_line.starts_with("POST ") {
+        assert!(authorized);
+        length.expect("POST includes a Content-Length")
+    } else {
+        assert!(request_line.starts_with("GET "), "{request_line:?}");
+        length.unwrap_or(0)
+    };
+    // File-backed uploads can arrive after the headers. Closing a socket with
+    // unread request bytes can reset it before the client receives the response.
+    let mut body = vec![0; length];
     peer.read_exact(&mut body).await.unwrap();
     (peer.into_inner(), request_line, body)
 }
@@ -269,7 +271,7 @@ async fn file_backed_post_preserves_exact_json_through_same_origin_redirects() {
             ("/upload/final", None),
         ] {
             let (peer, _) = listener.accept().await.unwrap();
-            let (mut peer, request_line, body) = read_post(peer).await;
+            let (mut peer, request_line, body) = read_request(peer).await;
             assert_eq!(request_line, format!("POST {path} HTTP/1.1\r\n"));
             if let Some(expected) = &first_body {
                 assert_eq!(&body, expected);
@@ -350,7 +352,7 @@ async fn replay_keeps_verified_pixels_through_http_retry_and_rechecks_the_next_t
     let server = tokio::spawn(async move {
         for attempt in 0..3 {
             let (peer, _) = listener.accept().await.unwrap();
-            let (mut peer, _, body) = read_post(peer).await;
+            let (mut peer, _, body) = read_request(peer).await;
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             let history = &json["messages"][1]["content"];
             if attempt < 2 {
@@ -414,20 +416,28 @@ async fn file_backed_post_does_not_replay_to_a_different_origin() {
             }],
         )],
     );
-    let result = tokio::time::timeout(RESPONSE_WATCHDOG, client.stream_chat(request))
-        .await
-        .unwrap();
-    server.await.unwrap();
-    assert!(matches!(
-        result,
-        Err(AgentError::Api {
-            status: StatusCode::TEMPORARY_REDIRECT,
-            ..
-        })
-    ));
+    let result = tokio::time::timeout(RESPONSE_WATCHDOG, async {
+        tokio::select! {
+            biased;
+            accepted = other.accept() => {
+                accepted.expect("accept on the second origin");
+                panic!("image request connected to a different origin");
+            }
+            result = client.stream_chat(request) => result,
+        }
+    })
+    .await
+    .expect("image request must finish");
+    let error = result.err().expect("expected the original 307 response");
     assert!(
-        tokio::time::timeout(Duration::from_millis(50), other.accept())
-            .await
-            .is_err()
+        matches!(
+            error,
+            AgentError::Api {
+                status: StatusCode::TEMPORARY_REDIRECT,
+                ..
+            }
+        ),
+        "expected an HTTP 307, got {error:?}"
     );
+    server.await.unwrap();
 }
