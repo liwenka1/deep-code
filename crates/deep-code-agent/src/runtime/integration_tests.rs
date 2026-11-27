@@ -6568,10 +6568,9 @@ async fn compaction_archives_original_entries_across_multiple_folds_and_export()
     runtime.shutdown().await;
 }
 
-/// `/compact` asks the model for a handover of the archived range — a
-/// separate, tool-less request on the flash tier carrying the user's focus,
-/// the archived turns and none of the retained tail — and the model's text
-/// becomes the compaction entry the next request is built on.
+/// `/compact` asks the current model for a handover of the archived range.
+/// The tool-less request carries the user's focus and the archived entries.
+/// The reply becomes the compaction entry the next request is built on.
 #[tokio::test]
 async fn compaction_asks_the_model_for_a_handover_summary() {
     let handover = "# 会话交接摘要 / Session handover\n## 任务与目标 / Task and goals\n- prompt 0 asked for the thing";
@@ -6587,20 +6586,15 @@ async fn compaction_asks_the_model_for_a_handover_summary() {
         scripts: Mutex::new(scripts),
         requests: Arc::clone(&requests),
     };
-    let runtime = AgentRuntime::with_config(
-        client,
-        ToolRegistry::default(),
-        AgentConfig {
-            model: DEEPSEEK_V4_PRO.into(),
-            ..AgentConfig::builtin()
-        },
-    )
-    .with_compact_instructions(Some("- always keep the failing test names".to_string()));
+    let mut runtime =
+        AgentRuntime::with_config(client, ToolRegistry::default(), AgentConfig::builtin())
+            .with_compact_instructions(Some("- always keep the failing test names".to_string()));
     for index in 0..6 {
         let mut rx = runtime.submit_user(format!("prompt {index}")).await;
         drain(&mut rx).await;
     }
 
+    runtime.config.model = "pro".to_string();
     let report = folded(compact(&runtime, Some("只关心 prompt 0")).await);
     assert!(!report.cut_short, "{report:?}");
     assert_eq!(report.summary, handover);
@@ -6609,8 +6603,9 @@ async fn compaction_asks_the_model_for_a_handover_summary() {
 
     let sent = requests.lock().unwrap().clone();
     assert_eq!(sent.len(), 7, "one summarizer request after six turns");
+    assert_eq!(sent[5]["model"], DEEPSEEK_FLASH);
     let request = &sent[6];
-    assert_eq!(request["model"], DEEPSEEK_FLASH);
+    assert_eq!(request["model"], DEEPSEEK_V4_PRO);
     assert!(
         request
             .get("tools")
@@ -7038,6 +7033,7 @@ async fn a_threshold_compaction_runs_at_most_once_per_turn() {
         }
 
         async fn stream_chat(&self, request: ChatRequest) -> AgentResult<AgentEventStream> {
+            assert_eq!(request.model, DEEPSEEK_V4_PRO);
             let events = if is_handover_request(&request) {
                 handover_reply("# handover")
             } else {
@@ -7073,6 +7069,7 @@ async fn a_threshold_compaction_runs_at_most_once_per_turn() {
     }
 
     let config = crate::config::AgentConfig {
+        model: DEEPSEEK_V4_PRO.into(),
         compaction_threshold: Some(1),
         ..crate::config::AgentConfig::builtin()
     };
@@ -7358,20 +7355,20 @@ async fn a_turn_that_lands_while_compact_writes_is_kept() {
 #[tokio::test]
 async fn a_fold_saves_its_summary_and_cost_with_the_entries_it_describes() {
     let workspace = tempfile::tempdir().unwrap();
-    let (client, handovers) = HandoverClient::new(|_| {
+    let usage = Usage {
+        prompt_tokens: Some(1244),
+        completion_tokens: Some(5),
+        prompt_cache_hit_tokens: Some(1234),
+        ..Usage::default()
+    };
+    let expected_cost = crate::pricing::calculate_turn_cost(DEEPSEEK_V4_PRO, &usage);
+    let (client, handovers) = HandoverClient::new(move |_| {
         Ok(vec![
             AgentEvent::TextDelta {
                 text: "# handover".to_string(),
             },
             AgentEvent::Done {
-                usage: Some(Usage {
-                    prompt_tokens: Some(10),
-                    completion_tokens: Some(5),
-                    // A plain counter, so the assertion does not depend on the
-                    // price table: only the summarizer's request can set it.
-                    prompt_cache_hit_tokens: Some(1234),
-                    ..Usage::default()
-                }),
+                usage: Some(usage.clone()),
             },
         ])
     });
@@ -7383,7 +7380,10 @@ async fn a_fold_saves_its_summary_and_cost_with_the_entries_it_describes() {
         ToolRegistry::default(),
         record,
         store,
-        crate::config::AgentConfig::builtin(),
+        AgentConfig {
+            model: DEEPSEEK_V4_PRO.into(),
+            ..AgentConfig::builtin()
+        },
     );
     for index in 0..6 {
         let mut rx = runtime.submit_user(format!("prompt {index}")).await;
@@ -7426,6 +7426,7 @@ async fn a_fold_saves_its_summary_and_cost_with_the_entries_it_describes() {
         saved.session_cache_hit_tokens, 1234,
         "the summarizer's usage is session spend and has to be in the file"
     );
+    assert!((saved.session_cost.usd - expected_cost.usd).abs() < f64::EPSILON);
 }
 
 /// A cancelled turn's loop, still on its way out of a threshold fold when the

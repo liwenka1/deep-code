@@ -12,7 +12,6 @@ use crate::echo_client::EchoClient;
 use crate::event::AgentEvent;
 use crate::message::Message;
 use crate::model::ChatRequest;
-use crate::model_registry::DEEPSEEK_FLASH;
 use crate::reasoning::ReasoningEffortSetting;
 use crate::runtime::event::{RuntimeEvent, TurnId, emit};
 use crate::runtime::{AgentRuntime, CompactNowOutcome, CompactionReport};
@@ -135,7 +134,9 @@ impl AgentRuntime {
                 return;
             }
         };
-        let outcome = self.compact_session(trigger, Some(tx), None, cancel).await;
+        let outcome = self
+            .compact_session(model, trigger, Some(tx), None, cancel)
+            .await;
         let mut state = self.state.lock().await;
         if trigger == Trigger::StoragePressure {
             state.storage_compaction_tried = Some(turn_id.clone());
@@ -158,15 +159,16 @@ impl AgentRuntime {
         focus: Option<&str>,
         cancel: &CancellationToken,
     ) -> CompactNowOutcome {
-        if let Err(error) = self.config.resolved_model() {
-            return CompactNowOutcome::Failed(error.user_message(self.ui_lang()));
-        }
+        let model = match self.config.resolved_model() {
+            Ok(model) => model,
+            Err(error) => return CompactNowOutcome::Failed(error.user_message(self.ui_lang())),
+        };
         // Measured around the fold, and only here: the automatic path fires on
         // a threshold (so "did it buy anything" is not in question) and its
         // event carries no numbers to report them with.
         let tokens_before = self.context_tokens().await;
         match self
-            .compact_session(Trigger::Manual, None, focus, cancel)
+            .compact_session(model, Trigger::Manual, None, focus, cancel)
             .await
         {
             FoldOutcome::Applied(folded) => CompactNowOutcome::Folded(CompactionReport {
@@ -198,8 +200,9 @@ impl AgentRuntime {
     /// itself rather than events nobody is listening for. With a stream, the
     /// start of the summarizer's wait, a fallback and a skipped fold are all
     /// announced on it.
-    pub(super) async fn compact_session(
+    async fn compact_session(
         &self,
+        model: &str,
         trigger: Trigger,
         tx: Option<&mpsc::UnboundedSender<RuntimeEvent>>,
         focus: Option<&str>,
@@ -223,7 +226,8 @@ impl AgentRuntime {
             if let Some(tx) = tx {
                 emit(tx, RuntimeEvent::CompactionStarted);
             }
-            self.handover_summary(&plan, &entries, focus, cancel).await
+            self.handover_summary(model, &plan, &entries, focus, cancel)
+                .await
         };
         let (summary, cut_short, mut fallback_reason) = match handover {
             Ok(Handover { text, cut_short }) => (text, cut_short, None),
@@ -426,20 +430,19 @@ impl AgentRuntime {
 
     /// Ask the model for the handover summary of `plan`'s archived range.
     ///
-    /// The separate, tool-less Flash request uses low reasoning effort and
-    /// observes [`HANDOVER_DEADLINE`] and `cancel`, which is the caller's — the
-    /// turn's for a fold inside a turn, the user's own for `/compact`. Never
-    /// the runtime's turn token from between turns: that one stays cancelled
-    /// after an Esc until the next turn begins.
+    /// The tool-less request uses the session model with low reasoning effort.
+    /// It observes [`HANDOVER_DEADLINE`] and the caller's cancellation token.
+    /// `/compact` has its own token so an earlier cancelled turn cannot stop it.
     async fn handover_summary(
         &self,
+        model: &str,
         plan: &CompactionPlan,
         entries: &[Arc<SessionEntry>],
         focus: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<Handover, HandoverError> {
         let mut request = ChatRequest::streaming(
-            DEEPSEEK_FLASH,
+            model,
             vec![
                 Message::system(HANDOVER_SYSTEM_PROMPT),
                 Message::user(handover_request(
@@ -455,7 +458,7 @@ impl AgentRuntime {
         tokio::select! {
             biased;
             () = cancel.cancelled() => Err(HandoverError::Cancelled),
-            outcome = tokio::time::timeout(HANDOVER_DEADLINE, self.collect_handover(DEEPSEEK_FLASH, request)) => {
+            outcome = tokio::time::timeout(HANDOVER_DEADLINE, self.collect_handover(request)) => {
                 outcome
                     .unwrap_or_else(|_| {
                         Err(format!("no reply within {}s", HANDOVER_DEADLINE.as_secs()))
@@ -470,11 +473,7 @@ impl AgentRuntime {
     /// any other request on the key. Opened with the turn requests' retry and
     /// guards (`open_stream`), so a transient 429 or 503 is retried rather
     /// than costing the fold.
-    async fn collect_handover(
-        &self,
-        model: &str,
-        request: ChatRequest,
-    ) -> Result<Handover, String> {
+    async fn collect_handover(&self, request: ChatRequest) -> Result<Handover, String> {
         let mut stream = self
             .open_stream(request)
             .await
@@ -490,6 +489,7 @@ impl AgentRuntime {
                 Ok(AgentEvent::Done { usage }) => {
                     finished = true;
                     if let Some(usage) = usage.as_ref() {
+                        let model = &stream.prepared_request().model;
                         self.accumulate_request_usage(model, usage).await;
                         // The client does not surface `finish_reason`, but a
                         // completion that used the whole allowance is one the
