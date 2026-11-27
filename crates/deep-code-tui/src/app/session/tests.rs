@@ -122,16 +122,52 @@ async fn failed_reconfiguration_retains_the_live_runtime() {
 fn unavailable_store_keeps_the_existing_persisted_runtime() {
     let (_workspace, mut app) = test_app();
     let old_runtime = Arc::clone(&app.runtime);
-    let id = app.session_id.clone();
-    std::fs::rename(
-        app.workspace.join(".deep-code"),
-        app.workspace.join("previous-state"),
-    )
-    .unwrap();
-    std::fs::write(app.workspace.join(".deep-code"), "unavailable").unwrap();
-    assert!(app.relaunch_runtime().is_err());
+    let id = app
+        .session_id
+        .clone()
+        .expect("fixture must start persisted");
+    let state_dir = app.workspace.join(".deep-code");
+
+    #[cfg(not(windows))]
+    let previous_state = {
+        let previous = app.workspace.join("previous-state");
+        std::fs::rename(&state_dir, &previous).unwrap();
+        std::fs::write(&state_dir, "unavailable").unwrap();
+        previous
+    };
+    #[cfg(windows)]
+    let state_lock = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+        // Windows protects the live store's open directory from renames.
+        // Block new opens of its parent while the live runtime holds the store.
+        std::fs::File::options()
+            .read(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&state_dir)
+            .unwrap()
+    };
+
+    let store_error = JsonSessionStore::for_pinned_workspace(&app.workspace)
+        .unwrap_err()
+        .to_string();
+    let Err(error) = app.relaunch_runtime() else {
+        panic!("expected reconfiguration to report the unavailable store");
+    };
+    assert_eq!(error, store_error);
     assert!(Arc::ptr_eq(&old_runtime, &app.runtime));
-    assert_eq!(app.session_id, id);
+    assert_eq!(app.session_id.as_deref(), Some(id.as_str()));
+
+    #[cfg(not(windows))]
+    {
+        std::fs::remove_file(&state_dir).unwrap();
+        std::fs::rename(previous_state, state_dir).unwrap();
+    }
+    #[cfg(windows)]
+    drop(state_lock);
+    app.shutdown_current_runtime();
 }
 
 pub(in crate::app) fn finish_scan(app: &mut App) {
