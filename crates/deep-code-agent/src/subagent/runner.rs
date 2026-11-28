@@ -164,6 +164,7 @@ pub async fn run_subagent(
             | RuntimeEvent::CompactionApplied { .. }
             | RuntimeEvent::RootGranted { .. }
             | RuntimeEvent::UserMessageInjected { .. }
+            | RuntimeEvent::UserRetryUnavailable { .. }
             | RuntimeEvent::ImageRequestPrepared { .. }
             | RuntimeEvent::Warning { .. } => {}
         }

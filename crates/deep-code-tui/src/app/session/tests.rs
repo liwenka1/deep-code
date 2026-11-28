@@ -27,6 +27,7 @@ async fn reconfiguration_keeps_live_history_after_a_failed_save() {
             None,
         )
         .unwrap(),
+        app.permission_mode(),
     );
     app.global_config_path = Some(workspace.path().join("unused-global-config.toml"));
     let id = app.session_id.clone();
@@ -76,6 +77,7 @@ async fn reconfiguration_keeps_unpersisted_conversation_and_can_add_a_root() {
             None,
         )
         .unwrap(),
+        app.permission_mode(),
     );
     app.global_config_path = Some(workspace.path().join("unused-global-config.toml"));
     let mut events = app

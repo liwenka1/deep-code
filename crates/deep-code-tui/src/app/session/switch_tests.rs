@@ -3,7 +3,7 @@ use deep_code_agent::SessionStore;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-fn app_with_restore_point() -> (tempfile::TempDir, App, SessionRecord) {
+fn app_with_restore_point(project_config: Option<&str>) -> (tempfile::TempDir, App, SessionRecord) {
     use deep_code_agent::{CheckpointId, CheckpointRecord, SessionEntry, TurnRecord};
 
     let parent = tempfile::tempdir().unwrap();
@@ -11,6 +11,9 @@ fn app_with_restore_point() -> (tempfile::TempDir, App, SessionRecord) {
     std::fs::create_dir(&workspace).unwrap();
     let workspace = deep_code_agent::canonicalize(&workspace).unwrap();
     let store = JsonSessionStore::for_pinned_workspace(&workspace).unwrap();
+    if let Some(project_config) = project_config {
+        std::fs::write(workspace.join(".deep-code/config.toml"), project_config).unwrap();
+    }
     let mut record = SessionRecord::new(workspace.clone(), "system");
     for (question, answer) in [
         ("first question", "first answer"),
@@ -62,7 +65,7 @@ async fn finish_restore_request(app: &mut App) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_lists_the_round_and_switches_to_an_independently_resumable_workspace() {
-    let (_parent, mut app, source) = app_with_restore_point();
+    let (_parent, mut app, source) = app_with_restore_point(None);
     assert!(app.handle_slash_command("/restore"));
     finish_restore_request(&mut app).await;
     let picker = app.restore_picker.as_ref().expect("restore picker");
@@ -147,8 +150,40 @@ async fn restore_lists_the_round_and_switches_to_an_independently_resumable_work
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_combines_active_limits_with_tighter_settings_on_disk() {
+    let (_parent, mut app, source) = app_with_restore_point(Some("[sandbox]\nnetwork = 'never'\n"));
+    app.permission_mode.set(PermissionMode::AcceptEdits);
+    std::fs::write(
+        app.global_config(),
+        "[approval]\ndefault_mode = 'accept_edits'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        source.workspace.join(".deep-code/config.toml"),
+        "[sandbox]\nnetwork = 'prompt'\n[lsp]\nenabled = false\n[approval]\ndefault_mode = 'default'\n",
+    )
+    .unwrap();
+
+    assert!(app.handle_slash_command("/restore 1"));
+    finish_restore_request(&mut app).await;
+    assert_ne!(app.workspace, source.workspace, "{}", app.status);
+    let config = AgentConfig::load_with(
+        app.global_config_path.clone(),
+        Some(app.workspace.join(".deep-code/config.toml")),
+        &|_| None,
+    )
+    .config;
+    assert_eq!(config.sandbox_network, deep_code_agent::NetworkMode::Never);
+    assert!(!config.lsp_enabled);
+    assert_eq!(config.default_permission_mode, PermissionMode::Default);
+    assert_eq!(app.permission_mode(), PermissionMode::Default);
+    assert_eq!(app.runtime.permission_mode(), PermissionMode::Default);
+    app.stop_current_runtime().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_or_failed_restore_keeps_the_original_window_and_workspace() {
-    let (parent, mut app, source) = app_with_restore_point();
+    let (parent, mut app, source) = app_with_restore_point(None);
     let original = Arc::clone(&app.runtime);
     assert!(app.handle_slash_command("/restore 999"));
     finish_restore_request(&mut app).await;
@@ -183,6 +218,7 @@ fn app_with_saved_target() -> (tempfile::TempDir, App, SessionRecord) {
     app.adopt_runtime(
         deep_code_agent::launch_runtime(&AgentConfig::builtin(), app.workspace.clone(), None)
             .unwrap(),
+        app.permission_mode(),
     );
     app.global_config_path = Some(workspace.path().join("unused-global-config.toml"));
     let store = JsonSessionStore::for_pinned_workspace(&app.workspace).unwrap();

@@ -38,6 +38,16 @@ pub enum PermissionMode {
 }
 
 impl PermissionMode {
+    /// The mode that grants fewer requests automatically.
+    #[must_use]
+    pub fn stricter(self, other: Self) -> Self {
+        if self.to_u8() <= other.to_u8() {
+            self
+        } else {
+            other
+        }
+    }
+
     /// Next mode in the Shift+Tab ring.
     #[must_use]
     pub fn cycle(self) -> Self {

@@ -3226,6 +3226,190 @@ async fn missing_confirmed_image_during_approval_does_not_block_the_tool_result(
 }
 
 #[tokio::test]
+async fn retries_reserve_the_whole_draft_chain_while_submitted_or_queued() {
+    let rejection = vec![AgentEvent::Error {
+        message: "provider rejected the prompt".into(),
+    }];
+    let runtime = AgentRuntime::with_config(
+        ScriptedClient::new(vec![rejection; 3]),
+        ToolRegistry::default(),
+        AgentConfig::builtin(),
+    );
+    drain(&mut runtime.submit_user("original").await).await;
+    let id = runtime.unsent_messages().await[0].id.clone();
+    let original = UserTurn::new("original").with_retry_drafts([id.clone()]);
+    drain(&mut runtime.submit_user(original.clone()).await).await;
+    let edit = runtime.unsent_messages().await[0].id.clone();
+    assert_ne!(edit, id);
+    for reserved in [&id, &edit] {
+        assert!(
+            runtime
+                .unsent_messages_excluding_retries(std::slice::from_ref(reserved))
+                .await
+                .is_empty()
+        );
+    }
+    let retry = UserTurn::new("edited again").with_retry_drafts([edit]);
+    let turn = runtime.begin_turn(retry.clone()).await.unwrap();
+    assert!(runtime.unsent_messages().await.is_empty());
+    assert!(!runtime.steer(original.clone()).await);
+    assert!(matches!(
+        runtime.begin_turn(original.clone()).await,
+        Err(AgentError::RetryUnavailable)
+    ));
+    assert_eq!(runtime.live_turn_id().await, Some(turn));
+
+    let events = drain(&mut runtime.drive_turn().await).await;
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::Error {
+            kind: RuntimeFailureKind::Submission,
+            ..
+        })
+    ));
+    assert!(
+        runtime
+            .unsent_messages()
+            .await
+            .iter()
+            .any(|entry| entry.id == id)
+    );
+
+    runtime.begin_turn("unrelated turn").await.unwrap();
+    assert!(runtime.steer(retry.clone()).await);
+    assert!(
+        !runtime
+            .unsent_messages()
+            .await
+            .iter()
+            .any(|entry| entry.id == id)
+    );
+    assert!(!runtime.steer(original).await);
+    drop(runtime.cancel_turn().await);
+    let events = drain(&mut runtime.drive_turn().await).await;
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnCancelled { .. })
+    ));
+    assert!(
+        runtime
+            .unsent_messages()
+            .await
+            .iter()
+            .any(|entry| entry.id == id)
+    );
+}
+
+#[tokio::test]
+async fn steering_drain_skips_a_retired_draft_and_delivers_other_follow_ups() {
+    let runtime = AgentRuntime::with_config(
+        ScriptedClient::new(vec![ok_turn()]),
+        ToolRegistry::default(),
+        AgentConfig::builtin(),
+    );
+    let turn_id = runtime.begin_turn("active prompt").await.unwrap();
+    let stale_id = "retired-draft".to_owned();
+    let stale = UserTurn::new("stale retry").with_retry_drafts([stale_id.clone()]);
+    let (content, unsent) = stale.pending_content();
+    // Simulate a queued retry whose source has disappeared since admission.
+    runtime
+        .state
+        .lock()
+        .await
+        .steering
+        .push_back(Steered::User {
+            prompt: stale,
+            content,
+            unsent,
+        });
+    assert!(runtime.steer("ordinary follow-up").await);
+
+    let events = drain(&mut runtime.drive_turn().await).await;
+    assert!(events.iter().any(|event| matches!(event,
+        RuntimeEvent::UserRetryUnavailable { turn_id: id, draft_ids }
+        if id == &turn_id && draft_ids == std::slice::from_ref(&stale_id))));
+    let messages = runtime.session_messages().await;
+    let user_text: Vec<_> = messages
+        .iter()
+        .filter(|message| message.role == crate::Role::User)
+        .map(|message| message.content.text())
+        .collect();
+    assert_eq!(user_text, ["active prompt", "ordinary follow-up"]);
+}
+
+#[tokio::test]
+async fn confirmed_retry_removes_only_its_draft_chain_after_resuming() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = crate::canonicalize(dir.path()).unwrap();
+    let reject = vec![AgentEvent::Error {
+        message: "provider rejected the prompt".into(),
+    }];
+    let config = AgentConfig::builtin();
+    let runtime = AgentRuntime::with_new_session(
+        ScriptedClient::new(vec![reject; 3]),
+        ToolRegistry::default(),
+        "system",
+        &workspace,
+        &config,
+    )
+    .unwrap();
+    drain(&mut runtime.submit_user("same text").await).await;
+    drain(&mut runtime.submit_user("same text").await).await;
+    let drafts = runtime.unsent_messages().await;
+    let unrelated = drafts[1].id.clone();
+    drain(
+        &mut runtime
+            .submit_user(UserTurn::new("edited").with_retry_drafts([drafts[0].id.clone()]))
+            .await,
+    )
+    .await;
+    let drafts = runtime.unsent_messages().await;
+    assert_eq!(
+        drafts.len(),
+        3,
+        "a failed retry preserves the original draft"
+    );
+    let id = runtime.session_id().await.unwrap();
+    runtime.shutdown().await;
+
+    let store = crate::JsonSessionStore::for_workspace(&workspace).unwrap();
+    let saved = store.load(&id).unwrap();
+    let runtime = AgentRuntime::from_session_record(
+        ScriptedClient::new(vec![ok_turn()]),
+        ToolRegistry::default(),
+        saved,
+        store.clone(),
+        config,
+    );
+    let retry = UserTurn::new("accepted edit").with_retry_drafts([drafts[0].id.clone()]);
+    let events = drain(&mut runtime.submit_user(retry.clone()).await).await;
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEvent::TurnFinished { .. })
+    ));
+    let drafts = runtime.unsent_messages().await;
+    assert_eq!(drafts.len(), 1);
+    assert_eq!(drafts[0].id, unrelated);
+    assert!(matches!(
+        runtime.begin_turn(retry).await,
+        Err(AgentError::RetryUnavailable)
+    ));
+    runtime.shutdown().await;
+
+    let saved = store.load(&id).unwrap();
+    assert_eq!(
+        saved.turns.len(),
+        2,
+        "remove the metadata of the retired draft-only turns"
+    );
+    let rounds = store
+        .restore_rounds(&id, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(rounds.len(), 1);
+    assert_eq!(rounds[0].prompt.as_deref(), Some("accepted edit"));
+}
+
+#[tokio::test]
 async fn persisted_errors_redact_provider_echoes_before_and_after_confirmation() {
     const KEY: &str = "sk-test-echoed-credential";
     for confirmed in [false, true] {

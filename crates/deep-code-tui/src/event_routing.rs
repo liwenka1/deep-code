@@ -50,6 +50,9 @@ impl App {
             RuntimeEvent::AssistantDelta { text, .. } => {
                 self.push_assistant_delta(&text);
             }
+            RuntimeEvent::UserRetryUnavailable { draft_ids, .. } => {
+                self.discard_unavailable_steer(&draft_ids);
+            }
             RuntimeEvent::ReasoningDelta { text, .. } => {
                 self.push_reasoning_delta(&text);
             }

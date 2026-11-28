@@ -25,6 +25,7 @@ impl App {
         self.sync_images();
         if self.input.trim().is_empty() {
             self.literal_prompt = false;
+            self.retry_draft_id = None;
         }
         self.completion = self.compute_completion();
     }

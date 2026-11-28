@@ -74,6 +74,14 @@ impl App {
             self.edit_unsent(as_sent.strip_prefix("/retry").unwrap_or_default().trim());
             return;
         }
+        if self
+            .retry_draft_id
+            .as_ref()
+            .is_some_and(|id| self.retrying_drafts.contains(id))
+        {
+            self.status = self.tr(TextId::RetryMissing).to_owned();
+            return;
+        }
         let images = self.attached_image_inputs();
         // Remember what was typed, with its attachments, before clearing it.
         self.remember_prompt(&sent);
@@ -141,7 +149,10 @@ impl App {
                 );
                 return;
             }
-            self.steering_queue.push(sent.clone());
+            let prompt = UserTurn::new(sent).with_retry_drafts(self.retry_draft_id.take());
+            self.retrying_drafts
+                .extend(prompt.retry_drafts().iter().cloned());
+            self.steering_queue.push(prompt.clone());
             // Also hand the text to the runtime, so it can steer it into the
             // *live* turn at the next tool-batch boundary rather than making the
             // user wait for the whole turn. The queue above stays the source of
@@ -153,7 +164,7 @@ impl App {
             let runtime = Arc::clone(&self.runtime);
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    let _ = runtime.steer(sent).await;
+                    let _ = runtime.steer(prompt).await;
                 });
             }
             self.clear_input();
@@ -164,8 +175,10 @@ impl App {
             return;
         }
 
+        let prompt = UserTurn::with_labeled_images(sent, images)
+            .with_retry_drafts(self.retry_draft_id.take());
         self.clear_input();
-        self.start_user_turn(sent, images, None);
+        self.start_user_turn(prompt, None);
     }
 
     fn edit_unsent(&mut self, arg: &str) {
@@ -189,9 +202,10 @@ impl App {
             return;
         }
         let runtime = Arc::clone(&self.runtime);
+        let retrying: Vec<_> = self.retrying_drafts.iter().cloned().collect();
         match images::spawn_image_worker("retry-draft", move |cancel| {
             let entry = handle
-                .block_on(runtime.unsent_messages())
+                .block_on(runtime.unsent_messages_excluding_retries(&retrying))
                 .into_iter()
                 .nth(index)?;
             let deep_code_agent::EntryKind::User { content } = &entry.kind else {
@@ -232,8 +246,10 @@ impl App {
             return true;
         }
         match result {
-            Ok(Some(draft)) => self.restore_retry(draft),
-            Ok(None) => self.status = self.tr(TextId::RetryMissing).to_owned(),
+            Ok(Some(draft)) if !self.retrying_drafts.contains(&draft.entry.id) => {
+                self.restore_retry(draft)
+            }
+            Ok(_) => self.status = self.tr(TextId::RetryMissing).to_owned(),
             Err(_) => {
                 self.status = self.tr_with(
                     TextId::RetryCheckFailed,
@@ -298,6 +314,7 @@ impl App {
             });
         }
         self.literal_prompt = !self.input.trim().is_empty();
+        self.retry_draft_id = Some(entry.id.clone());
         self.cursor_to_end();
         if !parked.text.is_empty() {
             self.remember_prompt(&self.input.clone());
@@ -316,17 +333,12 @@ impl App {
         };
     }
 
-    /// Start a turn from `text` (plus `images`) right now — the tail of
+    /// Start a turn from `prompt` right now — the tail of
     /// [`Self::submit`] once the composer and the slash commands are out of the
     /// way, shared with `/init`, which sends a canned brief. `shown` is what
     /// the transcript's user cell displays when that should not be the full
     /// text; the session record always keeps what was actually sent.
-    pub(crate) fn start_user_turn(
-        &mut self,
-        text: String,
-        images: Vec<(deep_code_agent::UserImage, String)>,
-        shown: Option<String>,
-    ) {
+    pub(crate) fn start_user_turn(&mut self, prompt: UserTurn, shown: Option<String>) {
         if self
             .session_switch
             .as_ref()
@@ -347,12 +359,11 @@ impl App {
             &[("backend", &self.backend_label)],
         );
 
-        self.history
-            .push(HistoryCell::user(shown.unwrap_or_else(|| text.clone())));
+        self.history.push(HistoryCell::user(
+            shown.unwrap_or_else(|| prompt.text.clone()),
+        ));
 
-        self.start_stream(StreamRequest::User(UserTurn::with_labeled_images(
-            text, images,
-        )));
+        self.start_stream(StreamRequest::User(prompt));
     }
 
     /// Send any prompts queued (steered) while the just-finished turn was
@@ -367,9 +378,34 @@ impl App {
         if self.steering_queue.is_empty() || self.is_streaming {
             return;
         }
+        if self
+            .steering_queue
+            .iter()
+            .any(|prompt| !prompt.retry_drafts().is_empty())
+        {
+            if !self
+                .runtime
+                .try_filter_queued_retries(&mut self.steering_queue)
+            {
+                self.pending_steering_flush = true;
+                return;
+            }
+            if self.steering_queue.is_empty() {
+                self.status = self.tr(TextId::RetryMissing).to_owned();
+                return;
+            }
+        }
         // Blank-line join so multiple steered messages read as separate turns
         // to the model rather than one run-on paragraph.
-        let combined = std::mem::take(&mut self.steering_queue).join("\n\n");
+        let queued = std::mem::take(&mut self.steering_queue);
+        let combined = queued
+            .iter()
+            .map(|prompt| prompt.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let retries = queued
+            .iter()
+            .flat_map(|prompt| prompt.retry_drafts().iter().cloned());
         self.error = None;
         self.scroll_offset = 0;
         self.approval_scroll_offset = 0;
@@ -384,7 +420,20 @@ impl App {
         // Text only: reaching the queue at all requires passing the
         // `ImageWhileStreaming` refusal in `submit`, so every entry here is a
         // prompt the runtime was steered with.
-        self.start_stream(StreamRequest::User(UserTurn::new(combined)));
+        self.start_stream(StreamRequest::User(
+            UserTurn::new(combined).with_retry_drafts(retries),
+        ));
+    }
+
+    pub(crate) fn discard_unavailable_steer(&mut self, draft_ids: &[String]) {
+        self.steering_queue.retain(|prompt| {
+            !prompt
+                .retry_drafts()
+                .iter()
+                .any(|id| draft_ids.contains(id))
+        });
+        self.retrying_drafts.retain(|id| !draft_ids.contains(id));
+        self.status = self.tr(TextId::RetryMissing).to_owned();
     }
 
     pub(super) fn cancel_streaming_turn(&mut self) {
@@ -413,6 +462,10 @@ impl App {
     /// render loop uses this to skip redundant redraws).
     pub fn drain_stream_updates(&mut self) -> bool {
         let Some(mut rx) = self.ui_rx.take() else {
+            if std::mem::take(&mut self.pending_steering_flush) {
+                self.flush_steering_queue();
+                return !self.pending_steering_flush;
+            }
             return false;
         };
 
@@ -485,6 +538,7 @@ impl App {
                 return;
             }
         };
+        self.retrying_drafts = prompt.retry_drafts().iter().cloned().collect();
         let (tx, rx) = mpsc::unbounded_channel();
         self.ui_rx = Some(rx);
         self.ui_tx = Some(tx.downgrade());
@@ -610,5 +664,6 @@ impl App {
         self.ui_rx = None;
         self.ui_tx = None;
         self.stream_cancel = None;
+        self.retrying_drafts.clear();
     }
 }

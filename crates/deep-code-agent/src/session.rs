@@ -94,8 +94,20 @@ impl Session {
         &mut self,
         turn_id: TurnId,
         content: Content,
-        unsent: UnsentMessage,
+        mut unsent: UnsentMessage,
     ) {
+        if !unsent.retry_of.is_empty() {
+            let mut chain = unsent.retry_of.iter().map(String::as_str).collect();
+            self.expand_retry_chain(&mut chain);
+            // Keep links to all retained ancestors, so evicting a draft in
+            // the middle of the chain cannot detach an older draft.
+            unsent.retry_of = self
+                .entries
+                .iter()
+                .filter(|entry| entry.unsent.is_some() && chain.contains(entry.id.as_str()))
+                .map(|entry| entry.id.clone())
+                .collect();
+        }
         let mut entry = SessionEntry::user(content).with_turn_id(turn_id);
         entry.unsent = Some(unsent);
         self.push_entry(entry);
@@ -105,7 +117,7 @@ impl Session {
         &mut self,
         turn_id: &TurnId,
         content: Content,
-        unsent: UnsentMessage,
+        mut unsent: UnsentMessage,
     ) -> bool {
         let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
             entry.pending_for(Some(turn_id)) && matches!(entry.kind, EntryKind::User { .. })
@@ -114,12 +126,20 @@ impl Session {
         };
         let entry = Arc::make_mut(entry);
         entry.kind = EntryKind::User { content };
+        unsent.retry_of = entry.unsent.take().expect("pending submission").retry_of;
         entry.unsent = Some(unsent);
         true
     }
 
-    pub(crate) fn settle_submissions(&mut self, turn_id: &TurnId, error: Option<&str>) -> bool {
+    /// Settle this request's pending entries. On acceptance, retire the drafts
+    /// the request retried and return any turns left without live entries.
+    pub(crate) fn settle_submissions(
+        &mut self,
+        turn_id: &TurnId,
+        error: Option<&str>,
+    ) -> Option<HashSet<TurnId>> {
         let mut settled = false;
+        let mut retried = HashSet::new();
         for entry in &mut self.entries {
             if entry.turn_id.as_ref() != Some(turn_id) {
                 continue;
@@ -135,28 +155,53 @@ impl Session {
             if let Some(error) = error {
                 entry.unsent.as_mut().expect("pending submission").error = Some(error.to_owned());
             } else {
-                entry.unsent = None;
+                retried.extend(entry.unsent.take().expect("pending submission").retry_of);
             }
             settled = true;
         }
-        settled
+        if retried.is_empty() {
+            return settled.then(HashSet::new);
+        }
+        let mut chain = retried.iter().map(String::as_str).collect();
+        self.expand_retry_chain(&mut chain);
+        let retired: HashSet<_> = chain.into_iter().map(str::to_owned).collect();
+        Some(self.retain_drafts(|entry| !retired.contains(&entry.id)))
+    }
+
+    /// Retries link to older drafts. Walking backwards also expands records
+    /// saved by versions that persisted only the directly selected draft IDs.
+    pub(crate) fn expand_retry_chain<'a>(&'a self, ids: &mut HashSet<&'a str>) {
+        for entry in self.entries.iter().rev() {
+            if ids.contains(entry.id.as_str())
+                && let Some(draft) = &entry.unsent
+            {
+                ids.extend(draft.retry_of.iter().map(String::as_str));
+            }
+        }
     }
 
     /// Keep the newest drafts that fit. Call while closing a turn or loading
     /// an idle session, so pending input is never evicted before submission.
-    /// Return discarded turn IDs that no remaining entries reference.
+    /// Return discarded turn IDs that no remaining live entries reference.
     pub(crate) fn limit_retained_drafts(&mut self) -> HashSet<TurnId> {
         let mut remaining = DRAFT_STORAGE_BUDGET_BYTES;
         let mut slots = MAX_RETAINED_DRAFTS;
+        self.retain_drafts(|entry| {
+            if slots > 0 && charge_json(entry, &mut remaining) {
+                slots -= 1;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    fn retain_drafts(&mut self, mut keep: impl FnMut(&SessionEntry) -> bool) -> HashSet<TurnId> {
         let mut removed_turns = HashSet::new();
         let previous_len = self.entries.len();
         self.entries.reverse();
         self.entries.retain(|entry| {
-            if entry.unsent.is_none() {
-                return true;
-            }
-            if slots > 0 && charge_json(entry, &mut remaining) {
-                slots -= 1;
+            if entry.unsent.is_none() || keep(entry) {
                 return true;
             }
             removed_turns.extend(entry.turn_id.iter().cloned());

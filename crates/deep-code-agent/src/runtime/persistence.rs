@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use crate::runtime::event::{RuntimeEvent, RuntimeFailureKind, TurnId, emit};
 use crate::runtime::persistence_actor::PersistenceActorHandle;
 use crate::runtime::state::{Persistence, RuntimeState};
 use crate::session::Session;
+use crate::session_entry::SessionEntry;
 use crate::session_store::{JsonSessionStore, SessionId, SessionRecord};
 #[cfg(test)]
 use crate::session_store::{SessionStore, SessionStoreError};
@@ -44,6 +46,26 @@ pub(crate) struct LiveSessionState {
 struct ClosedTurn {
     rejected: bool,
     draft_retained: bool,
+}
+
+fn unconfirmed_draft_turns(
+    store: Option<&JsonSessionStore>,
+    entries: &[Arc<SessionEntry>],
+    mut turns: HashSet<TurnId>,
+) -> HashSet<TurnId> {
+    if let Some(store) = store
+        && store
+            .retain_unconfirmed_turns(
+                entries,
+                &mut turns,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .is_err()
+    {
+        // An unreadable archive cannot establish that a turn was draft-only.
+        turns.clear();
+    }
+    turns
 }
 
 impl AgentRuntime {
@@ -113,6 +135,7 @@ impl AgentRuntime {
         let mut session = Session::from_entries(record.entries.clone());
         let removed = session.limit_retained_drafts();
         if session.entries().len() != record.entries.len() {
+            let removed = unconfirmed_draft_turns(store.as_ref(), session.entries(), removed);
             record.entries = session.entries().to_vec();
             record.turns.retain(|turn| !removed.contains(&turn.id));
         }
@@ -274,34 +297,42 @@ impl AgentRuntime {
             // Record first: waiting for disk serialization must not block turn
             // cancellation. The same lock order is used by live_snapshot.
             let mut record = persistence.record.lock().await;
-            let mut state = self.state.lock().await;
-            let active = state.session.image_observation_ids();
-            state.image_projections.retain_observations(&active);
-            record.entries = state.session.entries().to_vec();
-            record.image_projection_state = state.image_projections.snapshot(&active);
-            if let Some(turn) = state.current_turn.clone() {
-                if let Some(existing) = record.turns.iter_mut().find(|entry| entry.id == turn.id) {
-                    *existing = turn;
-                } else {
-                    record.turns.push(turn);
-                }
-            }
-            record.session_cost = state.session_cost;
-            record.session_cache_hit_tokens = state.session_cache_hit_tokens;
-            record.session_cache_miss_tokens = state.session_cache_miss_tokens;
-            record.session_cache_savings = state.session_cache_savings;
-            edit(&mut record);
-            record.limit_image_reports();
-            // Keep the authority in sync, otherwise a later persist/finish
-            // would restore the unbounded current-turn report list.
-            if let Some(turn) = &mut state.current_turn
-                && let Some(saved) = record.turns.iter().find(|saved| saved.id == turn.id)
-            {
-                *turn = saved.clone();
-            }
-            record.touch();
+            self.update_session_record(&mut record, edit).await;
         }
         persistence.actor.request_save();
+    }
+
+    async fn update_session_record(
+        &self,
+        record: &mut SessionRecord,
+        edit: impl FnOnce(&mut SessionRecord),
+    ) {
+        let mut state = self.state.lock().await;
+        let active = state.session.image_observation_ids();
+        state.image_projections.retain_observations(&active);
+        record.entries = state.session.entries().to_vec();
+        record.image_projection_state = state.image_projections.snapshot(&active);
+        if let Some(turn) = state.current_turn.clone() {
+            if let Some(existing) = record.turns.iter_mut().find(|entry| entry.id == turn.id) {
+                *existing = turn;
+            } else {
+                record.turns.push(turn);
+            }
+        }
+        record.session_cost = state.session_cost;
+        record.session_cache_hit_tokens = state.session_cache_hit_tokens;
+        record.session_cache_miss_tokens = state.session_cache_miss_tokens;
+        record.session_cache_savings = state.session_cache_savings;
+        edit(record);
+        record.limit_image_reports();
+        // Keep the authority in sync, otherwise a later persist/finish
+        // would restore the unbounded current-turn report list.
+        if let Some(turn) = &mut state.current_turn
+            && let Some(saved) = record.turns.iter().find(|saved| saved.id == turn.id)
+        {
+            *turn = saved.clone();
+        }
+        record.touch();
     }
 
     /// Close `turn_id`'s record. Guarded: a superseded loop (its turn was
@@ -311,15 +342,72 @@ impl AgentRuntime {
         self.close_turn(turn_id, None).await;
     }
 
+    pub(super) async fn confirm_submissions(&self, turn_id: &TurnId) {
+        // Lock the record before the live state so an intervening save cannot
+        // publish the draft removal with its old turn metadata still present.
+        let record = match &self.persistence {
+            Some(persistence) => Some(persistence.record.lock().await),
+            None => None,
+        };
+        let (removed, entries) = {
+            let mut state = self.state.lock().await;
+            if state.current_turn_id.as_ref() != Some(turn_id) || state.cancel.is_cancelled() {
+                return;
+            }
+            let Some(removed) = state.session.settle_submissions(turn_id, None) else {
+                return;
+            };
+            let entries =
+                (!removed.is_empty() && record.is_some()).then(|| state.session.entries().to_vec());
+            (removed, entries)
+        };
+        if let (Some(mut record), Some(persistence)) = (record, &self.persistence) {
+            let removed = match entries {
+                Some(entries) => self.check_removed_draft_turns(removed, entries).await,
+                None => removed,
+            };
+            self.update_session_record(&mut record, |record| {
+                if !removed.is_empty() {
+                    record.turns.retain(|turn| !removed.contains(&turn.id));
+                }
+            })
+            .await;
+            drop(record);
+            persistence.actor.request_save();
+        } else {
+            self.persist().await;
+        }
+    }
+
+    async fn check_removed_draft_turns(
+        &self,
+        removed: HashSet<TurnId>,
+        entries: Vec<Arc<SessionEntry>>,
+    ) -> HashSet<TurnId> {
+        let Some(store) = self.persistence.as_ref().and_then(|p| p.store.clone()) else {
+            return removed;
+        };
+        tokio::task::spawn_blocking(move || {
+            unconfirmed_draft_turns(Some(&store), &entries, removed)
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     async fn close_turn(&self, turn_id: &TurnId, error: Option<&str>) -> Option<ClosedTurn> {
         let error = error.map(crate::session_store::saved_diagnostic);
         let mut state = self.state.lock().await;
         if state.current_turn_id.as_ref() != Some(turn_id) {
             return None;
         }
-        let rejected =
-            error.is_some() && state.session.settle_submissions(turn_id, error.as_deref());
+        let rejected = error.is_some()
+            && state
+                .session
+                .settle_submissions(turn_id, error.as_deref())
+                .is_some();
         let removed = state.session.limit_retained_drafts();
+        let entries = (!removed.is_empty() && self.persistence.is_some())
+            .then(|| state.session.entries().to_vec());
         let draft_retained = rejected
             && state
                 .session
@@ -337,20 +425,31 @@ impl AgentRuntime {
                 turn.error = error.map(std::borrow::Cow::into_owned);
             }
             let mut record = persistence.record.lock().await;
-            if !removed.is_empty() {
-                record.turns.retain(|entry| !removed.contains(&entry.id));
-            }
-            if !removed.contains(&turn.id) {
-                if let Some(existing) = record.turns.iter_mut().find(|entry| entry.id == turn.id) {
-                    *existing = turn;
-                } else {
-                    record.turns.push(turn);
+            let removed = match entries {
+                Some(entries) => self.check_removed_draft_turns(removed, entries).await,
+                None => removed,
+            };
+            self.update_session_record(&mut record, move |record| {
+                if !removed.is_empty() {
+                    record.turns.retain(|entry| !removed.contains(&entry.id));
                 }
-            }
-            record.limit_turn_errors();
-            record.touch();
+                if !removed.contains(&turn.id) {
+                    if let Some(existing) =
+                        record.turns.iter_mut().find(|entry| entry.id == turn.id)
+                    {
+                        *existing = turn;
+                    } else {
+                        record.turns.push(turn);
+                    }
+                }
+                record.limit_turn_errors();
+            })
+            .await;
+            drop(record);
+            persistence.actor.request_save();
+        } else {
+            self.persist().await;
         }
-        self.persist().await;
         Some(ClosedTurn {
             rejected,
             draft_retained,

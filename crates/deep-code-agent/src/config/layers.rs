@@ -4,6 +4,7 @@
 
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use super::{
     STREAM_CHUNK_TIMEOUT_ENV, STREAM_MAX_BYTES_ENV, STREAM_MAX_RETRIES_ENV,
     STREAM_TOTAL_TIMEOUT_ENV,
 };
-use crate::execution_policy::{NetworkMode, PermissionMode};
+use crate::execution_policy::{NetworkMode, PermissionMode, SandboxMode};
 use crate::i18n::{Lang, TextId, tr, tr_with};
 use crate::image::ImageDetail;
 use crate::paths::home_dir;
@@ -480,6 +481,77 @@ fn read_config_file(path: &Path) -> FileRead {
             FileRead::Error(detail)
         }
     }
+}
+
+/// Carry the active limits and any tighter on-disk project settings into a
+/// checkpoint fork. The ordinary project overlay already enforces tightening.
+pub(crate) fn write_project_restrictions(
+    source: &Path,
+    destination: &Path,
+    active: Option<&AgentConfig>,
+) -> io::Result<()> {
+    let mut limits = AgentConfig {
+        sandbox_network: active.map_or(NetworkMode::Always, |config| config.sandbox_network),
+        sandbox_mode: active.map_or(SandboxMode::Off, |config| config.sandbox_mode),
+        default_permission_mode: active.map_or(PermissionMode::Yolo, |config| {
+            config.default_permission_mode
+        }),
+        lsp_enabled: active.is_none_or(|config| config.lsp_enabled),
+        turn_steps: active.map_or(0, |config| config.turn_steps),
+        ..AgentConfig::builtin()
+    };
+    match read_config_file(&source.join(".deep-code/config.toml")) {
+        FileRead::Missing => {}
+        FileRead::Error(message) => {
+            return Err(io::Error::other(format!(
+                "could not read source project config: {message}"
+            )));
+        }
+        FileRead::Parsed(file) => apply_file_overlay(
+            &mut limits,
+            &file,
+            ConfigLayer::Project,
+            &mut ConfigLoadReport::default(),
+            &mut Vec::new(),
+        ),
+    }
+
+    let mut config = String::new();
+    if limits.sandbox_network != NetworkMode::Always || limits.sandbox_mode == SandboxMode::Os {
+        config.push_str("[sandbox]\n");
+        if limits.sandbox_network != NetworkMode::Always {
+            config.push_str(&format!(
+                "network = {:?}\n",
+                limits.sandbox_network.as_setting()
+            ));
+        }
+        if limits.sandbox_mode == SandboxMode::Os {
+            config.push_str("mode = \"os\"\n");
+        }
+    }
+    if limits.default_permission_mode != PermissionMode::Yolo {
+        config.push_str(&format!(
+            "[approval]\ndefault_mode = {:?}\n",
+            limits.default_permission_mode.as_setting()
+        ));
+    }
+    if !limits.lsp_enabled {
+        config.push_str("[lsp]\nenabled = false\n");
+    }
+    if limits.turn_steps != 0 {
+        config.push_str(&format!("[budget]\nturn_steps = {}\n", limits.turn_steps));
+    }
+    if config.is_empty() {
+        return Ok(());
+    }
+
+    let root = crate::pinned_dir::open_canonical(destination)?;
+    let state = crate::pinned_dir::owned_child(&root, ".deep-code")?;
+    let mut output = state.open_with(
+        "config.toml",
+        cap_std::fs::OpenOptions::new().write(true).create_new(true),
+    )?;
+    output.write_all(config.as_bytes())
 }
 
 fn apply_file_overlay(

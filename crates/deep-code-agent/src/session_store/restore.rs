@@ -8,6 +8,7 @@ use super::{
     CheckpointRecord, JsonSessionStore, SessionId, SessionRecord, SessionStoreError, TurnRecord,
 };
 use crate::checkpoint::{CheckpointId, CheckpointStore};
+use crate::config::AgentConfig;
 use crate::runtime::TurnId;
 use crate::session_entry::{EntryKind, SessionEntry};
 
@@ -50,11 +51,22 @@ impl PreparedRestore {
 
 impl JsonSessionStore {
     /// Prepare an independent workspace and a session starting at the
-    /// selected restore point. Call on a worker because it copies files.
+    /// selected restore point from storage. A live controller should use
+    /// [`crate::AgentRuntime::prepare_restore`] to carry its active limits.
     pub fn prepare_restore(
         &self,
         session: &SessionId,
         selector: &str,
+        cancel: &CancellationToken,
+    ) -> Result<PreparedRestore, SessionStoreError> {
+        self.prepare_restore_with_config(session, selector, None, cancel)
+    }
+
+    pub(crate) fn prepare_restore_with_config(
+        &self,
+        session: &SessionId,
+        selector: &str,
+        active: Option<&AgentConfig>,
         cancel: &CancellationToken,
     ) -> Result<PreparedRestore, SessionStoreError> {
         let (point, mut record) = self.session_at_checkpoint(session, selector, cancel)?;
@@ -76,6 +88,8 @@ impl JsonSessionStore {
             .tempdir_in(parent)
             .map_err(restore_error)?;
         let destination = crate::paths::canonicalize(directory.path()).map_err(restore_error)?;
+        crate::config::write_project_restrictions(self.workspace_path(), &destination, active)
+            .map_err(restore_error)?;
         let store = CheckpointStore::new(self.workspace_path()).map_err(restore_error)?;
         let copied = store.copy_for_fork(&point.id, &destination, cancel);
         if cancel.is_cancelled() {
@@ -101,8 +115,9 @@ impl JsonSessionStore {
         cancel: &CancellationToken,
     ) -> Result<Vec<RestorePoint>, SessionStoreError> {
         let record = self.restore_source(session, cancel)?;
+        let drafts = self.draft_only_turns(&record, cancel)?;
         Ok(self
-            .available_points(&record)?
+            .available_points(&record, &drafts)?
             .into_iter()
             .map(|(_, point)| point)
             .collect())
@@ -116,8 +131,9 @@ impl JsonSessionStore {
         cancel: &CancellationToken,
     ) -> Result<Vec<RestoreRound>, SessionStoreError> {
         let record = self.restore_source(session, cancel)?;
+        let drafts = self.draft_only_turns(&record, cancel)?;
         let mut numbers = HashMap::new();
-        let mut rounds: Vec<_> = numbered_turns(&record)
+        let mut rounds: Vec<_> = numbered_turns(&record, &drafts)
             .map(|(round, turn)| {
                 numbers.insert(&turn.id, round);
                 RestoreRound {
@@ -128,7 +144,7 @@ impl JsonSessionStore {
                 }
             })
             .collect();
-        for (_, point) in self.available_points(&record)? {
+        for (_, point) in self.available_points(&record, &drafts)? {
             rounds[point.round - 1].checkpoints.push(point);
         }
         // Read newest to oldest, so if a turn has steering messages in
@@ -167,7 +183,8 @@ impl JsonSessionStore {
         cancel: &CancellationToken,
     ) -> Result<Vec<Arc<SessionEntry>>, SessionStoreError> {
         let record = self.restore_source(session, cancel)?;
-        let (_, turn) = numbered_turns(&record)
+        let drafts = self.draft_only_turns(&record, cancel)?;
+        let (_, turn) = numbered_turns(&record, &drafts)
             .find(|(number, _)| *number == round)
             .ok_or_else(|| {
                 restore_error(format!("round {round} is unavailable in this conversation"))
@@ -210,16 +227,17 @@ impl JsonSessionStore {
         cancel: &CancellationToken,
     ) -> Result<(RestorePoint, SessionRecord), SessionStoreError> {
         let source = self.restore_source(session, cancel)?;
+        let drafts = self.draft_only_turns(&source, cancel)?;
         let round = selector.parse::<usize>().ok();
         let (checkpoint, point) = self
-            .available_points(&source)?
+            .available_points(&source, &drafts)?
             .into_iter()
             .find(|(_, point)| {
                 point.id.0 == selector || (!point.before_turn && round == Some(point.round))
             })
             .ok_or_else(|| {
                 let exists = round.is_some_and(|round| {
-                    numbered_turns(&source).any(|(number, _)| number == round)
+                    numbered_turns(&source, &drafts).any(|(number, _)| number == round)
                 });
                 let reason = if exists {
                     "there is no saved end-of-round workspace snapshot"
@@ -240,7 +258,6 @@ impl JsonSessionStore {
             EntryKind::Compaction { summary, .. } => Some(summary.clone()),
             _ => None,
         });
-        let drafts = draft_turns(&source.entries);
         let turn_count = source
             .turns
             .iter()
@@ -274,13 +291,14 @@ impl JsonSessionStore {
     fn available_points<'a>(
         &self,
         record: &'a SessionRecord,
+        drafts: &HashSet<TurnId>,
     ) -> Result<Vec<(&'a CheckpointRecord, RestorePoint)>, SessionStoreError> {
         if record.checkpoints.is_empty() {
             return Ok(Vec::new());
         }
         let store = CheckpointStore::new(self.workspace_path()).map_err(restore_error)?;
         let saved = store.list().map_err(restore_error)?;
-        let rounds: HashMap<_, _> = numbered_turns(record)
+        let rounds: HashMap<_, _> = numbered_turns(record, drafts)
             .map(|(round, turn)| (&turn.id, round))
             .collect();
         Ok(record
@@ -305,6 +323,21 @@ impl JsonSessionStore {
                 })
             })
             .collect())
+    }
+
+    fn draft_only_turns(
+        &self,
+        record: &SessionRecord,
+        cancel: &CancellationToken,
+    ) -> Result<HashSet<TurnId>, SessionStoreError> {
+        let mut drafts: HashSet<_> = record
+            .entries
+            .iter()
+            .filter(|entry| entry.unsent.is_some())
+            .filter_map(|entry| entry.turn_id.clone())
+            .collect();
+        self.retain_unconfirmed_turns(&record.entries, &mut drafts, cancel)?;
+        Ok(drafts)
     }
 
     fn checkpoint_entries(
@@ -377,16 +410,10 @@ pub(super) fn require_original_history(
     Ok(())
 }
 
-fn draft_turns(entries: &[Arc<SessionEntry>]) -> HashSet<&TurnId> {
-    entries
-        .iter()
-        .filter(|entry| entry.unsent.is_some())
-        .filter_map(|entry| entry.turn_id.as_ref())
-        .collect()
-}
-
-fn numbered_turns(record: &SessionRecord) -> impl Iterator<Item = (usize, &TurnRecord)> {
-    let drafts = draft_turns(&record.entries);
+fn numbered_turns<'a>(
+    record: &'a SessionRecord,
+    drafts: &HashSet<TurnId>,
+) -> impl Iterator<Item = (usize, &'a TurnRecord)> {
     record
         .turns
         .iter()

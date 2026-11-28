@@ -7,6 +7,7 @@ mod write;
 use std::env;
 use std::time::Duration;
 
+pub(crate) use layers::write_project_restrictions;
 pub use layers::{ConfigLayer, ConfigLoadReport, ConfigSources, LoadedAgentConfig};
 pub use write::{GlobalConfigUpdate, validate_api_key, write_global_config_update};
 

@@ -95,6 +95,9 @@ pub enum AgentError {
     #[error("{0}")]
     Attachment(String),
 
+    #[error("no matching unsent message")]
+    RetryUnavailable,
+
     #[error("stream stalled: no data for {seconds}s")]
     StreamStalled { seconds: u64 },
 
@@ -129,6 +132,7 @@ impl AgentError {
                 &[("seconds", &seconds.to_string())],
             ),
             Self::Attachment(message) => message.clone(),
+            Self::RetryUnavailable => tr(lang, TextId::RetryMissing).to_string(),
             Self::StreamStalled { seconds } => tr_with(
                 lang,
                 TextId::ErrStreamStalled,

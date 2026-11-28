@@ -7,7 +7,7 @@
 //! 2. render [`RuntimeEvent`]s as they arrive,
 //! 3. forward approval decisions via [`AgentRuntime::submit_approval`].
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use std::path::PathBuf;
@@ -127,7 +127,7 @@ pub struct App {
     /// while a prompt typed *after* the cancel, before the runtime has
     /// acknowledged it, is the user's next request and fires when
     /// `TurnCancelled` lands.
-    pub(crate) steering_queue: Vec<String>,
+    pub(crate) steering_queue: Vec<UserTurn>,
     /// Set by the turn-end handler, consumed by `drain_stream_updates` once the
     /// drain loop is finished. The flush starts a new turn, so running it inside
     /// the loop would let a later `StreamFinished` from the turn that *just*
@@ -237,6 +237,10 @@ pub struct App {
     /// walking the history would silently strip the pictures out of a draft the
     /// user was in the middle of writing.
     history_draft: HistoryPrompt,
+    retry_draft_id: Option<String>,
+    /// Drafts submitted or queued by this UI turn, including before the
+    /// runtime task has registered them.
+    retrying_drafts: HashSet<String>,
     pub(crate) completion: Option<CompletionMenu>,
     pub(crate) workspace_files: Vec<String>,
     /// Resolved once at launch; every runtime swap and store access must
@@ -671,6 +675,8 @@ pub(crate) struct HistoryPrompt {
     pub(crate) images: Vec<images::AttachedImage>,
     #[serde(skip)]
     pub(crate) pasted_blocks: Vec<(String, String)>,
+    #[serde(skip)]
+    pub(crate) retry_draft_id: Option<String>,
 }
 
 impl HistoryPrompt {
@@ -681,6 +687,7 @@ impl HistoryPrompt {
             images: std::mem::take(&mut app.attached_images),
             pasted_blocks: std::mem::take(&mut app.pasted_blocks),
             literal_prompt: std::mem::take(&mut app.literal_prompt),
+            retry_draft_id: app.retry_draft_id.take(),
         }
     }
 
@@ -701,6 +708,7 @@ impl HistoryPrompt {
         app.attached_images = self.images;
         app.pasted_blocks = self.pasted_blocks;
         app.literal_prompt = self.literal_prompt;
+        app.retry_draft_id = self.retry_draft_id;
         app.cursor_to_end();
         app.close_completion();
     }
@@ -992,6 +1000,8 @@ impl App {
             prompt_history,
             history_cursor: None,
             history_draft: HistoryPrompt::default(),
+            retry_draft_id: None,
+            retrying_drafts: HashSet::new(),
             completion: None,
             workspace_files,
             workspace,
@@ -1214,6 +1224,7 @@ impl App {
         self.discard_image_work();
         self.input.clear();
         self.literal_prompt = false;
+        self.retry_draft_id = None;
         self.input_cursor = 0;
         self.pasted_blocks.clear();
         // The attachments belong to the chips that were just removed.

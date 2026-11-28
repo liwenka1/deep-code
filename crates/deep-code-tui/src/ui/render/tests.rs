@@ -3129,7 +3129,8 @@ fn streaming_composer_hint_adapts_to_space_after_the_cancel_shortcut() {
     app.sandbox_off = false;
     app.is_streaming = true;
     app.streaming_since = Some(std::time::Instant::now());
-    app.steering_queue.push("follow up".to_string());
+    app.steering_queue
+        .push(deep_code_agent::UserTurn::new("follow up"));
     let hint = tr_with(
         Lang::En,
         TextId::ComposerPlaceholderSteering,
@@ -3183,7 +3184,8 @@ fn streaming_footer_keeps_activity_and_queue_count_in_narrow_windows() {
 
     let badges = "[default] [unsandboxed] ";
     check_footer(&mut app, 40, badges, &[" Esc"]);
-    app.steering_queue.push("follow up".to_string());
+    app.steering_queue
+        .push(deep_code_agent::UserTurn::new("follow up"));
     check_footer(&mut app, 40, badges, &[" Esc ◷ 1"]);
 
     app.permission_mode
@@ -3191,7 +3193,7 @@ fn streaming_footer_keeps_activity_and_queue_count_in_narrow_windows() {
     let badges = "[accept-edits] [unsandboxed] ";
     for queued in [1, 16] {
         app.steering_queue
-            .resize_with(queued, || "follow up".to_string());
+            .resize_with(queued, || deep_code_agent::UserTurn::new("follow up"));
         let full = format!(" {queued} queued");
         let compact = format!(" ◷ {queued}");
         let tight = format!(" ◷{queued}");
@@ -3204,7 +3206,10 @@ fn streaming_footer_keeps_activity_and_queue_count_in_narrow_windows() {
     let follow_up = "Follow up after the current work";
     app.insert_str_at_cursor(follow_up);
     app.submit();
-    assert_eq!(app.steering_queue, [follow_up]);
+    assert_eq!(
+        app.steering_queue,
+        [deep_code_agent::UserTurn::new(follow_up)]
+    );
     check_footer(&mut app, 36, badges, &[" ◷ 1", " ◷1"]);
 
     app.insert_str_at_cursor("Another draft");
@@ -3250,7 +3255,8 @@ fn streaming_footer_preserves_complete_fields_across_narrow_layouts() {
         let activity = format!("⠋ {label}");
         let time = clock.split_whitespace().last().unwrap();
         for queued in [0, 1, 16] {
-            app.steering_queue.resize_with(queued, String::new);
+            app.steering_queue
+                .resize_with(queued, deep_code_agent::UserTurn::default);
             let count = queued.to_string();
             let tight = format!("◷{count}");
             let marker = format!("◷ {count}");
@@ -3539,7 +3545,10 @@ fn streaming_footer_confirms_a_queued_follow_up_with_the_transcript_scrolled_up(
     app.insert_str_at_cursor(follow_up);
     app.submit();
     assert!(app.input.is_empty());
-    assert_eq!(app.steering_queue, [follow_up]);
+    assert_eq!(
+        app.steering_queue,
+        [deep_code_agent::UserTurn::new(follow_up)]
+    );
 
     let screen = frame(&mut app, 80, 12);
     assert!(!screen.contains(follow_up), "{screen}");
@@ -4036,7 +4045,10 @@ fn a_queued_steer_is_visible_as_a_pending_row() {
         app.is_streaming = true;
         app.streaming_since = Some(std::time::Instant::now());
         app.history.push(HistoryCell::user("do the thing"));
-        app.steering_queue = queue;
+        app.steering_queue = queue
+            .into_iter()
+            .map(deep_code_agent::UserTurn::new)
+            .collect();
 
         let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();

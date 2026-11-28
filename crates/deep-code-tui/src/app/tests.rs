@@ -770,7 +770,7 @@ fn a_refused_send_keeps_the_walk_through_the_history() {
     let refused = |app: &mut App, refusal: &str| {
         app.is_streaming = true;
         if refusal == "a full queue" {
-            app.steering_queue = vec![String::new(); STEERING_QUEUE_CAP];
+            app.steering_queue = vec![UserTurn::default(); STEERING_QUEUE_CAP];
             app.insert_str_at_cursor("rerun the flaky test");
         } else {
             app.configured_model = if refusal == "an image mid-stream" {
@@ -893,7 +893,7 @@ fn clearing_the_composer_ends_the_walk_through_the_history() {
             "a send" => {
                 app.is_streaming = true;
                 app.submit();
-                assert_eq!(app.steering_queue, vec!["older".to_string()], "sanity");
+                assert_eq!(app.steering_queue, [UserTurn::new("older")], "sanity");
             }
             "Ctrl+C" => app.handle_ctrl_c(),
             _ => app.handle_escape(),
@@ -2420,7 +2420,7 @@ fn steering_queues_prompt_while_streaming_without_sending() {
     app.input = "wait, skip the tests".to_string();
     app.submit();
 
-    assert_eq!(app.steering_queue, vec!["wait, skip the tests"]);
+    assert_eq!(app.steering_queue, [UserTurn::new("wait, skip the tests")]);
     assert!(app.input.is_empty(), "composer clears after queueing");
     assert!(app.is_streaming, "queueing must not end the current turn");
     assert_eq!(
@@ -2665,13 +2665,13 @@ fn prompt_typed_after_cancel_fires_when_the_cancel_lands() {
 
     app.input = "try this instead".to_string();
     app.submit();
-    assert_eq!(app.steering_queue, vec!["try this instead".to_string()]);
+    assert_eq!(app.steering_queue, [UserTurn::new("try this instead")]);
 
     app.apply_runtime_event(RuntimeEvent::TurnCancelled { turn_id });
     assert!(!app.is_streaming);
     assert_eq!(
         app.steering_queue,
-        vec!["try this instead".to_string()],
+        [UserTurn::new("try this instead")],
         "the cancel landing must not swallow a prompt typed after it"
     );
     assert!(
@@ -2695,31 +2695,31 @@ fn a_second_escape_during_cancel_keeps_the_prompt_queued_after_the_first() {
     });
     app.is_streaming = true;
     // Control: the first cancel does drop what was queued before it.
-    app.steering_queue.push("stale follow-up".to_string());
+    app.steering_queue.push(UserTurn::new("stale follow-up"));
     app.handle_escape();
     assert!(app.steering_queue.is_empty());
     assert!(app.is_streaming, "the cancel has not landed yet");
 
     app.input = "try this instead".to_string();
     app.submit();
-    assert_eq!(app.steering_queue, vec!["try this instead".to_string()]);
+    assert_eq!(app.steering_queue, [UserTurn::new("try this instead")]);
 
     app.handle_escape();
     assert_eq!(
         app.steering_queue,
-        vec!["try this instead".to_string()],
+        [UserTurn::new("try this instead")],
         "a second Esc during the wind-down must keep the replacement prompt"
     );
     app.handle_ctrl_c();
     assert_eq!(
         app.steering_queue,
-        vec!["try this instead".to_string()],
+        [UserTurn::new("try this instead")],
         "Ctrl+C during the wind-down is the same cancel, same rule"
     );
 
     app.apply_runtime_event(RuntimeEvent::TurnCancelled { turn_id });
     assert!(!app.is_streaming);
-    assert_eq!(app.steering_queue, vec!["try this instead".to_string()]);
+    assert_eq!(app.steering_queue, [UserTurn::new("try this instead")]);
     assert!(app.pending_steering_flush);
 }
 
@@ -3563,7 +3563,7 @@ fn an_injected_mid_turn_prompt_retires_its_pending_entry() {
     let mut app = App::new();
     app.is_streaming = true;
     app.active_turn = Some(ActiveTurn::default());
-    app.steering_queue.push("skip the tests".to_string());
+    app.steering_queue.push(UserTurn::new("skip the tests"));
 
     app.apply_runtime_event(RuntimeEvent::UserMessageInjected {
         turn_id: deep_code_agent::TurnId("turn_1".to_string()),
@@ -3582,6 +3582,31 @@ fn an_injected_mid_turn_prompt_retires_its_pending_entry() {
     ));
     // Injection continues the same turn — it does not end it.
     assert!(app.is_streaming, "injecting a prompt must not end the turn");
+}
+
+#[tokio::test]
+async fn unavailable_retries_leave_other_steering_in_the_queue() {
+    let mut app = App::new();
+    let stale = "stale".to_owned();
+    let expired = UserTurn::new("expired retry").with_retry_drafts([stale.clone()]);
+    let retired = UserTurn::new("retired retry").with_retry_drafts(["retired".into()]);
+    let ordinary = UserTurn::new("ordinary follow-up");
+    app.is_streaming = true;
+    app.steering_queue = vec![expired, retired.clone(), ordinary.clone()];
+    app.apply_runtime_event(RuntimeEvent::UserRetryUnavailable {
+        turn_id: deep_code_agent::TurnId::new(),
+        draft_ids: vec![stale],
+    });
+    assert_eq!(app.steering_queue, [retired, ordinary]);
+    assert!(app.is_streaming);
+
+    app.is_streaming = false;
+    app.flush_steering_queue();
+    assert!(app.steering_queue.is_empty());
+    assert!(
+        matches!(app.history.last(), Some(HistoryCell::User { text }) if text == "ordinary follow-up")
+    );
+    wait_for_retry_test_turn(&mut app).await;
 }
 
 #[test]
@@ -3943,7 +3968,7 @@ fn a_pasted_word_after_a_slash_is_not_a_command() {
     assert_eq!(
         app.steering_queue
             .iter()
-            .map(|text| text.trim())
+            .map(|prompt| prompt.text.trim())
             .collect::<Vec<_>>(),
         vec!["/help"],
         "sent as text"
@@ -4160,6 +4185,7 @@ fn image_command_does_not_send_the_typed_line() {
 
 struct RefusingClient {
     expects_images: bool,
+    accepts_after: Option<std::sync::atomic::AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -4178,10 +4204,20 @@ impl deep_code_agent::LlmClient for RefusingClient {
             request.messages.last().unwrap().content.has_images(),
             self.expects_images
         );
+        let accepted = self.accepts_after.as_ref().is_some_and(|count| {
+            use std::sync::atomic::Ordering::Relaxed;
+            count
+                .fetch_update(Relaxed, Relaxed, |count| count.checked_sub(1))
+                .is_err()
+        });
         Ok(Box::pin(async_stream::try_stream! {
-            yield deep_code_agent::AgentEvent::Error {
-                message: "provider rejected the prompt".into(),
-            };
+            if accepted {
+                yield deep_code_agent::AgentEvent::Done { usage: None };
+            } else {
+                yield deep_code_agent::AgentEvent::Error {
+                    message: "provider rejected the prompt".into(),
+                };
+            }
         }))
     }
 }
@@ -4196,6 +4232,7 @@ async fn retry_loads_an_editable_draft_with_the_saved_image() {
         AgentRuntime::new(
             RefusingClient {
                 expects_images: true,
+                accepts_after: Some(std::sync::atomic::AtomicUsize::new(2)),
             },
             deep_code_agent::ToolRegistry::new(),
         )
@@ -4236,7 +4273,16 @@ async fn retry_loads_an_editable_draft_with_the_saved_image() {
         matches!(&app.attached_images[0].source, deep_code_agent::UserImage::Saved(image)
         if image.path().is_file())
     );
+    let selected_draft = app.retry_draft_id.clone().unwrap();
     app.submit();
+    // A previously recovered editor buffer can still name this draft before
+    // the spawned runtime task has registered the submission.
+    app.input = "stale retry buffer".into();
+    app.retry_draft_id = Some(selected_draft);
+    app.submit();
+    assert!(app.steering_queue.is_empty());
+    assert_eq!(app.status, app.tr(TextId::RetryMissing));
+    app.clear_input();
     wait_for_retry_test_turn(&mut app).await;
     assert_eq!(app.runtime.unsent_messages().await.len(), 2);
     app.history_prev();
@@ -4248,6 +4294,19 @@ async fn retry_loads_an_editable_draft_with_the_saved_image() {
     app.backspace();
     assert!(app.attached_images.is_empty());
     assert_eq!(app.input, pasted);
+
+    app.clear_input();
+    app.insert_str_at_cursor("/retry");
+    app.submit();
+    wait_for_image_work(&mut app).await;
+    app.insert_str_at_cursor(" edited");
+    app.submit();
+    wait_for_retry_test_turn(&mut app).await;
+    assert!(app.runtime.unsent_messages().await.is_empty());
+    app.insert_str_at_cursor("/retry");
+    app.submit();
+    wait_for_image_work(&mut app).await;
+    assert_eq!(app.status, app.tr(TextId::RetryMissing));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4260,6 +4319,7 @@ async fn retry_and_history_resend_collapsed_slash_text_as_model_input() {
         app.runtime = Arc::new(AgentRuntime::new(
             RefusingClient {
                 expects_images: false,
+                accepts_after: None,
             },
             deep_code_agent::ToolRegistry::new(),
         ));
@@ -4297,6 +4357,7 @@ async fn recovered_apikey_text_stays_editable_and_out_of_the_model_and_config() 
     app.runtime = Arc::new(AgentRuntime::new(
         RefusingClient {
             expects_images: false,
+            accepts_after: None,
         },
         deep_code_agent::ToolRegistry::new(),
     ));

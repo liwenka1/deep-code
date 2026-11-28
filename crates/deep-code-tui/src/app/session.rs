@@ -1,7 +1,7 @@
 use super::*;
 use deep_code_agent::{
-    GlobalConfigUpdate, LoadedAgentConfig, RestorePoint, RestoreRound, SessionEntry, SessionId,
-    write_global_config_update,
+    GlobalConfigUpdate, LoadedAgentConfig, PermissionMode, RestorePoint, RestoreRound,
+    SessionEntry, SessionId, write_global_config_update,
 };
 
 #[cfg(test)]
@@ -86,7 +86,11 @@ impl PendingSessionScan {
 }
 
 impl App {
-    pub(crate) fn adopt_runtime(&mut self, launched: LaunchedRuntime) -> Option<SessionRecord> {
+    pub(crate) fn adopt_runtime(
+        &mut self,
+        launched: LaunchedRuntime,
+        mode: PermissionMode,
+    ) -> Option<SessionRecord> {
         // Exhaustive destructuring for the same reason `App::launch` uses it:
         // a field added to `LaunchedRuntime` must be given a home in BOTH
         // consumers, and skipping one has to be written down as `field: _`.
@@ -140,17 +144,13 @@ impl App {
         // reads this field — the `/restore` honesty note, the grants banner —
         // must describe the boundary the live runtime actually enforces.
         self.extra_roots = extra_roots;
-        // Carry the user's chosen permission mode onto the new runtime's shared
-        // handle so a config swap (/model, /apikey, /resume, /clear) doesn't
-        // silently reset it.
-        let previous_mode = self.permission_mode.get();
         self.permission_mode = permission_mode;
+        self.permission_mode.set(mode);
         // Adopted, not inherited from the previous session: `/resume` and
         // `switch_session` can cross between a config that had `mode = "off"`
         // and one that did not, and a stale chip would either hide a real
         // removal of confinement or cry wolf about one that is gone.
         self.sandbox_off = sandbox_off;
-        self.permission_mode.set(previous_mode);
         resume_record
     }
 
@@ -231,13 +231,14 @@ impl App {
             resume,
         )
         .map_err(|error| error.to_string())?;
-        Ok(self.adopt_configured_runtime(launched, agent_config))
+        Ok(self.adopt_configured_runtime(launched, agent_config, self.permission_mode()))
     }
 
     fn adopt_configured_runtime(
         &mut self,
         launched: LaunchedRuntime,
         agent_config: &AgentConfig,
+        mode: PermissionMode,
     ) -> Option<SessionRecord> {
         self.cost_currency = agent_config.cost_currency;
         self.configured_model = agent_config.model.clone();
@@ -255,7 +256,7 @@ impl App {
         // previews, compaction warnings — reverts to whatever the config said
         // while the screen around it stays in the user's choice: a `/lang`
         // that could not be saved, an environment override.
-        let effective_resume = self.adopt_runtime(launched);
+        let effective_resume = self.adopt_runtime(launched, mode);
         self.runtime.set_ui_lang(self.lang);
         effective_resume
     }
@@ -374,7 +375,7 @@ impl App {
             )
             .map_err(|error| error.to_string())?;
             self.stop_current_runtime().await;
-            self.adopt_configured_runtime(launched, agent_config);
+            self.adopt_configured_runtime(launched, agent_config, self.permission_mode());
             if let Some(error) = self.runtime.flush_session().await {
                 self.pending_launch_warnings
                     .push(format!("failed to persist reconfigured session: {error}"));
@@ -738,7 +739,6 @@ impl App {
         let current = Arc::clone(&self.runtime);
         match crate::session_switch::SessionSwitch::restore(
             Arc::clone(&current),
-            workspace,
             self.global_config_path.clone(),
             id,
             selector.to_owned(),
@@ -976,7 +976,11 @@ impl App {
             self.history_search = None;
             (position, source, !self.extra_roots.is_empty())
         });
-        let record = self.adopt_configured_runtime(launched, &config);
+        let mut mode = self.permission_mode();
+        if restored.is_some() {
+            mode = mode.stricter(config.default_permission_mode);
+        }
+        let record = self.adopt_configured_runtime(launched, &config, mode);
         self.finish_session_switch(record.as_ref());
         if let Some((position, source, had_extra_roots)) = restored {
             let path = self.workspace.display().to_string();
@@ -1186,6 +1190,9 @@ impl App {
         // different session and auto-send there.
         self.steering_queue.clear();
         self.pending_steering_flush = false;
+        self.pending_retry = None;
+        self.retry_draft_id = None;
+        self.history_draft.retry_draft_id = None;
         if let Some(effective_record) = effective_record {
             self.history.extend(hydrate_history(effective_record));
         }

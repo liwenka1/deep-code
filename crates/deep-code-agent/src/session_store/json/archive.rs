@@ -7,6 +7,7 @@ use cap_fs_ext::DirExt;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+use crate::runtime::TurnId;
 use crate::session_entry::{EntryKind, SessionEntry};
 
 const ARCHIVES_DIR: &str = "archives";
@@ -151,6 +152,41 @@ impl JsonSessionStore {
             };
             next = parent;
         }
+    }
+
+    /// A turn can have a live rejected steer and an archived opening prompt.
+    /// Keep only candidates with no confirmed user entry in either place.
+    pub(crate) fn retain_unconfirmed_turns(
+        &self,
+        entries: &[Arc<SessionEntry>],
+        turns: &mut HashSet<TurnId>,
+        cancel: &CancellationToken,
+    ) -> Result<(), SessionStoreError> {
+        fn remove_confirmed(turns: &mut HashSet<TurnId>, entries: &[Arc<SessionEntry>]) {
+            for entry in entries {
+                if entry.unsent.is_none()
+                    && matches!(entry.kind, EntryKind::User { .. })
+                    && let Some(id) = &entry.turn_id
+                {
+                    turns.remove(id);
+                }
+            }
+        }
+
+        if !turns.is_empty() {
+            remove_confirmed(turns, entries);
+        }
+        if !turns.is_empty() {
+            self.visit_archives(entries, cancel, |archive| {
+                remove_confirmed(turns, &archive.entries);
+                Ok(if turns.is_empty() {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                })
+            })?;
+        }
+        Ok(())
     }
 
     /// Expand the transcript of a loaded session for display. A summary from

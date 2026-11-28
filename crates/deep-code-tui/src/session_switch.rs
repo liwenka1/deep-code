@@ -6,8 +6,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use deep_code_agent::{
-    AgentConfig, AgentRuntime, CancellationToken, JsonSessionStore, LaunchedRuntime,
-    PreparedRestore, SessionId, SessionRecord, WorkspaceRoots,
+    AgentConfig, AgentRuntime, CancellationToken, LaunchedRuntime, PreparedRestore, SessionId,
+    SessionRecord, WorkspaceRoots,
 };
 use tokio::sync::{oneshot, watch};
 
@@ -68,7 +68,7 @@ impl SessionSwitch {
         global_config_path: Option<PathBuf>,
         record: SessionRecord,
     ) -> Result<Self, String> {
-        Self::start_with(current, global_config_path, move |_| {
+        Self::start_with(current, global_config_path, move |_, _| {
             Ok(SwitchTarget {
                 roots,
                 record,
@@ -79,15 +79,12 @@ impl SessionSwitch {
 
     pub fn restore(
         current: Arc<AgentRuntime>,
-        workspace: PathBuf,
         global_config_path: Option<PathBuf>,
         session: SessionId,
         selector: String,
     ) -> Result<Self, String> {
-        Self::start_with(current, global_config_path, move |cancel| {
-            let store = JsonSessionStore::for_pinned_workspace(&workspace)
-                .map_err(|error| error.to_string())?;
-            let fork = store
+        Self::start_with(current, global_config_path, move |runtime, cancel| {
+            let fork = runtime
                 .prepare_restore(&session, &selector, cancel)
                 .map_err(|error| error.to_string())?;
             let record = fork.record().clone();
@@ -106,7 +103,9 @@ impl SessionSwitch {
     fn start_with(
         current: Arc<AgentRuntime>,
         global_config_path: Option<PathBuf>,
-        target: impl FnOnce(&CancellationToken) -> Result<SwitchTarget, String> + Send + 'static,
+        target: impl FnOnce(&AgentRuntime, &CancellationToken) -> Result<SwitchTarget, String>
+        + Send
+        + 'static,
     ) -> Result<Self, String> {
         let executor = tokio::runtime::Handle::try_current().ok();
         Self::spawn(move |cancel| {
@@ -131,7 +130,7 @@ impl SessionSwitch {
                 roots,
                 record,
                 restore,
-            } = target(&cancel)?;
+            } = target(&current, &cancel)?;
             let config = AgentConfig::load_with(
                 global_config_path,
                 Some(roots.primary.join(".deep-code/config.toml")),

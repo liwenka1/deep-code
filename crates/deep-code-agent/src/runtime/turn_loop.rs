@@ -323,15 +323,7 @@ impl AgentRuntime {
                         .is_ok_and(|event| !matches!(event, AgentEvent::Error { .. }))
                 {
                     pending = false;
-                    let confirmed = self
-                        .state
-                        .lock()
-                        .await
-                        .session
-                        .settle_submissions(&turn_id, None);
-                    if confirmed {
-                        self.persist().await;
-                    }
+                    self.confirm_submissions(&turn_id).await;
                 }
                 match event {
                     Ok(AgentEvent::TextDelta { text }) => {
@@ -662,21 +654,36 @@ impl AgentRuntime {
     /// order is part of the contract.
     async fn drain_steering(&self, turn_id: &TurnId, tx: &mpsc::UnboundedSender<RuntimeEvent>) {
         use super::Steered;
-        let drained: Vec<Steered> = {
+        let (events, changed) = {
             let mut state = self.state.lock().await;
             if state.current_turn_id.as_ref() != Some(turn_id) {
                 return;
             }
-            let drained: Vec<Steered> = std::mem::take(&mut state.steering).into();
-            for steered in &drained {
+            let mut events = Vec::new();
+            let mut changed = false;
+            for steered in std::mem::take(&mut state.steering) {
                 match steered {
                     Steered::User {
-                        content, unsent, ..
-                    } => state.session.push_pending_user(
-                        turn_id.clone(),
-                        content.clone(),
-                        unsent.clone(),
-                    ),
+                        prompt,
+                        content,
+                        unsent,
+                    } => {
+                        if state.can_retry(prompt.retry_drafts()) {
+                            state
+                                .session
+                                .push_pending_user(turn_id.clone(), content, unsent);
+                            changed = true;
+                            events.push(RuntimeEvent::UserMessageInjected {
+                                turn_id: turn_id.clone(),
+                                text: prompt.text,
+                            });
+                        } else {
+                            events.push(RuntimeEvent::UserRetryUnavailable {
+                                turn_id: turn_id.clone(),
+                                draft_ids: prompt.retry_of,
+                            });
+                        }
+                    }
                     // A runtime nudge (the budget wrap-up): recorded as a System
                     // entry, never a user one. As a user entry it would become
                     // the newest user message and pull compaction's anchor off
@@ -684,29 +691,19 @@ impl AgentRuntime {
                     // that is then persisted. System entries are not the anchor,
                     // so the task survives (and a mid-stream System notice is
                     // itself archivable once the turn moves on).
-                    Steered::Notice(text) => state.session.push_system(text),
+                    Steered::Notice(text) => {
+                        state.session.push_system(text);
+                        changed = true;
+                    }
                 }
             }
-            drained
+            (events, changed)
         };
-        if drained.is_empty() {
-            return;
+        if changed {
+            self.persist().await;
         }
-        self.persist().await;
-        for steered in drained {
-            // Runtime notices raise no user-injection event: the TUI renders
-            // `UserMessageInjected` as the user's own message and retires a
-            // pending user steer against it, neither of which is true of a
-            // runtime nudge. It stays an internal instruction to the model.
-            if let Steered::User { prompt, .. } = steered {
-                emit(
-                    tx,
-                    RuntimeEvent::UserMessageInjected {
-                        turn_id: turn_id.clone(),
-                        text: prompt.text,
-                    },
-                );
-            }
+        for event in events {
+            emit(tx, event);
         }
     }
 }

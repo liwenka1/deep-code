@@ -92,6 +92,7 @@ impl Drop for PreparedTurn<'_> {
 pub struct UserTurn {
     pub text: String,
     images: Vec<(UserImage, String)>,
+    retry_of: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,7 +136,20 @@ impl UserTurn {
         Self {
             text: text.into(),
             images,
+            ..Self::default()
         }
+    }
+
+    /// Associate an edited prompt with the saved drafts it retries.
+    #[must_use]
+    pub fn with_retry_drafts(mut self, ids: impl IntoIterator<Item = String>) -> Self {
+        self.retry_of = ids.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn retry_drafts(&self) -> &[String] {
+        &self.retry_of
     }
 
     #[must_use]
@@ -145,7 +159,10 @@ impl UserTurn {
 
     fn pending_content(&self) -> (Content, UnsentMessage) {
         let mut content = Content::from(self.text.clone());
-        let mut unsent = UnsentMessage::default();
+        let mut unsent = UnsentMessage {
+            retry_of: self.retry_of.clone(),
+            ..UnsentMessage::default()
+        };
         for (image, label) in &self.images {
             match image {
                 UserImage::Saved(asset) => {
@@ -364,7 +381,10 @@ impl AgentRuntime {
             return None;
         }
         let mut content = Content::from(prompt.text.clone());
-        let mut unsent = UnsentMessage::default();
+        let mut unsent = UnsentMessage {
+            retry_of: prompt.retry_of.clone(),
+            ..UnsentMessage::default()
+        };
         if prompt.images.is_empty() {
             return Some((content, unsent));
         }
@@ -594,6 +614,9 @@ impl AgentRuntime {
         // finalization from consuming this turn's state.
         {
             let state = self.state.lock().await;
+            if !state.can_retry(prompt.retry_drafts()) {
+                return Err(AgentError::RetryUnavailable);
+            }
             if state.current_turn_id.is_some() {
                 state.cancel.cancel();
                 if let Some((id, tx)) = &state.turn_events {
@@ -611,6 +634,10 @@ impl AgentRuntime {
         let turn_id = TurnId::new();
         {
             let mut state = self.state.lock().await;
+            // Finalizing the previous turn can evict a retained draft.
+            if !state.can_retry(prompt.retry_drafts()) {
+                return Err(AgentError::RetryUnavailable);
+            }
             state
                 .session
                 .push_pending_user(turn_id.clone(), content, unsent);
@@ -746,10 +773,9 @@ impl AgentRuntime {
     /// be injected into **that** turn rather than queued behind it (mid-turn
     /// steering).
     ///
-    /// Returns whether the text was accepted. `false` means no turn is in
-    /// flight — there is nothing to steer — and the caller should submit it
-    /// normally instead. This is a best-effort hand-off, not a delivery
-    /// guarantee: the text waits in the runtime's steering queue until the loop
+    /// Returns whether the text was accepted. A caller can submit a follow-up
+    /// normally after the turn ends. Retried drafts must still be available.
+    /// The text waits in the runtime's steering queue until the loop
     /// reaches a tool-batch boundary, so a turn that never runs another batch (a
     /// single long answer, or one tool that outlives the user's patience) ends
     /// with the text still queued. `begin_turn` clears it then, and the caller
@@ -772,6 +798,18 @@ impl AgentRuntime {
         }
         let mut state = self.state.lock().await;
         if state.current_turn_id.as_ref() != Some(&target) || cancel.is_cancelled() {
+            return false;
+        }
+        if !state.can_retry(prompt.retry_drafts()) {
+            if let Some((_, tx)) = &state.turn_events {
+                emit(
+                    tx,
+                    RuntimeEvent::UserRetryUnavailable {
+                        turn_id: target,
+                        draft_ids: prompt.retry_of,
+                    },
+                );
+            }
             return false;
         }
         state.steering.push_back(Steered::User {
@@ -944,18 +982,44 @@ impl AgentRuntime {
 
     /// Unconfirmed messages from this session, newest first, for explicit editing.
     pub async fn unsent_messages(&self) -> Vec<Arc<SessionEntry>> {
+        self.unsent_messages_excluding_retries(&[]).await
+    }
+
+    /// Drafts available to edit, accounting for retries the caller has queued
+    /// but the runtime might not have received yet.
+    pub async fn unsent_messages_excluding_retries(
+        &self,
+        reserved: &[String],
+    ) -> Vec<Arc<SessionEntry>> {
         let state = self.state.lock().await;
+        let retrying = state.retrying_drafts(reserved);
         state
             .session
             .entries()
             .iter()
             .rev()
-            .filter(|entry| {
-                entry.unsent.is_some()
-                    && (entry.turn_id.is_none() || entry.turn_id != state.current_turn_id)
-            })
+            .filter(|entry| state.is_saved_draft(entry) && !retrying.contains(entry.id.as_str()))
             .cloned()
             .collect()
+    }
+
+    /// Filter queued follow-ups before combining their text. A busy runtime
+    /// leaves the queue untouched so a controller can try again next tick.
+    #[must_use]
+    pub fn try_filter_queued_retries(&self, queued: &mut Vec<UserTurn>) -> bool {
+        let Ok(state) = self.state.try_lock() else {
+            return false;
+        };
+        let mut reserved = Vec::new();
+        queued.retain(|prompt| {
+            let ids = prompt.retry_drafts();
+            if !state.can_retry_excluding(ids, &reserved) {
+                return false;
+            }
+            reserved.extend(ids.iter().cloned());
+            true
+        });
+        true
     }
 
     /// Nonblocking idle check for a controller committing a prepared switch.

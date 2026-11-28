@@ -854,7 +854,7 @@ mod tests {
         handle_key(&mut app, plain(KeyCode::Enter));
         assert_eq!(
             app.steering_queue,
-            vec!["skip tests".to_string()],
+            [deep_code_agent::UserTurn::new("skip tests")],
             "Enter mid-stream queues the prompt as a follow-up"
         );
         assert!(app.input.is_empty(), "composer clears once queued");
@@ -888,7 +888,7 @@ mod tests {
 
         assert_eq!(
             app.steering_queue,
-            vec!["rerun the flaky test".to_string()],
+            [deep_code_agent::UserTurn::new("rerun the flaky test")],
             "Enter sent the recalled prompt, not the menu's `/clear`"
         );
     }

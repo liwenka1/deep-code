@@ -7,10 +7,41 @@ use tokio_util::sync::CancellationToken;
 use crate::checkpoint::{CheckpointId, CheckpointStore, SnapshotOutcome, SnapshotSkip};
 use crate::runtime::AgentRuntime;
 use crate::runtime::event::{RuntimeEvent, TurnId, emit};
-use crate::session_store::CheckpointRecord;
+use crate::session_store::{
+    CheckpointRecord, JsonSessionStore, PreparedRestore, SessionId, SessionStoreError,
+};
 use crate::tool::ToolError;
 
 impl AgentRuntime {
+    /// Prepare a new workspace from a checkpoint, carrying this runtime's
+    /// active restrictions into the copy. Run on a worker because it copies files.
+    pub fn prepare_restore(
+        &self,
+        session: &SessionId,
+        selector: &str,
+        cancel: &CancellationToken,
+    ) -> Result<PreparedRestore, SessionStoreError> {
+        let workspace = self
+            .workspace
+            .as_deref()
+            .ok_or_else(|| SessionStoreError::Io {
+                message: "restore: the runtime has no workspace".into(),
+            })?;
+        let active = crate::AgentConfig {
+            default_permission_mode: self
+                .config
+                .default_permission_mode
+                .stricter(self.permission_mode()),
+            ..self.config.clone()
+        };
+        JsonSessionStore::for_pinned_workspace(workspace)?.prepare_restore_with_config(
+            session,
+            selector,
+            Some(&active),
+            cancel,
+        )
+    }
+
     /// Enable an automatic end-of-turn snapshot for the given workspace
     /// root.
     ///

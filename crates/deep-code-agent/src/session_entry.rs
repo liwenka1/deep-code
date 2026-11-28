@@ -44,6 +44,10 @@ pub struct UnsentMessage {
     pub missing_image_labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Saved drafts explicitly recovered into this submission. Keep the link
+    /// across a rejection or restart until the provider confirms a retry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retry_of: Vec<String>,
 }
 
 impl SessionEntry {

@@ -34,6 +34,61 @@ fn fold(store: &JsonSessionStore, record: &mut SessionRecord) {
 }
 
 #[test]
+fn restore_fork_keeps_project_restrictions_without_copying_credentials_or_grants() {
+    use crate::{AgentConfig, NetworkMode, PermissionMode, SandboxMode};
+
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("project");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = crate::canonicalize(&workspace).unwrap();
+    let store = JsonSessionStore::for_pinned_workspace(&workspace).unwrap();
+    let global = parent.path().join("global.toml");
+    std::fs::write(
+        &global,
+        "[sandbox]\nnetwork = 'always'\nmode = 'off'\n[approval]\ndefault_mode = 'yolo'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join(".deep-code/config.toml"),
+        "[sandbox]\nnetwork = 'never'\nmode = 'os'\nallow_irreversible = ['npm publish']\n\
+         [approval]\ndefault_mode = 'accept_edits'\nauto_allow = ['shell']\n\
+         [lsp]\nenabled = false\n[budget]\nturn_steps = 4\n\
+         [provider]\napi_key = 'private-placeholder'\nbase_url = 'https://example.invalid'\n",
+    )
+    .unwrap();
+    let mut source = SessionRecord::new(workspace, "system");
+    let turn = TurnId::new();
+    source.entries.extend([
+        Arc::new(SessionEntry::user("question").with_turn_id(turn.clone())),
+        Arc::new(SessionEntry::assistant("answer", None, Vec::new()).with_turn_id(turn.clone())),
+    ]);
+    source.turns.push(TurnRecord::new(turn.clone()));
+    save_point(&mut source, &turn, "after_turn", 1);
+    store.save(&mut source).unwrap();
+
+    let restore = store
+        .prepare_restore(&source.id, "1", &CancellationToken::new())
+        .unwrap();
+    let fork_workspace = &restore.record().workspace;
+    let path = fork_workspace.join(".deep-code/config.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    for excluded in [
+        "private-placeholder",
+        "example.invalid",
+        "auto_allow",
+        "allow_irreversible",
+    ] {
+        assert!(!text.contains(excluded));
+    }
+    let config = AgentConfig::load_with(Some(global), Some(path), &|_| None).config;
+    assert_eq!(config.sandbox_network, NetworkMode::Never);
+    assert_eq!(config.sandbox_mode, SandboxMode::Os);
+    assert_eq!(config.default_permission_mode, PermissionMode::AcceptEdits);
+    assert!(!config.lsp_enabled);
+    assert_eq!(config.turn_steps, 4);
+}
+
+#[test]
 fn session_at_checkpoint_uses_the_round_boundary_even_inside_archives() {
     let workspace = tempfile::tempdir().unwrap();
     let workspace = crate::canonicalize(workspace.path()).unwrap();
@@ -57,6 +112,14 @@ fn session_at_checkpoint_uses_the_round_boundary_even_inside_archives() {
                 .with_turn_id(turn.clone()),
         ));
         save_point(&mut source, &turn, "after_turn", round);
+        if round == 10 {
+            let mut rejected = SessionEntry::user("rejected steer").with_turn_id(turn);
+            rejected.unsent = Some(crate::UnsentMessage {
+                error: Some("provider rejected the steer".into()),
+                ..Default::default()
+            });
+            source.entries.push(Arc::new(rejected));
+        }
         if round == 2 || round == 12 {
             let id = TurnId::new();
             source.turns.push(TurnRecord::new(id.clone()));
@@ -69,6 +132,12 @@ fn session_at_checkpoint_uses_the_round_boundary_even_inside_archives() {
         }
     }
     store.save(&mut source).unwrap();
+    assert!(source.entries.iter().all(|entry| !matches!(
+        &entry.kind, EntryKind::User { content } if content.text() == "question 10"
+    )));
+    assert!(source.entries.iter().any(|entry| matches!(
+        &entry.kind, EntryKind::User { content } if content.text() == "rejected steer"
+    )));
     let cancel = CancellationToken::new();
     std::fs::remove_dir(source.workspace.join(".deep-code/checkpoints/after_turn_1")).unwrap();
     let rounds = store.restore_rounds(&source.id, &cancel).unwrap();

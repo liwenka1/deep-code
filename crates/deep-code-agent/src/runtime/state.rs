@@ -8,6 +8,7 @@ use super::event::TurnId;
 use super::persistence_actor::PersistenceActorHandle;
 use crate::pricing::CostEstimate;
 use crate::session::Session;
+use crate::session_entry::SessionEntry;
 use crate::session_store::{ImageProjectionState, SessionRecord, TurnRecord};
 use crate::tool::ToolCall;
 
@@ -233,6 +234,70 @@ pub(super) struct RuntimeState {
     /// Used to make the breaker's guidance concrete (`/add-dir <this dir>`).
     /// Reset at the start of each turn.
     pub(super) last_boundary_denial_path: Option<String>,
+}
+
+impl RuntimeState {
+    pub(super) fn is_saved_draft(&self, entry: &SessionEntry) -> bool {
+        entry.unsent.is_some() && (entry.turn_id.is_none() || entry.turn_id != self.current_turn_id)
+    }
+
+    /// Draft IDs move from the steering queue to the pending transcript
+    /// under the same lock, so there is no gap before provider confirmation.
+    pub(super) fn retrying_drafts<'a>(&'a self, reserved: &'a [String]) -> HashSet<&'a str> {
+        let mut ids: HashSet<_> = reserved.iter().map(String::as_str).collect();
+        if let Some(turn) = self.current_turn_id.as_ref() {
+            let submitted = self
+                .session
+                .entries()
+                .iter()
+                .filter(|entry| entry.turn_id.as_ref() == Some(turn))
+                .filter_map(|entry| entry.unsent.as_ref());
+            let steered = self.steering.iter().filter_map(|entry| match entry {
+                Steered::User { unsent, .. } => Some(unsent),
+                Steered::Notice(_) => None,
+            });
+            ids.extend(
+                submitted
+                    .chain(steered)
+                    .flat_map(|draft| draft.retry_of.iter().map(String::as_str)),
+            );
+        }
+        if !ids.is_empty() {
+            self.session.expand_retry_chain(&mut ids);
+            // An older draft may be in flight while a later failed edit is
+            // still saved. Hide each candidate whose chain intersects it.
+            for entry in self.session.entries() {
+                if entry
+                    .unsent
+                    .as_ref()
+                    .is_some_and(|draft| draft.retry_of.iter().any(|id| ids.contains(id.as_str())))
+                {
+                    ids.insert(entry.id.as_str());
+                }
+            }
+        }
+        ids
+    }
+
+    pub(super) fn can_retry(&self, ids: &[String]) -> bool {
+        self.can_retry_excluding(ids, &[])
+    }
+
+    pub(super) fn can_retry_excluding(&self, ids: &[String], reserved: &[String]) -> bool {
+        if ids.is_empty() {
+            return true;
+        }
+        let retrying = self.retrying_drafts(reserved);
+        ids.iter().all(|id| {
+            !retrying.contains(id.as_str())
+                && self
+                    .session
+                    .entries()
+                    .iter()
+                    .rev()
+                    .any(|entry| entry.id == *id && self.is_saved_draft(entry))
+        })
+    }
 }
 
 pub(super) struct Persistence {

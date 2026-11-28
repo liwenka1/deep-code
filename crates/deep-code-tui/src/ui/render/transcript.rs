@@ -94,8 +94,8 @@ pub(super) fn render_messages(
             tr(app.lang, TextId::PendingSteerLabel),
             Style::default().fg(Color::Yellow),
         )));
-        for text in &app.steering_queue {
-            lines.extend(pending_steer_lines(text, content_width));
+        for prompt in &app.steering_queue {
+            lines.extend(pending_steer_lines(&prompt.text, content_width));
         }
     }
 

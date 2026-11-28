@@ -81,6 +81,11 @@ pub enum RuntimeEvent {
     /// is a fact only the runtime knows, which is why the decision lives there
     /// and the UI merely reports it.
     UserMessageInjected { turn_id: TurnId, text: String },
+    /// A steered retry's saved draft is no longer available for submission.
+    UserRetryUnavailable {
+        turn_id: TurnId,
+        draft_ids: Vec<String>,
+    },
     /// Assistant text suitable for transcript rendering.
     AssistantDelta { turn_id: TurnId, text: String },
     /// Reasoning text suitable for transcript rendering.
@@ -224,6 +229,7 @@ impl RuntimeEvent {
         match self {
             Self::TurnStarted { .. } => "turn.started",
             Self::UserMessageInjected { .. } => "user.injected",
+            Self::UserRetryUnavailable { .. } => "user.retry_unavailable",
             Self::AssistantDelta { .. } => "assistant.delta",
             Self::ReasoningDelta { .. } => "reasoning.delta",
             Self::ToolCallStarted { .. } => "tool.started",
@@ -258,6 +264,7 @@ impl RuntimeEvent {
         match self {
             Self::TurnStarted { turn_id, .. }
             | Self::UserMessageInjected { turn_id, .. }
+            | Self::UserRetryUnavailable { turn_id, .. }
             | Self::AssistantDelta { turn_id, .. }
             | Self::ReasoningDelta { turn_id, .. }
             | Self::ToolCallStarted { turn_id, .. }
@@ -342,6 +349,14 @@ mod tests {
                     text: "actually, skip the tests".to_string(),
                 },
                 "user.injected",
+                some_turn,
+            ),
+            (
+                RuntimeEvent::UserRetryUnavailable {
+                    turn_id: turn.clone(),
+                    draft_ids: vec!["draft".into()],
+                },
+                "user.retry_unavailable",
                 some_turn,
             ),
             (
@@ -516,7 +531,7 @@ mod tests {
                 some_turn,
             ),
         ];
-        assert_eq!(cases.len(), 22, "a new variant must be pinned here too");
+        assert_eq!(cases.len(), 23, "a new variant must be pinned here too");
         for (event, kind, turn_id) in &cases {
             assert_eq!(event.wire_kind(), *kind, "{event:?}");
             assert_eq!(event.turn_id(), *turn_id, "{event:?}");

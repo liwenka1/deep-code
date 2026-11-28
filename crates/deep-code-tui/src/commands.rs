@@ -1,4 +1,6 @@
-use deep_code_agent::{CostEstimate, Message, PrefixStatus, estimate_token_count, web_enabled};
+use deep_code_agent::{
+    CostEstimate, Message, PrefixStatus, UserTurn, estimate_token_count, web_enabled,
+};
 
 use std::sync::Arc;
 
@@ -192,11 +194,7 @@ impl App {
             self.status = self.busy_status(TextId::StatusInitBusy);
             return;
         }
-        self.start_user_turn(
-            INIT_BRIEF.to_string(),
-            Vec::new(),
-            Some("/init".to_string()),
-        );
+        self.start_user_turn(UserTurn::new(INIT_BRIEF), Some("/init".to_string()));
     }
 
     /// `/skill`: list the discovered skills, or run one by name.
@@ -264,7 +262,7 @@ impl App {
             name = skill.name
         );
         let shown = format!("/skill {arg}");
-        self.start_user_turn(text, Vec::new(), Some(shown));
+        self.start_user_turn(UserTurn::new(text), Some(shown));
     }
 
     /// `/diff [path]`: the working tree against `HEAD`, through the user's own

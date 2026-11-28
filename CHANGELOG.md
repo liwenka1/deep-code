@@ -8,7 +8,15 @@ Entries marked **Security:** change security-relevant behavior.
 
 - **Breaking:** Removed the `auto` permission mode and its Flash approval requests. The available modes are `default`, `accept_edits`, and `yolo`.
   Press `F2` followed by `F7` to confirm YOLO, or `Shift+Tab` again to return to `default`.
+  Replace explicit CLI and GitHub Bot `auto` arguments, including callers pinned to older Bot workflow refs that install the CLI from npm `latest`.
 - An invalid `approval.default_mode` selects `default` and generates a warning.
+- `/restore` opens a round picker and branches from a saved checkpoint into an independent conversation and sibling workspace. Press `V` or run `/restore view N` to read saved messages and tool results from a round, including archived rounds.
+  Legacy checkpoints mark the start of a round. Restore reports missing attachments and history from older compactions that saved only a summary.
+- **Security:** Restored workspaces apply the stricter sandbox, approval, LSP, and turn budget limits from the running session and the project configuration on disk. The first restored window uses the merged approval mode, and the limits persist across resumes.
+- Successful rounds save workspace snapshots and keep them by default. Set a positive `[checkpoints] max_snapshots` in the global config to prune the oldest snapshots. Shell logs referenced by saved conversations remain available for restore.
+- Compaction retains original messages and tool records in the archive and uses the current session model for summaries. Deleting a session reclaims archives that no other session references.
+- `/retry` returns a failed submission's editable text and saved images to the composer. A queued or running retry reserves its prior drafts. Provider acceptance removes those drafts from the retry list. Failure or cancellation releases the reservation. The session keeps up to 32 drafts within a 4 MiB budget for text, diagnostics, and attachment references.
+  DeepSeek validates images in new submissions. Historical images can be omitted during replay with the reason recorded.
 
 ## [0.5.5] - 2026-11-22
 
